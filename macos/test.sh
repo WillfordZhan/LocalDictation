@@ -33,6 +33,12 @@ swiftc -swift-version 5 -parse-as-library "$TEST_SOURCE_DIR/DictationStore.swift
 swiftc -swift-version 5 -parse-as-library "$TEST_SOURCE_DIR/DictationStore.swift" \
   "$TEST_SOURCE_DIR/DictationMotion.swift" "$TEST_SOURCE_DIR/DictationViews.swift" "$TEST_SOURCE_DIR/HistoryReprocessing.swift" "$TEST_SOURCE_DIR/DictationInsights.swift" \
   "$TEST_SOURCE_DIR/ShortcutRecorder.swift" "$TEST_SOURCE_DIR/PromptStudio.swift" \
+  "$TEST_SOURCE_DIR/tests/HistoryPaginationTests.swift" -o "$TEST_BUILD_DIR/history-pagination-checks"
+"$TEST_BUILD_DIR/history-pagination-checks"
+
+swiftc -swift-version 5 -parse-as-library "$TEST_SOURCE_DIR/DictationStore.swift" \
+  "$TEST_SOURCE_DIR/DictationMotion.swift" "$TEST_SOURCE_DIR/DictationViews.swift" "$TEST_SOURCE_DIR/HistoryReprocessing.swift" "$TEST_SOURCE_DIR/DictationInsights.swift" \
+  "$TEST_SOURCE_DIR/ShortcutRecorder.swift" "$TEST_SOURCE_DIR/PromptStudio.swift" \
   "$TEST_SOURCE_DIR/tests/PromptStudioTests.swift" -o "$TEST_BUILD_DIR/prompt-studio-checks"
 "$TEST_BUILD_DIR/prompt-studio-checks"
 

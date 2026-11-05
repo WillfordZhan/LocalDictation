@@ -125,7 +125,8 @@ enum DictationHistoryLayoutChecks {
         try require(near(bottomGap, 32), "History body bottom is not 32 points above the document bottom")
         try require(near(document.bounds.height, outer.contentView.bounds.height),
                     "History document is shorter or taller than its viewport")
-        try require(near(listScroll.convert(listScroll.bounds, to: listPane).height, listPane.bounds.height - 24),
+        let paginationHeight: CGFloat = count > 20 ? 36 : 0
+        try require(near(listScroll.convert(listScroll.bounds, to: listPane).height, listPane.bounds.height - 24 - paginationHeight),
                     "Independent list scroll view does not fill its pane")
         let ambiguous = [body, listPane, detailPane].filter { $0.hasAmbiguousLayout }
         if !ambiguous.isEmpty {
@@ -150,7 +151,7 @@ enum DictationHistoryLayoutChecks {
             try require(near(transcriptRect.minX, 18) && near(detailPane.bounds.width - transcriptRect.maxX, 18),
                         "Transcript scroll view does not span the detail content width")
             let rows = descendants(listDocument).compactMap { $0 as? NSButton }
-            try require(rows.count == count, "Inner history list omitted records")
+            try require(rows.count == min(count, 20), "History page did not bound its rendered rows")
         } else {
             try require(transcript == nil, "Empty history retained a stale transcript editor")
             let labels = descendants(detailPane).compactMap { ($0 as? NSTextField)?.stringValue }
@@ -213,7 +214,7 @@ enum DictationHistoryLayoutChecks {
             } catch { failed = true; fputs("FAIL: \(error.localizedDescription)\n", stderr) }
         }
         if failed { exit(1) }
-        print("PASS: hidden AppKit history in overlay/legacy scroller styles at 1100×820 and 1000×700, with 1/251/0 records; equal-height full-width panes; 32-point document bottom inset; viewport-sized outer document; independently scrolling long list; short transcript expands with window height; all permanent records retained.")
+        print("PASS: hidden AppKit history in overlay/legacy scroller styles at 1100×820 and 1000×700, with 1/251/0 records; equal-height full-width panes; compact pagination only for multiple pages; 32-point document bottom inset; viewport-sized outer document; independently scrolling current page; short transcript expands with window height; all permanent records retained.")
         print("LIMIT: synthetic in-memory history and invisible production views; no production files, recording, services, clipboard, or destructive confirmation was accessed.")
     }
 }

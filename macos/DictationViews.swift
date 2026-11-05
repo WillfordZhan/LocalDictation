@@ -275,6 +275,11 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     private var homeRaw = false; private var historyMode = 0
     private var selectedEntryID: UUID?; private var historySearch = ""
     private var historyList: NSStackView?; private var historyDetail: NSStackView?
+    private var historyPage = 0
+    private let historyPageSize = 20
+    private var historyListContainer: NSStackView?
+    private weak var historyListScroll: NSScrollView?
+    private var historyPager: NSView?
     private weak var searchField: NSSearchField?; private weak var vocabularyField: NSTextField?
     private var vocabularyFeedback: NSTextField?; private var vocabularyAdd: ActionButton?
     private var correctionLearningStatus = "等待下一次自动填入，检查当前应用是否支持术语学习。"
@@ -480,7 +485,8 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         homeInsertionNotice = nil; homeAllowInsertion = nil
         homeProcessingDetail = nil; cleanupSettingDetail = nil
         clear(pageStack); liveStatus = nil; liveStart = nil; liveCancel = nil; microphoneStatus = nil; accessibilityStatus = nil
-        historyList = nil; historyDetail = nil; vocabularyFeedback = nil; vocabularyAdd = nil; correctionLearningLabel = nil
+        historyList = nil; historyDetail = nil; historyListContainer = nil; historyListScroll = nil; historyPager = nil
+        vocabularyFeedback = nil; vocabularyAdd = nil; correctionLearningLabel = nil
         for (item, button) in navigation { button.selected = item == page }
 
         switch page { case .home: renderHome(); case .history: renderHistory(); case .dictionary: renderDictionary(); case .prompts: renderPrompts(); case .settings: renderSettings() }
@@ -701,10 +707,15 @@ extension DictationWindowController {
         // Fill the remaining viewport with independently scrolling panes. A long
         // list or short transcript must not collapse or push aside the other pane.
         let listScroll = NSScrollView(); listScroll.hasVerticalScroller = true; listScroll.drawsBackground = false
+        historyListScroll = listScroll
         let listDocument = SurfaceView(fill: Palette.sidebar); listScroll.documentView = listDocument
         listDocument.widthAnchor.constraint(equalTo: listScroll.contentView.widthAnchor).isActive = true
         pin(list, in: listDocument)
-        let listCard = card(listScroll, color: Palette.sidebar, inset: 12)
+        let listContainer = vertical(8); historyListContainer = listContainer
+        listScroll.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .vertical)
+        listScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 80).isActive = true
+        fill(listContainer, listScroll)
+        let listCard = card(listContainer, color: Palette.sidebar, inset: 12)
         listCard.widthAnchor.constraint(equalToConstant: 238).isActive = true
         listCard.identifier = NSUserInterfaceItemIdentifier("history-list-pane")
         let detailCard = card(detail, inset: 18)
@@ -725,10 +736,20 @@ extension DictationWindowController {
     private func reloadHistoryList() {
         guard let list = historyList else { return }; clear(list)
         let entries = filteredEntries
-        if !entries.contains(where: { $0.id == selectedEntryID }) { selectedEntryID = entries.first?.id }
+        let pageCount = max(1, (entries.count + historyPageSize - 1) / historyPageSize)
+        // Keep the selected transcript visible when a new recording shifts its
+        // index. Explicit search/page actions clear selection before reloading.
+        if let selected = entries.firstIndex(where: { $0.id == selectedEntryID }) {
+            historyPage = selected / historyPageSize
+        } else {
+            historyPage = min(historyPage, pageCount - 1)
+        }
+        let start = historyPage * historyPageSize
+        let visibleEntries = Array(entries.dropFirst(start).prefix(historyPageSize))
+        if !visibleEntries.contains(where: { $0.id == selectedEntryID }) { selectedEntryID = visibleEntries.first?.id }
         if entries.isEmpty { fill(list, label(historySearch.isEmpty ? "还没有口述记录" : "没有匹配的记录", size: 12, color: Palette.muted)) }
         let formatter = DateFormatter(); formatter.dateFormat = "M月d日 HH:mm"
-        for entry in entries {
+        for entry in visibleEntries {
             let button = HistoryRowButton(date: formatter.string(from: entry.createdAt),
                 summary: String(entry.text.replacingOccurrences(of: "\n", with: " ").prefix(22)),
                 selected: selectedEntryID == entry.id) { [weak self] in
@@ -736,9 +757,49 @@ extension DictationWindowController {
                     self.selectedEntryID = entry.id; self.reloadHistoryList()
                     if let detail = self.historyDetail { DictationMotion.reveal(detail, duration: 0.1) }
                 }
+            button.identifier = NSUserInterfaceItemIdentifier("history-row-\(entry.id.uuidString)")
             fill(list, button)
         }
+        reloadHistoryPager(pageCount: pageCount)
         reloadHistoryDetail()
+    }
+    private func reloadHistoryPager(pageCount: Int) {
+        if let pager = historyPager {
+            historyListContainer?.removeArrangedSubview(pager); pager.removeFromSuperview(); historyPager = nil
+        }
+        // A single page has no extra footer or reserved blank space.
+        guard pageCount > 1, let container = historyListContainer else { return }
+        let previous = ActionButton("", icon: "chevron.left") { [weak self] in self?.changeHistoryPage(by: -1) }
+        let next = ActionButton("", icon: "chevron.right") { [weak self] in self?.changeHistoryPage(by: 1) }
+        for (button, name, enabled) in [(previous, "上一页", historyPage > 0), (next, "下一页", historyPage < pageCount - 1)] {
+            button.isBordered = false; button.exactLayoutSize = true; button.isEnabled = enabled
+            button.toolTip = name; button.setAccessibilityLabel(name)
+            button.identifier = NSUserInterfaceItemIdentifier(button === previous ? "history-page-previous" : "history-page-next")
+            button.widthAnchor.constraint(equalToConstant: 24).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        }
+        let pageLabel = label("\(historyPage + 1) / \(pageCount)", size: 11, color: Palette.secondary)
+        pageLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        pageLabel.alignment = .center; pageLabel.maximumNumberOfLines = 1
+        pageLabel.identifier = NSUserInterfaceItemIdentifier("history-page-number")
+        pageLabel.setAccessibilityLabel("第 \(historyPage + 1) 页，共 \(pageCount) 页")
+        pageLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 52).isActive = true
+        let leftSpace = NSView(), rightSpace = NSView()
+        let pager = horizontal([leftSpace, previous, pageLabel, next, rightSpace], spacing: 4)
+        leftSpace.widthAnchor.constraint(equalTo: rightSpace.widthAnchor).isActive = true
+        pager.identifier = NSUserInterfaceItemIdentifier("history-pagination")
+        pager.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        pager.setContentHuggingPriority(.required, for: .vertical)
+        historyPager = pager; fill(container, pager)
+    }
+    private func changeHistoryPage(by offset: Int) {
+        let pageCount = max(1, (filteredEntries.count + historyPageSize - 1) / historyPageSize)
+        let target = min(max(historyPage + offset, 0), pageCount - 1)
+        guard target != historyPage else { return }
+        historyPage = target; selectedEntryID = nil
+        reloadHistoryList()
+        historyListScroll?.documentView?.scroll(.zero)
+        if let detail = historyDetail { DictationMotion.reveal(detail, duration: 0.1) }
     }
     private func reloadHistoryDetail() {
         guard let detail = historyDetail else { return }; clear(detail)
@@ -811,7 +872,10 @@ extension DictationWindowController {
         store.updatePreferences { $0.vocabulary = terms }
     }
     func controlTextDidChange(_ notification: Notification) {
-        if let search = notification.object as? NSSearchField, search === searchField { historySearch = search.stringValue; reloadHistoryList() }
+        if let search = notification.object as? NSSearchField, search === searchField {
+            historySearch = search.stringValue; historyPage = 0; selectedEntryID = nil; reloadHistoryList()
+            historyListScroll?.documentView?.scroll(.zero)
+        }
         else if let field = notification.object as? NSTextField, field === vocabularyField { vocabularyAdd?.isEnabled = !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
     private func settingRow(_ title: String, detail: String, control: NSView, detailLabel: NSTextField? = nil) -> NSView {
