@@ -1,4 +1,5 @@
 import AppKit
+import CoreFoundation
 
 /// Uses the real AppKit run loop and intermediate rendered frames. The windows
 /// stay hidden, model inputs stay in memory, and system preferences are intact.
@@ -18,7 +19,9 @@ enum DictationMotionChecks {
         while !condition() {
             let remaining = deadline - ProcessInfo.processInfo.systemUptime
             guard remaining > 0 else { return false }
-            wait(min(0.002, remaining))
+            // Return after one source is handled so the predicate observes
+            // that callback's state before later animation callbacks run.
+            CFRunLoopRunInMode(.defaultMode, min(0.002, remaining), true)
         }
         return true
     }
@@ -44,19 +47,30 @@ enum DictationMotionChecks {
         return image.colorAt(x: Int((rect.minX + 5) * scale), y: Int(y * scale))!.usingColorSpace(.sRGB)!.redComponent
     }
     @discardableResult static func frame(_ root: NSView, _ name: String, since start: TimeInterval) throws -> Data {
+        let renderStarted = ProcessInfo.processInfo.systemUptime
+        let alphaBeforeRender = card(root)?.alphaValue ?? -1
         guard let image = root.bitmapImageRepForCachingDisplay(in: root.bounds) else { throw NSError(domain: "Frame", code: 1) }
         root.cacheDisplay(in: root.bounds, to: image)
         // Encode PNGs only after timing assertions: compression on the main
         // thread would otherwise stall the animation we are measuring.
         let data = Data(bytes: image.bitmapData!, count: image.bytesPerRow * image.pixelsHigh)
         samples.append(["frame": name, "elapsed_ms": (ProcessInfo.processInfo.systemUptime - start) * 1000,
+                        "render_ms": (ProcessInfo.processInfo.systemUptime - renderStarted) * 1000,
+                        "tooltip_alpha_before_render": alphaBeforeRender,
                         "tooltip_alpha": card(root)?.alphaValue ?? -1])
         renderedFrames.append((name, image))
         return data
     }
     static func main() {
         do { try run(); print("PASS: \(checks) timed motion checks, intermediate frames and cancellation verified") }
-        catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
+        catch {
+            fputs("FAIL: \(error.localizedDescription)\n", stderr)
+            if let data = try? JSONSerialization.data(withJSONObject: samples, options: [.sortedKeys]),
+               let diagnostic = String(data: data, encoding: .utf8) {
+                fputs("MOTION SAMPLES: \(diagnostic)\n", stderr)
+            }
+            exit(1)
+        }
     }
     static func run() throws {
         NSApplication.shared.setActivationPolicy(.prohibited)
