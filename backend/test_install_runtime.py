@@ -1,0 +1,83 @@
+"""Run the real installer against a temporary venv and tiny inert model files.
+
+MLX modules here are source stubs. This test never imports the installed GPU
+packages, invokes a package manager, downloads models or opens user Runtime.
+"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+import venv
+
+
+BACKEND = Path(__file__).resolve().parent
+
+
+class RuntimeInstallTests(unittest.TestCase):
+    def test_staged_backend_includes_prompt_resources_and_remains_importable(self):
+        self.run_install("whisper")
+
+    def test_qwen_install_does_not_require_or_copy_whisper(self):
+        self.run_install("qwen")
+
+    def run_install(self, asr_backend):
+        with tempfile.TemporaryDirectory(prefix="dictation-install-test-") as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            environment = source / "local-dictation-venv"
+            venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+            site = environment / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+            for package, version in (("mlx", "0.32.4"), ("mlx_whisper", "0.4.3"), ("mlx_lm", "0.32.2"), ("mlx_audio", "0.6.3")):
+                module = site / package
+                module.mkdir(parents=True)
+                (module / "__init__.py").write_text("# Inert installer test module.\n")
+                if package == "mlx": (module / "core.py").write_text("# No GPU code.\n")
+                if package == "mlx_audio":
+                    asr = module / "stt/models/qwen3_asr"
+                    asr.mkdir(parents=True)
+                    (asr / "__init__.py").write_text("class Qwen3ASRModel: pass\n")
+                info = site / f"{package}-{version}.dist-info"
+                info.mkdir()
+                (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {package.replace('_', '-')}\nVersion: {version}\n")
+            model_files = {
+                "Qwen3-4B-Instruct-2507-4bit": ("model.safetensors", "config.json", "tokenizer.json", "tokenizer_config.json"),
+            }
+            if asr_backend == "whisper":
+                model_files["whisper-large-v3-turbo"] = ("weights.safetensors", "config.json")
+            else:
+                model_files["Qwen3-ASR-1.7B-8bit"] = ("model.safetensors", "config.json", "tokenizer_config.json", "vocab.json",
+                    "merges.txt", "preprocessor_config.json", "chat_template.json")
+            for model, names in model_files.items():
+                directory = source / "models" / model
+                directory.mkdir(parents=True)
+                for name in names: (directory / name).write_bytes(b"{}" if name.endswith(".json") else b"test-weight")
+                if model == "Qwen3-ASR-1.7B-8bit":
+                    (directory / "config.json").write_text(json.dumps({"model_type": "qwen3_asr", "quantization": {"bits": 8}}))
+            runtime = root / "Application Support" / "Runtime"
+            history = runtime.parent / "history.json"
+            history.parent.mkdir(parents=True)
+            history.write_bytes(b"private history sentinel")
+            result = subprocess.run(["/bin/bash", str(BACKEND / "install_runtime.sh")],
+                env={**os.environ, "LOCAL_DICTATION_SOURCE_WORK_DIR": str(source),
+                     "LOCAL_DICTATION_RUNTIME_DIR": str(runtime), "LOCAL_DICTATION_ASR_BACKEND": asr_backend},
+                text=True, capture_output=True, timeout=45)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for name in ("server.py", "streaming.py", "prompt_store.py", "prompt-imports.json", "test_prompt_store.py", "model_artifacts.py", "model-manifest.json"):
+                self.assertEqual((runtime / "backend" / name).read_bytes(), (BACKEND / name).read_bytes())
+            self.assertIn("后端资源导入检查通过", result.stdout)
+            self.assertEqual(history.read_bytes(), b"private history sentinel")
+            self.assertFalse((runtime.parent / "cleanup-prompts.json").exists())
+            self.assertEqual((runtime / "asr-backend").read_text().strip(), asr_backend)
+            if asr_backend == "qwen": self.assertFalse((runtime / "models/whisper-large-v3-turbo").exists())
+            self.assertFalse((runtime / ".install-lock").exists())
+            verified = subprocess.run([str(runtime / "local-dictation-venv/bin/python"), "-B", "-c",
+                "import server, prompt_store; print(server.default_prompt_draft()['name'])"],
+                cwd=runtime / "backend", text=True, capture_output=True, timeout=10)
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
