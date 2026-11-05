@@ -130,15 +130,18 @@ enum DictationMotionChecks {
         try frame(root, "tooltip-exit", since: exitBegan)
         move(map, next)
         try require(card(root) === entering && abs(entering.alphaValue - exitAlpha) < 0.01, "Re-entry jumped opacity or created a duplicate layer")
-        wait(0.16)
+        _ = waitFor(timeout: 0.4) { card(root) === entering && entering.alphaValue == 1 }
         try require(card(root) === entering && entering.alphaValue == 1, "Old exit completion removed the new hover")
-        leave(map); wait(0.14)
+        leave(map)
+        _ = waitFor(timeout: 0.3) { card(root) == nil }
         try require(card(root) == nil, "Tooltip exit never removed its layer")
         move(map, active); wait(0.025); leave(map); wait(0.20)
         try require(card(root) == nil, "Leaving during dwell produced a ghost tooltip")
-        move(map, active); wait(0.02); move(map, next); wait(0.02); move(map, active); wait(0.24)
+        move(map, active); wait(0.02); move(map, next); wait(0.02); move(map, active)
+        _ = waitFor(timeout: 0.5) { card(root)?.accessibilityLabel()?.contains("680 字") == true }
         try require(card(root)?.accessibilityLabel()?.contains("680 字") == true, "Rapid date changes displayed an older scheduled result")
-        leave(map); wait(0.14)
+        leave(map)
+        try require(waitFor(timeout: 0.3) { card(root) == nil }, "Rapid-date tooltip did not finish removal")
         move(map, active); map.isHidden = true; wait(0.24)
         try require(card(root) == nil, "Hidden map's delayed work created an orphan tooltip")
         map.isHidden = false
@@ -147,6 +150,9 @@ enum DictationMotionChecks {
         let rowPlain = try frame(root, "sidebar-idle", since: rowStart)
         let idleShade = rowShade(row, in: root)
         row.mouseEntered(with: event(.mouseEntered, for: row, point: NSPoint(x: 10, y: 10)))
+        // This check intentionally measures rendered colors rather than
+        // private transition state. A severely stalled renderer can still
+        // miss this narrow sample; retain the strict intermediate-color proof.
         wait(0.035)
         let rowMiddle = try frame(root, "sidebar-hover-middle", since: rowStart)
         let middleShade = rowShade(row, in: root)
@@ -164,7 +170,7 @@ enum DictationMotionChecks {
         let reveal = NSView(frame: NSRect(x: 20, y: 20, width: 100, height: 30)); root.addSubview(reveal)
         DictationMotion.reveal(reveal)
         try require(abs(reveal.alphaValue - 0.78) < 0.001, "Reveal did not start at 0.78")
-        wait(0.05)
+        try require(waitFor(timeout: 0.3) { reveal.alphaValue > 0.78 }, "Reveal never advanced past its initial opacity")
         let revealAlpha = reveal.alphaValue
         try require(revealAlpha > 0.78 && revealAlpha < 1, "Reveal has no intermediate values")
         DictationMotion.reveal(reveal)
@@ -173,20 +179,29 @@ enum DictationMotionChecks {
         try require(reveal.alphaValue == 1, "Cancelled reveal left stale transparency")
         var oldCompletion = false
         DictationMotion.fade(reveal, to: 0, duration: 0.09) { oldCompletion = true }
-        wait(0.025); DictationMotion.cancel(reveal); wait(0.12)
+        try require(waitFor(timeout: 0.2) { reveal.alphaValue < 1 }, "Cancellable fade never advanced")
+        try require(reveal.alphaValue > 0 && !oldCompletion, "Cancellable fade skipped its intermediate state")
+        DictationMotion.cancel(reveal); wait(0.12)
         try require(!oldCompletion && reveal.alphaValue == 1, "Cancelled completion fired after replacement")
 
         DictationMotion.reduceMotionOverride = true
-        DictationMotion.reveal(reveal, duration: 0.3); wait(0.025)
+        try require(DictationMotion.duration(0.3) == 0.06, "Reduced-motion duration exceeded its 60ms policy")
+        DictationMotion.reveal(reveal, duration: 0.3)
+        try require(reveal.alphaValue == 0.78, "Reduced-motion reveal lost its initial opacity")
+        try require(waitFor(timeout: 0.2) { reveal.alphaValue > 0.78 }, "Reduced-motion reveal never advanced")
         try require(reveal.alphaValue > 0.78 && reveal.alphaValue < 1, "Reduced motion lost all state transition feedback")
-        wait(0.07)
+        _ = waitFor(timeout: 0.3) { reveal.alphaValue == 1 }
         try require(reveal.alphaValue == 1 && reveal.frame.origin == NSPoint(x: 20, y: 20), "Reduced motion moved the view or stayed transparent")
-        move(map, active); wait(0.18)
-        try require(card(root)?.alphaValue == 1, "Reduced-motion tooltip did not complete within 80+60ms")
-        leave(map); wait(0.09)
+        move(map, active)
+        _ = waitFor(timeout: 0.4) { card(root)?.alphaValue == 1 }
+        try require(card(root)?.alphaValue == 1, "Reduced-motion tooltip did not finish its dwell and entry")
+        leave(map)
+        _ = waitFor(timeout: 0.3) { card(root) == nil }
         try require(card(root) == nil, "Reduced-motion exit failed to clean up")
         DictationMotion.reduceMotionOverride = false
-        DictationMotion.reveal(reveal, duration: 0.5); wait(0.04)
+        DictationMotion.reveal(reveal, duration: 0.5)
+        try require(waitFor(timeout: 0.3) { reveal.alphaValue > 0.78 }, "Policy-change fixture never started its reveal")
+        try require(reveal.alphaValue < 1, "Policy-change fixture finished before interruption")
         DictationMotion.reduceMotionOverride = true
         try require(reveal.alphaValue == 1, "Runtime motion-policy change left an unfinished transition")
         try require(!window.isVisible, "Motion test activated a window")

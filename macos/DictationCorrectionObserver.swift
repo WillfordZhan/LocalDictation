@@ -256,7 +256,7 @@ final class DictationCorrectionObserver {
     private let reader: Reader
     private let clock: () -> TimeInterval
     private let pollsAutomatically: Bool
-    private let readQueue = DispatchQueue(label: "local-dictation.correction-observer", qos: .utility)
+    private let readQueue: DispatchQueue
     private var observation: Observation?
     private var generation = UUID()
     private var inFlight = false
@@ -265,8 +265,9 @@ final class DictationCorrectionObserver {
 
     init(reader: @escaping Reader = DictationCorrectionObserver.readField,
          clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         pollsAutomatically: Bool = true) {
-        self.reader = reader; self.clock = clock; self.pollsAutomatically = pollsAutomatically
+         pollsAutomatically: Bool = true,
+         readQueue: DispatchQueue = DispatchQueue(label: "local-dictation.correction-observer", qos: .utility)) {
+        self.reader = reader; self.clock = clock; self.pollsAutomatically = pollsAutomatically; self.readQueue = readQueue
     }
 
     deinit {

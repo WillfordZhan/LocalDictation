@@ -74,7 +74,22 @@ enum DictationCorrectionObserverTests {
         var now: TimeInterval = 100
         var snapshot: DictationCorrectionReadResult = .unavailable
         var candidates: [DictationCorrectionCandidate] = []
-        let observer = DictationCorrectionObserver(reader: { _, _ in snapshot }, clock: { now }, pollsAutomatically: false)
+        let readQueue = DispatchQueue(label: "fixture.correction-reader", qos: .utility)
+        let observer = DictationCorrectionObserver(reader: { _, _ in snapshot }, clock: { now },
+            pollsAutomatically: false, readQueue: readQueue)
+        func drain(_ queue: DispatchQueue) {
+            // Every queued read posts consume to main before this queue marker
+            // can run. Its main marker therefore proves both phases completed,
+            // including reads that leave availability unchanged. A wall-clock
+            // delay cannot establish that ordering under scheduler contention.
+            let completed = DispatchGroup(); completed.enter()
+            queue.async { DispatchQueue.main.async { completed.leave() } }
+            let deadline = Date().addingTimeInterval(2)
+            while completed.wait(timeout: .now()) != .success {
+                precondition(Date() < deadline, "Reader/main completion did not drain")
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.005))
+            }
+        }
         observer.onCorrection = { precondition(Thread.isMainThread); candidates.append($0) }
         let entryID = UUID()
         func text(_ value: String, caret: Int? = nil, selected: Int = 0) {
@@ -83,7 +98,7 @@ enum DictationCorrectionObserverTests {
         }
         func tick(_ advance: TimeInterval = 0) {
             now += advance; observer.sampleNow()
-            RunLoop.current.run(until: Date().addingTimeInterval(0.025))
+            drain(readQueue)
         }
         func begin(_ value: String = "修复 SalesPrat。", offset: Int = 0) {
             now = 100
@@ -159,19 +174,24 @@ enum DictationCorrectionObserverTests {
         // An older AX response may return after the next paste. Its generation
         // must be discarded even when the two fields contain identical text.
         let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let delayedQueue = DispatchQueue(label: "fixture.delayed-correction-reader", qos: .utility)
         var blockedReads = 0, lateCandidates = 0
         let delayed = DictationCorrectionObserver(reader: { _, _ in
             blockedReads += 1
             if blockedReads == 1 { started.signal(); _ = release.wait(timeout: .now() + 2) }
             return .snapshot(DictationCorrectionSnapshot(text: "SalesPrat", selection: CFRange(location: 9, length: 0)))
-        }, clock: { now }, pollsAutomatically: false)
+        }, clock: { now }, pollsAutomatically: false, readQueue: delayedQueue)
         delayed.onCorrection = { _ in lateCandidates += 1 }
         delayed.observeInsertion(pid: getpid(), element: element, range: CFRange(location: 0, length: 0), text: "SalesPrat", entryID: UUID(), bundleID: nil)
         delayed.sampleNow(); precondition(started.wait(timeout: .now() + 1) == .success)
+        // Hold the real asynchronous boundary beyond the former tick window:
+        // a 25ms run loop turn must not be mistaken for a completed AX read.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.025))
+        precondition(delayed.availability == .confirming && lateCandidates == 0)
         delayed.observeInsertion(pid: getpid(), element: element, range: CFRange(location: 0, length: 0), text: "OtherWord", entryID: UUID(), bundleID: nil)
-        release.signal(); RunLoop.current.run(until: Date().addingTimeInterval(0.03))
+        release.signal(); drain(delayedQueue)
         precondition(delayed.availability == .confirming && lateCandidates == 0)
         delayed.stop(); observer.stop()
-        print("PASS correction observer: automatic terminology confidence, complete phrase confirmation, repeated replacements, verified insertion, stability, UTF-16 scope, focus/submission/timeout, unsupported AX, one result, late callback isolation")
+        print("PASS correction observer: automatic terminology confidence, complete phrase confirmation, repeated replacements, verified insertion, stability, UTF-16 scope, focus/submission/timeout, unsupported AX, one result, read/main completion ordering, blocked-reader late callback isolation")
     }
 }
