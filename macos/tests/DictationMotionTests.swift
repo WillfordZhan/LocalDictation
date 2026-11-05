@@ -120,9 +120,13 @@ enum DictationMotionChecks {
         try require(card(root) === entering && entering.alphaValue == 1, "A cancelled gap exit removed the resumed tooltip")
 
         let exitBegan = ProcessInfo.processInfo.systemUptime
-        leave(map); wait(0.035)
+        leave(map)
+        // Observe the first real exit frame, just as entry does above. A
+        // loaded CI run loop can defer its timer past an arbitrary 35 ms.
+        try require(waitFor(timeout: 0.2) { entering.alphaValue < 1 }, "Tooltip exit never advanced")
         let exitAlpha = entering.alphaValue
-        try require(card(root) === entering && exitAlpha > 0 && exitAlpha < 1, "Tooltip exit skipped its intermediate opacity")
+        try require(card(root) === entering && exitAlpha > 0 && exitAlpha < 1,
+                    "Tooltip exit skipped its intermediate opacity: \(exitAlpha), elapsed \(ProcessInfo.processInfo.systemUptime - exitBegan)")
         try frame(root, "tooltip-exit", since: exitBegan)
         move(map, next)
         try require(card(root) === entering && abs(entering.alphaValue - exitAlpha) < 0.01, "Re-entry jumped opacity or created a duplicate layer")
