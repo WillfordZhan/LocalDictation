@@ -6,6 +6,7 @@ packages, invokes a package manager, downloads models or opens user Runtime.
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,21 @@ class RuntimeInstallTests(unittest.TestCase):
     def test_qwen_install_does_not_require_or_copy_whisper(self):
         self.run_install("qwen")
 
-    def run_install(self, asr_backend):
+    def test_public_source_without_local_readme_or_validation_installs(self):
+        # Reproduce a clean published source tree instead of inheriting ignored
+        # files from the developer's checkout. No models or user data are used.
+        with tempfile.TemporaryDirectory(prefix="dictation-public-source-") as temporary:
+            public_backend = Path(temporary) / "backend"
+            public_backend.mkdir()
+            for source in BACKEND.iterdir():
+                if source.is_file() and (source.suffix in (".py", ".sh") or source.name in
+                                         ("requirements.txt", "model-manifest.json", "prompt-imports.json")):
+                    shutil.copyfile(source, public_backend / source.name)
+            self.assertFalse((public_backend / "README.md").exists())
+            self.assertFalse((public_backend / "validation.json").exists())
+            self.run_install("qwen", backend=public_backend)
+
+    def run_install(self, asr_backend, backend=BACKEND):
         with tempfile.TemporaryDirectory(prefix="dictation-install-test-") as temporary:
             root = Path(temporary)
             source = root / "source"
@@ -60,13 +75,14 @@ class RuntimeInstallTests(unittest.TestCase):
             history = runtime.parent / "history.json"
             history.parent.mkdir(parents=True)
             history.write_bytes(b"private history sentinel")
-            result = subprocess.run(["/bin/bash", str(BACKEND / "install_runtime.sh")],
+            result = subprocess.run(["/bin/bash", str(backend / "install_runtime.sh")],
                 env={**os.environ, "LOCAL_DICTATION_SOURCE_WORK_DIR": str(source),
                      "LOCAL_DICTATION_RUNTIME_DIR": str(runtime), "LOCAL_DICTATION_ASR_BACKEND": asr_backend},
                 text=True, capture_output=True, timeout=45)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             for name in ("server.py", "streaming.py", "prompt_store.py", "prompt-imports.json", "test_prompt_store.py", "model_artifacts.py", "model-manifest.json"):
-                self.assertEqual((runtime / "backend" / name).read_bytes(), (BACKEND / name).read_bytes())
+                self.assertEqual((runtime / "backend" / name).read_bytes(), (backend / name).read_bytes())
+            self.assertFalse((runtime / "backend/validation.json").exists())
             self.assertIn("后端资源导入检查通过", result.stdout)
             self.assertEqual(history.read_bytes(), b"private history sentinel")
             self.assertFalse((runtime.parent / "cleanup-prompts.json").exists())

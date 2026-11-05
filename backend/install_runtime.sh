@@ -251,10 +251,15 @@ fi
 BACKEND_STAGE="$(mktemp -d "$RUNTIME_DIR/.install-backend.XXXXXX")"
 LAST_STAGE="$BACKEND_STAGE"
 mkdir "$BACKEND_STAGE/backend"
-for name in server.py streaming.py prompt_store.py prompt-imports.json model_artifacts.py model-manifest.json start.sh setup.sh download_models.py requirements.txt diagnose.py install_runtime.sh README.md test_server.py test_prompt_store.py validation.json; do
+for name in server.py streaming.py prompt_store.py prompt-imports.json model_artifacts.py model-manifest.json start.sh setup.sh download_models.py requirements.txt diagnose.py install_runtime.sh test_server.py test_prompt_store.py; do
   [[ -f "$BACKEND_DIR/$name" ]] || fail "交付文件缺失：$BACKEND_DIR/$name"
   /bin/cp -p "$BACKEND_DIR/$name" "$BACKEND_STAGE/backend/$name"
 done
+# Documentation is useful when present, but a clean source checkout contains
+# no local acceptance reports and must not depend on or install those reports.
+if [[ -f "$BACKEND_DIR/README.md" ]]; then
+  /bin/cp -p "$BACKEND_DIR/README.md" "$BACKEND_STAGE/backend/README.md"
+fi
 # Import the staged service with its own interpreter before publication. This
 # verifies local module dependencies without loading models or creating stores.
 "$VALIDATION_PYTHON" -B - "$BACKEND_STAGE/backend" <<'PYBACKEND' || fail "后端资源不完整；尚未发布新服务。"
