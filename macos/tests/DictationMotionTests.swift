@@ -163,14 +163,21 @@ enum DictationMotionChecks {
         let rowStart = ProcessInfo.processInfo.systemUptime
         let rowPlain = try frame(root, "sidebar-idle", since: rowStart)
         let idleShade = rowShade(row, in: root)
+        // Capture only this transition. Rendering can outlast a short hover
+        // effect on CI; drive its real easing/blend/draw at known progress.
+        var sidebarAnimation: DictationMotionAnimation?
+        DictationMotionAnimation.startForTesting = { sidebarAnimation = $0 }
+        defer { DictationMotionAnimation.startForTesting = nil }
         row.mouseEntered(with: event(.mouseEntered, for: row, point: NSPoint(x: 10, y: 10)))
-        // This check intentionally measures rendered colors rather than
-        // private transition state. A severely stalled renderer can still
-        // miss this narrow sample; retain the strict intermediate-color proof.
-        wait(0.035)
+        DictationMotionAnimation.startForTesting = nil
+        guard let sidebarAnimation else { throw NSError(domain: "SidebarMotion", code: 1, userInfo: [NSLocalizedDescriptionKey: "Hover did not start its animation"]) }
+        try require(sidebarAnimation.duration == 0.10 && sidebarAnimation.frameRate == 60,
+                    "Sidebar hover changed its 100ms / 60Hz timing contract")
+        try require(sidebarAnimation.currentProgress == 0, "Captured sidebar animation already advanced")
+        sidebarAnimation.currentProgress = 0.25
         let rowMiddle = try frame(root, "sidebar-hover-middle", since: rowStart)
         let middleShade = rowShade(row, in: root)
-        wait(0.10)
+        sidebarAnimation.currentProgress = 1
         let rowHover = try frame(root, "sidebar-hover-full", since: rowStart)
         let finalShade = rowShade(row, in: root)
         try require(rowPlain != rowMiddle && rowMiddle != rowHover, "Sidebar hover has no rendered color transition")

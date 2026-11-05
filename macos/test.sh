@@ -70,7 +70,7 @@ swiftc -swift-version 5 -parse-as-library "$TEST_SOURCE_DIR/DictationStore.swift
   -o "$TEST_BUILD_DIR/shortcut-feedback-checks"
 "$TEST_BUILD_DIR/shortcut-feedback-checks"
 
-swiftc -swift-version 5 -parse-as-library "$TEST_SOURCE_DIR/DictationStore.swift" \
+swiftc -swift-version 5 -parse-as-library -D DICTATION_MOTION_TESTS "$TEST_SOURCE_DIR/DictationStore.swift" \
   "$TEST_SOURCE_DIR/DictationMotion.swift" "$TEST_SOURCE_DIR/DictationViews.swift" "$TEST_SOURCE_DIR/HistoryReprocessing.swift" \
   "$TEST_SOURCE_DIR/DictationInsights.swift" "$TEST_SOURCE_DIR/ShortcutRecorder.swift" "$TEST_SOURCE_DIR/PromptStudio.swift" \
   "$TEST_SOURCE_DIR/tests/DictationMotionTests.swift" -o "$TEST_BUILD_DIR/motion-checks"

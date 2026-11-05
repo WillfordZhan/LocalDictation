@@ -19,6 +19,16 @@ final class DictationMotionAnimation: NSAnimation {
     }
     func cancel() { completion = nil; stop() }
     func finishImmediately() { stop(); currentProgress = 1 }
+
+#if DICTATION_MOTION_TESTS
+    /// The fixture can render a specific progress value through this same
+    /// animation's easing/update callback without racing the CI frame timer.
+    static var startForTesting: ((DictationMotionAnimation) -> Void)?
+    override func start() {
+        if let driver = Self.startForTesting { driver(self); return }
+        super.start()
+    }
+#endif
 }
 
 enum DictationMotion {
