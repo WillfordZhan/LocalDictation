@@ -14,6 +14,8 @@ jobs:
       - name: Protocol and scheduling tests without model downloads
         working-directory: backend
         run: python -m unittest discover -p 'test_*.py' -q
+      - name: Distribution validation
+        run: python -m unittest discover -s packaging -p 'test_*.py' -q
   native:
     runs-on: macos-14
     steps:

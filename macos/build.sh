@@ -32,6 +32,21 @@ if [[ -n "${LOCAL_DICTATION_PYTHON_BUNDLE:-}" ]]; then
   RUNTIME_STAGE="$RUNTIME_STAGE_ROOT/Python"
   trap 'rm -rf "$RUNTIME_STAGE_ROOT"' EXIT
   cp -cR "$LOCAL_DICTATION_PYTHON_BUNDLE" "$RUNTIME_STAGE" || ditto "$LOCAL_DICTATION_PYTHON_BUNDLE" "$RUNTIME_STAGE"
+  # Development/evaluation imports can leave bytecode with local co_filename
+  # paths after the runtime manifest was built. Remove only generated caches
+  # from this new staging copy, then require an exact manifest match.
+  python3 -B - "$RUNTIME_STAGE" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+root = Path(sys.argv[1])
+for path in root.rglob("__pycache__"):
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+for pattern in ("*.pyc", "*.pyo"):
+    for path in root.rglob(pattern):
+        path.unlink()
+PY
   python3 "$APP_SOURCE_DIR/../packaging/validate_runtime.py" "$RUNTIME_STAGE"
   # Only inactive build output is replaced. Never sign an old or partial
   # interpreter left by an earlier build in this directory.
