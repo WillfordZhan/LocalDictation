@@ -134,8 +134,12 @@ enum DictationUIChecks {
                 let action = descendants(row).compactMap { $0 as? NSButton }.first!
                 let text = row.subviews.compactMap { $0 as? NSTextField }.first!
                 let textRect = text.alignmentRect(forFrame: text.frame)
-                try require(abs(action.frame.width - 64) < 1 && textRect.maxX <= action.frame.minX - 11, "Learning action stretches or overlaps correction text")
-                rightEdges.append(action.convert(action.bounds, to: root).maxX)
+                let actionRect = action.alignmentRect(forFrame: action.frame)
+                // Auto Layout constrains the alignment rect. Native button
+                // bezels extend their drawing frames differently across macOS.
+                try require(abs(actionRect.width - 64) < 1 && textRect.maxX <= actionRect.minX - 11,
+                            "Learning action stretches or overlaps correction text: frame=\(action.frame), alignment=\(actionRect)")
+                rightEdges.append(row.convert(actionRect, to: root).maxX)
             }
             try require(rightEdges.max()! - rightEdges.min()! < 1, "Learned and manual actions do not share a right edge")
             if let output { try controller.renderPNG(to: output.appendingPathComponent("dictionary-learning-\(Int(width)).png")) }
@@ -432,13 +436,15 @@ enum DictationUIChecks {
             for row in rows {
                 let remove = try button("删除", in: row)
                 let text = row.subviews.compactMap { $0 as? NSTextField }.first!
-                // AppKit labels draw with a two-point frame inset. Compare
-                // their alignment rect, which the stack's constraints use.
+                // Labels and native button bezels both have drawing insets.
+                // Compare the alignment rectangles used by stack constraints.
                 let textRect = text.alignmentRect(forFrame: text.frame)
-                try require(abs(remove.frame.width - 64) < 1, "Delete button stretches with window")
-                try require(abs(remove.frame.maxX - row.bounds.maxX) < 1 && abs(textRect.minX) < 1, "Dictionary row alignment drifted")
-                try require(textRect.maxX <= remove.frame.minX - 11, "Term overlaps delete button")
-                rightEdges.append(remove.convert(remove.bounds, to: root).maxX)
+                let removeRect = remove.alignmentRect(forFrame: remove.frame)
+                try require(abs(removeRect.width - 64) < 1,
+                            "Delete button stretches with window: frame=\(remove.frame), alignment=\(removeRect)")
+                try require(abs(removeRect.maxX - row.bounds.maxX) < 1 && abs(textRect.minX) < 1, "Dictionary row alignment drifted")
+                try require(textRect.maxX <= removeRect.minX - 11, "Term overlaps delete button")
+                rightEdges.append(row.convert(removeRect, to: root).maxX)
             }
             try require((rightEdges.max()! - rightEdges.min()!) < 1, "Delete buttons do not share right edge")
         }
