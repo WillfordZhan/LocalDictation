@@ -8,10 +8,11 @@ struct DictationCorrectionCandidate: Equatable {
     let corrected: String
     let bundleID: String?
     let observedAt: Date
+    var requiresConfirmation = false
 }
 
 enum DictationCorrectionAvailability: Equatable {
-    case idle, confirming, observing, learned, unsupported, unconfirmed
+    case idle, confirming, observing, learned, awaitingConfirmation, unsupported, unconfirmed
 }
 
 struct DictationCorrectionSnapshot {
@@ -25,10 +26,49 @@ enum DictationCorrectionReadResult {
     case focusChanged
 }
 
-/// Detects one spelling/casing correction, not semantic rewriting. Both the
-/// unchanged surrounding text and the complete edited token must agree.
+/// Automatic learning requires a spelling/casing signal. Short lower-case
+/// phrases remain ambiguous and can only become an explicit confirmation.
+/// In either path, replaying the same replacement must explain the entire edit.
 enum DictationCorrectionDetector {
+    static func candidate(in original: String, edited: String) -> (original: String, corrected: String, requiresConfirmation: Bool)? {
+        if let correction = correction(in: original, edited: edited) {
+            return (correction.original, correction.corrected, false)
+        }
+        let before = Array(original), after = Array(edited)
+        guard let start = firstChange(before, after),
+              let oldRange = phraseRange(in: before, at: start),
+              let newRange = phraseRange(in: after, at: start) else { return nil }
+        let source = String(before[oldRange]), destination = String(after[newRange])
+        let oldWords = source.split(separator: " ", omittingEmptySubsequences: false)
+        let newWords = destination.split(separator: " ", omittingEmptySubsequences: false)
+        // Keep the confirmation about a short term, not a rewritten English
+        // sentence. A neighbouring unchanged word supplies the phrase scope.
+        guard (2...3).contains(oldWords.count), oldWords.count == newWords.count,
+              source.count <= 64, destination.count <= 64,
+              oldWords.allSatisfy({ !$0.isEmpty && $0.allSatisfy(isLowercaseLetter) }),
+              newWords.allSatisfy({ !$0.isEmpty && $0.allSatisfy(isLowercaseLetter) }) else { return nil }
+        let changed = oldWords.indices.filter { oldWords[$0] != newWords[$0] }
+        guard changed.count == 1 else { return nil }
+        let a = Array(oldWords[changed[0]]), b = Array(newWords[changed[0]])
+        guard min(a.count, b.count) >= 3, abs(a.count - b.count) <= 1,
+              editDistance(a, b) <= 2, hasTermShape(destination),
+              replacementExplainsEdit(original, edited: edited, source: source, destination: destination) else { return nil }
+        return (source, destination, true)
+    }
+
     static func correction(in original: String, edited: String) -> (original: String, corrected: String)? {
+        if let result = singleCorrection(in: original, edited: edited) { return result }
+        let before = Array(original), after = Array(edited)
+        guard let start = firstChange(before, after),
+              let oldRange = tokenRange(in: original, characters: before, start: start, end: start + 1),
+              let newRange = tokenRange(in: edited, characters: after, start: start, end: start + 1) else { return nil }
+        let source = String(before[oldRange]), destination = String(after[newRange])
+        guard isHighConfidence(source: source, destination: destination),
+              replacementExplainsEdit(original, edited: edited, source: source, destination: destination) else { return nil }
+        return (source, destination)
+    }
+
+    private static func singleCorrection(in original: String, edited: String) -> (original: String, corrected: String)? {
         let before = Array(original), after = Array(edited)
         guard before != after, !before.isEmpty, !after.isEmpty else { return nil }
         // Appending a message or deleting its tail is not an explicit correction.
@@ -48,6 +88,70 @@ enum DictationCorrectionDetector {
         let destination = String(after[token])
         guard isHighConfidence(source: source, destination: destination) else { return nil }
         return (source, destination)
+    }
+
+    private static func firstChange(_ before: [Character], _ after: [Character]) -> Int? {
+        var index = 0
+        while index < min(before.count, after.count), before[index] == after[index] { index += 1 }
+        // A pure append/delete is not a correction, even if the result looks
+        // like a known technical identifier.
+        return index < min(before.count, after.count) ? index : nil
+    }
+
+    private static func isLowercaseLetter(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy { (97...122).contains($0.value) }
+    }
+
+    private static func phraseRange(in characters: [Character], at index: Int) -> Range<Int>? {
+        func isPhraseCharacter(_ value: Character) -> Bool { isLowercaseLetter(value) || value == " " }
+        guard characters.indices.contains(index), isPhraseCharacter(characters[index]) else { return nil }
+        var lower = index, upper = index + 1
+        while lower > 0, isPhraseCharacter(characters[lower - 1]) { lower -= 1 }
+        while upper < characters.count, isPhraseCharacter(characters[upper]) { upper += 1 }
+        while lower < upper, characters[lower] == " " { lower += 1 }
+        while upper > lower, characters[upper - 1] == " " { upper -= 1 }
+        return lower..<upper
+    }
+
+    private static func hasTermShape(_ phrase: String) -> Bool {
+        let tagger = NLTagger(tagSchemes: [.lexicalClass])
+        tagger.string = phrase; tagger.setLanguage(.english, range: phrase.startIndex..<phrase.endIndex)
+        var tags: [NLTag] = []
+        tagger.enumerateTags(in: phrase.startIndex..<phrase.endIndex, unit: .word, scheme: .lexicalClass,
+                             options: [.omitWhitespace, .omitPunctuation]) { tag, _ in
+            tags.append(tag ?? .otherWord); return true
+        }
+        // A noun phrase may contain an ambiguous internal word ("cache hit
+        // rate"). Verb-led commands and pronoun-led sentences are not terms.
+        // This is only a conservative presentation filter, never proof that a
+        // lower-case replacement is semantically equivalent or safe to learn.
+        return (tags.first == .noun || tags.first == .adjective) && tags.last == .noun
+    }
+
+    private static func replacementExplainsEdit(_ original: String, edited: String,
+                                                source: String, destination: String) -> Bool {
+        let before = Array(original), after = Array(edited), source = Array(source), destination = Array(destination)
+        guard !source.isEmpty, !destination.isEmpty, source != destination else { return false }
+        func matches(_ term: [Character], in text: [Character], at index: Int) -> Bool {
+            guard index + term.count <= text.count,
+                  text[index..<index + term.count].elementsEqual(term) else { return false }
+            return (index == 0 || !isIdentifier(text[index - 1]))
+                && (index + term.count == text.count || !isIdentifier(text[index + term.count]))
+        }
+        var oldIndex = 0, newIndex = 0, replacements = 0
+        while oldIndex < before.count {
+            if matches(source, in: before, at: oldIndex) {
+                if matches(destination, in: after, at: newIndex) {
+                    oldIndex += source.count; newIndex += destination.count; replacements += 1
+                } else if matches(source, in: after, at: newIndex) {
+                    oldIndex += source.count; newIndex += source.count
+                } else { return false }
+            } else {
+                guard newIndex < after.count, before[oldIndex] == after[newIndex] else { return false }
+                oldIndex += 1; newIndex += 1
+            }
+        }
+        return newIndex == after.count && replacements > 0
     }
 
     private static func tokenRange(in text: String, characters: [Character], start: Int, end: Int) -> Range<Int>? {
@@ -263,10 +367,11 @@ final class DictationCorrectionObserver {
                 item.pending = edited; item.pendingSince = clock(); observation = item; return
             }
             guard clock() - item.pendingSince >= 1.5, selection.length == 0 else { return }
-            guard let correction = DictationCorrectionDetector.correction(in: item.original, edited: edited) else { stop(); return }
+            guard let correction = DictationCorrectionDetector.candidate(in: item.original, edited: edited) else { stop(); return }
             let candidate = DictationCorrectionCandidate(entryID: item.entryID, original: correction.original,
-                corrected: correction.corrected, bundleID: item.bundleID, observedAt: Date())
-            stop(); setAvailability(.learned); onCorrection?(candidate)
+                corrected: correction.corrected, bundleID: item.bundleID, observedAt: Date(),
+                requiresConfirmation: correction.requiresConfirmation)
+            stop(); setAvailability(correction.requiresConfirmation ? .awaitingConfirmation : .learned); onCorrection?(candidate)
         }
     }
 

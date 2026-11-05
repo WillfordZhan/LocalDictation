@@ -22,9 +22,15 @@ struct DictationCorrectionHint: Codable, Equatable {
     let corrected: String
 }
 
+enum DictationWaveformStyle: String, Codable, CaseIterable {
+    case lively, gentle
+    var title: String { self == .lively ? "灵动" : "柔和" }
+}
+
 struct DictationPreferences: Codable {
     var cleanupEnabled = true
     var autoInsertEnabled = true
+    var waveformStyle: DictationWaveformStyle = .lively
     var recognitionLanguage = "zh"
     // Kept in the settings schema for old installations; -1 means permanent.
     // Session-only and age-based deletion are no longer supported policies.
@@ -45,7 +51,7 @@ struct DictationPreferences: Codable {
     init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case cleanupEnabled, autoInsertEnabled, recognitionLanguage, historyRetentionDays, vocabulary
+        case cleanupEnabled, autoInsertEnabled, waveformStyle, recognitionLanguage, historyRetentionDays, vocabulary
         case automaticVocabularyLearning, learnedVocabulary
         case shortcutMode, shortcutKeyCode, shortcutModifiers, shortcutDisplay
     }
@@ -55,6 +61,7 @@ struct DictationPreferences: Codable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         cleanupEnabled = try values.decodeIfPresent(Bool.self, forKey: .cleanupEnabled) ?? true
         autoInsertEnabled = try values.decodeIfPresent(Bool.self, forKey: .autoInsertEnabled) ?? true
+        waveformStyle = (try? values.decodeIfPresent(DictationWaveformStyle.self, forKey: .waveformStyle)) ?? .lively
         recognitionLanguage = try values.decodeIfPresent(String.self, forKey: .recognitionLanguage) ?? "zh"
         historyRetentionDays = (try? values.decodeIfPresent(Int.self, forKey: .historyRetentionDays)) ?? -1
         vocabulary = try values.decodeIfPresent([String].self, forKey: .vocabulary) ?? []

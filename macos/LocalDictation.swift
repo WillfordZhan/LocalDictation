@@ -424,6 +424,7 @@ private final class TextInserter {
 private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate {
     private let correctionObserver = DictationCorrectionObserver()
     private let learningToast = DictationLearningToast()
+    private var pendingCorrectionID: UUID?
     private var correctionStatus = "填入后纠正术语，可自动加入词典。"
     private var phase: Phase = .idle
     private var statusText = "准备就绪"
@@ -532,7 +533,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
                 self.lastEntryID = nil; self.detailText = ""
             }
             self.windowController?.reloadStore()
-            if !self.store.preferences.automaticVocabularyLearning { self.correctionObserver.stop() }
+            if !self.store.preferences.automaticVocabularyLearning {
+                self.correctionObserver.stop()
+                if self.learningToast.awaitingConfirmation { self.learningToast.hide() }
+            }
             self.updateUI()
         }
         if let option = CommandLine.arguments.firstIndex(of: "--render-preview"), CommandLine.arguments.count > option + 1 {
@@ -1406,6 +1410,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         state.recording = phase == .recording; state.processing = phase == .processing
         state.cleanupEnabled = (activePreferences ?? store.preferences).cleanupEnabled
         state.cleanupBackend = cleanupBackend
+        state.waveformStyle = store.preferences.waveformStyle
         state.canStart = canBeginRecording; state.canCancel = phase.busy
         state.pendingCount = streamingJobs.filter { $0.stoppedAt != nil }.count
         state.elapsedSeconds = phase == .recording ? Int(streamingCapture?.meterSnapshot.elapsedSeconds ?? recorder?.currentTime ?? 0)
@@ -2439,6 +2444,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             case .idle: self.correctionStatus = "填入后纠正术语，可自动加入词典。"
             case .confirming: self.correctionStatus = "正在确认文字已填入。"
             case .observing: self.correctionStatus = "正在留意本次文字中的术语纠正。"
+            case .awaitingConfirmation: self.correctionStatus = "发现词组纠正，确认后可记住。"
             case .learned: break // The persistence callback supplies the actual outcome.
             case .unsupported: self.correctionStatus = "当前输入框不支持读取修改，仍可手动添加词条。"
             case .unconfirmed: self.correctionStatus = "未能确认本次填入，已跳过自动学习。"
@@ -2446,21 +2452,48 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             self.windowController?.updateCorrectionLearning(status: self.correctionStatus)
         }
         correctionObserver.onCorrection = { [weak self] candidate in
-            guard let self, !self.terminating else { return }
-            guard let learned = self.store.learnVocabulary(original: candidate.original, corrected: candidate.corrected,
-                entryID: candidate.entryID, bundleID: candidate.bundleID, at: candidate.observedAt) else {
-                self.correctionStatus = self.store.storageError ?? "已跳过已有词条或撤销过的纠正。"
+            guard let self, !self.terminating, self.store.preferences.automaticVocabularyLearning else { return }
+            // Previously undone pairs remain a rejection memory. Do not ask
+            // the user to confirm a pair the store intentionally will not learn.
+            if self.store.preferences.learnedVocabulary.contains(where: {
+                $0.original == candidate.original && $0.corrected == candidate.corrected
+            }) {
+                self.correctionStatus = "填入后纠正术语，可自动加入词典。"
                 self.windowController?.updateCorrectionLearning(status: self.correctionStatus)
                 return
             }
-            self.correctionStatus = self.store.storageError ?? "已学会 \(learned.corrected)，可在此撤销。"
+            if candidate.requiresConfirmation {
+                let pendingID = UUID(); self.pendingCorrectionID = pendingID
+                self.learningToast.showConfirmation(original: candidate.original, term: candidate.corrected, onIgnored: { [weak self] in
+                    guard let self, self.pendingCorrectionID == pendingID else { return }
+                    self.pendingCorrectionID = nil
+                    if self.correctionObserver.availability == .awaitingConfirmation {
+                        self.correctionStatus = "填入后纠正术语，可自动加入词典。"
+                        self.windowController?.updateCorrectionLearning(status: self.correctionStatus)
+                    }
+                }) { [weak self] in
+                    self?.acceptCorrection(candidate)
+                }
+            } else { self.acceptCorrection(candidate) }
+        }
+    }
+
+    private func acceptCorrection(_ candidate: DictationCorrectionCandidate) {
+        pendingCorrectionID = nil
+        guard !terminating, store.preferences.automaticVocabularyLearning else { return }
+        guard let learned = store.learnVocabulary(original: candidate.original, corrected: candidate.corrected,
+            entryID: candidate.entryID, bundleID: candidate.bundleID, at: candidate.observedAt) else {
+            self.correctionStatus = self.store.storageError ?? "已跳过已有词条或撤销过的纠正。"
             self.windowController?.updateCorrectionLearning(status: self.correctionStatus)
-            self.learningToast.show(term: learned.corrected) { [weak self] in
-                guard let self else { return }
-                let undone = self.store.undoLearnedVocabulary(id: learned.id)
-                self.correctionStatus = undone ? "已撤销 \(learned.corrected)。" : self.store.storageError ?? "该学习记录已撤销。"
-                self.windowController?.updateCorrectionLearning(status: self.correctionStatus)
-            }
+            return
+        }
+        self.correctionStatus = self.store.storageError ?? "已学会 \(learned.corrected)，可在此撤销。"
+        self.windowController?.updateCorrectionLearning(status: self.correctionStatus)
+        self.learningToast.show(term: learned.corrected) { [weak self] in
+            guard let self else { return }
+            let undone = self.store.undoLearnedVocabulary(id: learned.id)
+            self.correctionStatus = undone ? "已撤销 \(learned.corrected)。" : self.store.storageError ?? "该学习记录已撤销。"
+            self.windowController?.updateCorrectionLearning(status: self.correctionStatus)
         }
     }
 

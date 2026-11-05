@@ -158,6 +158,17 @@ enum DictationUIChecks {
         try require(!descendants(root).contains { $0.identifier?.rawValue == "correction-learning-status" }, "Learning status is displayed outside dictionary")
         try require(controller.window?.isVisible == false, "Learning fixture unexpectedly displayed its window")
 
+        controller.showPage(.settings)
+        let waveform = try control(NSPopUpButton.self, beside: "波形动效", in: root)
+        try require(waveform.titleOfSelectedItem == "灵动" && store.preferences.waveformStyle == .lively,
+                    "An upgrade must preserve the existing lively waveform by default")
+        waveform.selectItem(withTitle: "柔和"); try sendAction(waveform)
+        try require(store.preferences.waveformStyle == .gentle && DictationStore(directory: directory).preferences.waveformStyle == .gentle,
+                    "The waveform choice did not persist across a store restart")
+        let lively = try control(NSPopUpButton.self, beside: "波形动效", in: root)
+        lively.selectItem(withTitle: "灵动"); try sendAction(lively)
+        try require(DictationStore(directory: directory).preferences.waveformStyle == .lively, "Could not switch back to the original motion")
+
         let toast = DictationLearningToast()
         let panel = Mirror(reflecting: toast).children.first { $0.label == "panel" }!.value as! NSPanel
         let toastRoot = panel.contentView!
@@ -172,6 +183,21 @@ enum DictationUIChecks {
         try require(toastUndo.acceptsFirstMouse(for: nil), "Undo needs a focus-acquiring first click")
         toastUndo.performClick(nil); toastUndo.performClick(nil)
         try require(actions == 1 && !toastUndo.isEnabled, "Learning toast undo executed more than once")
+
+        var remembered = 0
+        toast.showConfirmation(original: "pass ratio", term: "path ratio", showWindow: false, visibleFrame: visibleFrame) { remembered += 1 }
+        try require(toast.awaitingConfirmation && remembered == 0 && containsText("记住 path ratio？", in: toastRoot),
+                    "A phrase suggestion wrote a correction without confirmation")
+        if let output { try toast.renderPNG(to: output.appendingPathComponent("phrase-confirmation.png")) }
+        let remember = try button("记住", in: toastRoot)
+        remember.performClick(nil); remember.performClick(nil)
+        try require(remembered == 1 && !toast.awaitingConfirmation, "Confirming a phrase did not execute exactly once")
+        var ignored = 0
+        toast.showConfirmation(original: "cash ratio", term: "cache ratio", showWindow: false, visibleFrame: visibleFrame,
+                               onIgnored: { ignored += 1 }) { remembered += 1 }
+        toast.hide(); toast.hide()
+        try require(remembered == 1 && ignored == 1 && !toast.awaitingConfirmation,
+                    "Dismissing a suggestion learned it or failed to close its pending state exactly once")
 
         // Deadlines and replaced notices must release their callbacks. None of
         // these checks displays a window or touches the destination application.

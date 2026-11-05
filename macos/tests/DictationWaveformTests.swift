@@ -137,6 +137,31 @@ enum DictationWaveformTests {
         sixty.advance(average: 1, peak: 1, seconds: .nan)
         require(sixty.columns == finiteBefore, "Invalid frame timestamps corrupted the waveform")
 
+        // Compare motion under the same measured speech without damping real
+        // onsets or extending silence release. Both remain display-rate invariant.
+        var livelyMotion = DictationWaveformEnvelope(seed: 55), gentleMotion = DictationWaveformEnvelope(seed: 55)
+        var previousLively = Array(repeating: 2.0, count: 10), previousGentle = previousLively
+        var livelyVariation = 0.0, gentleVariation = 0.0
+        for frame in 0..<1200 {
+            let db = -26.0 + 7 * sin(Double(frame) / 18) + 2 * sin(Double(frame) / 5)
+            livelyMotion.advance(average: measured(db), peak: measured(db + 8), seconds: 1.0 / 60)
+            gentleMotion.advance(average: measured(db), peak: measured(db + 8), seconds: 1.0 / 60, style: .gentle)
+            let lhs = livelyMotion.columns.map { DictationWaveformEnvelope.displayHeight(for: $0) }
+            let rhs = gentleMotion.columns.map { DictationWaveformEnvelope.displayHeight(for: $0) }
+            livelyVariation += zip(lhs, previousLively).map { abs($0 - $1) }.reduce(0, +)
+            gentleVariation += zip(rhs, previousGentle).map { abs($0 - $1) }.reduce(0, +)
+            previousLively = lhs; previousGentle = rhs
+        }
+        require(gentleVariation < livelyVariation * 0.9 && gentleVariation > livelyVariation * 0.6,
+                "Gentle motion either stayed as busy as lively or became excessively muted")
+        var gentleOnset = DictationWaveformEnvelope(seed: 55)
+        gentleOnset.advance(average: measured(-14), peak: measured(-6), seconds: 1.0 / 120, style: .gentle)
+        require(gentleOnset.columns.max()! >= target * 0.8, "Gentle motion delayed a real onset")
+        gentleOnset.advance(average: measured(-35), peak: measured(-29), seconds: 1.0 / 120, style: .gentle)
+        require(gentleOnset.columns.allSatisfy { $0 <= quieter * 1.1 + 1e-9 }, "Gentle motion delayed a softer voice")
+        for _ in 0..<10 { gentleOnset.advance(average: 0, peak: 0, seconds: 1.0 / 120, style: .gentle) }
+        require(gentleOnset.columns.allSatisfy { $0 == 0 }, "Gentle silence release exceeded 84ms")
+
         NSApplication.shared.setActivationPolicy(.prohibited)
         require(CommandLine.arguments.count == 2, "Pass an output directory for temporary frames")
         let directory = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
@@ -166,7 +191,7 @@ enum DictationWaveformTests {
         hud.hide()
         require(deliveryHide?.isCancelled == true, "Explicit hide must cancel pending delivery feedback")
         let speech: [Double] = [-46, -38, -26, -15, -23, -32, -43, -51, -39, -28, -18, -27, -35, -49, -58, -54, -37, -21, -10, -25, -34]
-        var comparisonEnvelope = DictationWaveformEnvelope(seed: 54)
+        let gentleHUD = DictationHUD()
         let began = ProcessInfo.processInfo.systemUptime
         for frame in 0..<360 {
             let time = Double(frame) / 60
@@ -189,19 +214,15 @@ enum DictationWaveformTests {
             state.meterPeakLevel = speaking ? measured(sampleDB + 8) : 0
             let file = directory.appendingPathComponent(String(format: "frame-%03d.png", frame))
             try hud.renderPNG(to: file, state: state, animationTime: time, reduceMotion: false)
-            comparisonEnvelope.advance(average: state.meterLevel, peak: state.meterPeakLevel, seconds: 1.0 / 60)
-            let sheet = NSImage(size: NSSize(width: 240, height: 100)); sheet.lockFocus()
-            NSColor(white: 0.96, alpha: 1).setFill(); NSRect(x: 0, y: 0, width: 240, height: 100).fill()
-            for (row, caption) in ["0.5.3", "0.5.4"].enumerated() {
+            var gentleState = state; gentleState.waveformStyle = .gentle
+            let gentleFile = directory.appendingPathComponent(String(format: "gentle-%03d.png", frame))
+            try gentleHUD.renderPNG(to: gentleFile, state: gentleState, animationTime: time, reduceMotion: false)
+            let sheet = NSImage(size: NSSize(width: 226, height: 100)); sheet.lockFocus()
+            NSColor(white: 0.96, alpha: 1).setFill(); NSRect(x: 0, y: 0, width: 226, height: 100).fill()
+            for (row, caption) in ["灵动", "柔和"].enumerated() {
                 let y = CGFloat(54 - row * 46)
-                (caption as NSString).draw(at: NSPoint(x: 12, y: y + 9), withAttributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.darkGray])
-                NSColor(white: 0.055, alpha: 1).setFill()
-                NSBezierPath(roundedRect: NSRect(x: 72, y: y, width: 132, height: 34), xRadius: 17, yRadius: 17).fill()
-                NSColor.white.setFill()
-                for (index, column) in comparisonEnvelope.columns.enumerated() {
-                    let barHeight = row == 0 ? 2 + 16 * column : DictationWaveformEnvelope.displayHeight(for: column)
-                    NSBezierPath(roundedRect: NSRect(x: 119 + CGFloat(index * 4), y: y + (34 - barHeight) / 2, width: 2, height: barHeight), xRadius: 1, yRadius: 1).fill()
-                }
+                (caption as NSString).draw(at: NSPoint(x: 16, y: y + 9), withAttributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.darkGray])
+                NSImage(contentsOf: row == 0 ? file : gentleFile)?.draw(in: NSRect(x: 76, y: y, width: 118, height: 34))
             }
             sheet.unlockFocus()
             if let tiff = sheet.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff) {

@@ -23,11 +23,14 @@ final class DictationLearningToast: NSObject {
     private let panel: LearningToastPanel
     private let surface = LearningToastSurface()
     private let message = NSTextField(labelWithString: "")
+    private let icon = NSImageView()
     private let undo = LearningToastButton(title: "撤销", target: nil, action: nil)
     private let dismiss = LearningToastButton(title: "", target: nil, action: nil)
     private var onUndo: (() -> Void)?
+    private var onIgnored: (() -> Void)?
     private var expiration: DispatchWorkItem?
     private var generation: UInt64 = 0
+    private(set) var awaitingConfirmation = false
 
     override init() {
         panel = LearningToastPanel(contentRect: NSRect(x: 0, y: 0, width: 270, height: 44),
@@ -38,7 +41,7 @@ final class DictationLearningToast: NSObject {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.appearance = NSAppearance(named: .aqua); panel.contentView = surface
         surface.setAccessibilityElement(false)
-        let icon = NSImageView(image: NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: nil)!)
+        icon.image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: nil)
         icon.contentTintColor = NSColor(white: 1, alpha: 0.7)
         icon.setAccessibilityElement(false)
         message.font = .systemFont(ofSize: 12.5, weight: .medium); message.textColor = .white
@@ -74,11 +77,27 @@ final class DictationLearningToast: NSObject {
 
     func show(term: String, showWindow: Bool = true, visibleFrame: NSRect? = nil,
               onUndo: @escaping () -> Void) {
+        present(term: term, original: nil, showWindow: showWindow, visibleFrame: visibleFrame, onIgnored: nil, action: onUndo)
+    }
+
+    func showConfirmation(original: String, term: String, showWindow: Bool = true, visibleFrame: NSRect? = nil,
+                          onIgnored: (() -> Void)? = nil,
+                          onRemember: @escaping () -> Void) {
+        present(term: term, original: original, showWindow: showWindow, visibleFrame: visibleFrame, onIgnored: onIgnored, action: onRemember)
+    }
+
+    private func present(term: String, original: String?, showWindow: Bool, visibleFrame: NSRect?,
+                         onIgnored: (() -> Void)?, action: @escaping () -> Void) {
         generation &+= 1; let current = generation
         expiration?.cancel(); DictationMotion.cancel(surface)
-        self.onUndo = onUndo; undo.isEnabled = true; dismiss.isEnabled = true
-        message.stringValue = "已学会 \(term)"; message.toolTip = term
-        undo.setAccessibilityLabel("撤销学习：\(term)")
+        awaitingConfirmation = original != nil
+        self.onIgnored = onIgnored
+        self.onUndo = action; undo.isEnabled = true; dismiss.isEnabled = true
+        message.stringValue = awaitingConfirmation ? "记住 \(term)？" : "已学会 \(term)"
+        message.toolTip = original.map { "\($0) → \(term)" } ?? term
+        undo.title = awaitingConfirmation ? "记住" : "撤销"
+        undo.setAccessibilityLabel((awaitingConfirmation ? "记住词组：" : "撤销学习：") + term)
+        icon.image = NSImage(systemSymbolName: awaitingConfirmation ? "book" : "checkmark.circle", accessibilityDescription: nil)
         let frame = visibleFrame ?? NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })?.visibleFrame
             ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1000, height: 700)
         let textWidth = (message.stringValue as NSString).size(withAttributes: [.font: message.font!]).width
@@ -92,13 +111,18 @@ final class DictationLearningToast: NSObject {
             guard let self, self.generation == current else { return }
             self.hide()
         }
-        expiration = deadline; DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: deadline)
+        expiration = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + (awaitingConfirmation ? 12 : 5), execute: deadline)
     }
 
     func hide() {
+        let ignored = onIgnored
+        onIgnored = nil
         generation &+= 1; let current = generation
         expiration?.cancel(); expiration = nil; onUndo = nil
+        awaitingConfirmation = false
         undo.isEnabled = false; dismiss.isEnabled = false
+        ignored?()
         guard panel.isVisible else { DictationMotion.cancel(surface); return }
         DictationMotion.fade(surface, to: 0, duration: 0.12) { [weak self] in
             guard let self, self.generation == current else { return }
@@ -108,6 +132,7 @@ final class DictationLearningToast: NSObject {
 
     @objc private func undoLearning() {
         guard let action = onUndo else { return }
+        onIgnored = nil
         hide(); action()
     }
     @objc private func dismissNotice() { hide() }

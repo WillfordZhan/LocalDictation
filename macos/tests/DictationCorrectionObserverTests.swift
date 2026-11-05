@@ -35,6 +35,40 @@ enum DictationCorrectionObserverTests {
         detects("hello world", "Hello world", nil)
         detects("SalesPar", "SalesPart", nil)
         detects("SalesPart", "SalesPar", nil)
+        detects("比较 SalesPrat 和 SalesPrat。", "比较 SalesPart 和 SalesPart。", ("SalesPrat", "SalesPart"))
+        detects("比较 SalesPrat 和 SalesPrat。", "比较 SalesPart 和 SalesPrat。", ("SalesPrat", "SalesPart"))
+        detects("比较 SalesPrat 和 ProductPrat。", "比较 SalesPart 和 ProductPart。", nil)
+        detects("比较 SalesPrat 和 SalesPart。", "比较 SalesPart 和 SalesPrat。", nil)
+        detects("计算 pass ratio 的值。", "计算 pathRatio 的值。", ("pass ratio", "pathRatio"))
+        detects("计算 pass ratio 的值。", "计算 path ratio 的值。", nil)
+
+        // Lower-case phrases cannot be promoted to automatic terminology by
+        // spelling similarity alone. Preserve their full scope for confirmation.
+        let phrase = DictationCorrectionDetector.candidate(in: "计算 pass ratio 的值。", edited: "计算 path ratio 的值。")
+        precondition(phrase?.original == "pass ratio" && phrase?.corrected == "path ratio" && phrase?.requiresConfirmation == true,
+                     "A spaced, lower-case correction needs a complete confirmation candidate")
+        func suggests(_ before: String, _ after: String, _ expected: (String, String)?, file: StaticString = #file, line: UInt = #line) {
+            let result = DictationCorrectionDetector.candidate(in: before, edited: after)
+            precondition(result?.original == expected?.0 && result?.corrected == expected?.1 &&
+                         (result == nil || result?.requiresConfirmation == true),
+                         "Unexpected confirmation: \(before) -> \(after); got \(String(describing: result))", file: file, line: line)
+        }
+        suggests("检查 cache lime 的值。", "检查 cache line 的值。", ("cache lime", "cache line"))
+        suggests("检查 cache ration 的值。", "检查 cache ratio 的值。", ("cache ration", "cache ratio"))
+        suggests("🍎 检查 pass ratio，再看 pass ratio。", "🍎 检查 path ratio，再看 path ratio。", ("pass ratio", "path ratio"))
+        suggests("检查 pass ratio，再看 pass ratio。", "检查 path ratio，再看 pass ratio。", ("pass ratio", "path ratio"))
+        suggests("检查 pass ratio，再看 cache lime。", "检查 path ratio，再看 cache line。", nil)
+        suggests("计算 pass ratio。", "删除 path ratio。", nil)
+        suggests("计算 pass ratio。", "计算 path ratio。再检查一次。", nil)
+        suggests("计算 pass ratio。", "计算 path percentage。", nil)
+        suggests("计算 pass ratio。", "计算 path ratio2。", nil)
+        suggests("计算 ratio 8080。", "计算 ratio 8081。", nil)
+        suggests("run cat", "run car", nil)
+        suggests("we saw cat", "we saw car", nil)
+        suggests("please change the cat", "please change the car", nil)
+        suggests("cat", "car", nil)
+        suggests("hello world", "Hello world", nil)
+        suggests("计算 pass ratio。", "计算 pass  ratio。", nil)
 
         let element = AXUIElementCreateApplication(getpid()) // Identity fixture, never queried.
         var now: TimeInterval = 100
@@ -111,6 +145,17 @@ enum DictationCorrectionObserverTests {
             text: "SalesPrat", entryID: entryID, bundleID: nil)
         precondition(observer.availability == .unsupported)
 
+        confirmed("计算 pass ratio，再核对 pass ratio。")
+        text("计算 path ratio，再核对 path ratio。")
+        tick(); tick(1.6)
+        precondition(candidates.count == 4 && candidates.last?.original == "pass ratio" &&
+                     candidates.last?.corrected == "path ratio" && candidates.last?.requiresConfirmation == true &&
+                     observer.availability == .awaitingConfirmation,
+                     "A verified phrase edit must ask for confirmation, never report automatic learning")
+        tick(2)
+        precondition(candidates.count == 4, "A pending confirmation must not repeatedly prompt")
+        precondition(candidates.prefix(3).allSatisfy { !$0.requiresConfirmation }, "Existing high-confidence corrections changed policy")
+
         // An older AX response may return after the next paste. Its generation
         // must be discarded even when the two fields contain identical text.
         let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
@@ -127,6 +172,6 @@ enum DictationCorrectionObserverTests {
         release.signal(); RunLoop.current.run(until: Date().addingTimeInterval(0.03))
         precondition(delayed.availability == .confirming && lateCandidates == 0)
         delayed.stop(); observer.stop()
-        print("PASS correction observer: terminology confidence, verified insertion, stability, UTF-16 scope, focus/submission/timeout, unsupported AX, one result, late callback isolation")
+        print("PASS correction observer: automatic terminology confidence, complete phrase confirmation, repeated replacements, verified insertion, stability, UTF-16 scope, focus/submission/timeout, unsupported AX, one result, late callback isolation")
     }
 }

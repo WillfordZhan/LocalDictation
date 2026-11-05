@@ -27,6 +27,7 @@ struct DictationUIState {
     var elapsedSeconds = 0
     var meterLevel: Double = 0
     var meterPeakLevel: Double = 0
+    var waveformStyle: DictationWaveformStyle = .lively
     var microphoneAllowed = false
     var accessibilityAllowed = false
     var automaticInsertionPermissionDetails = ""
@@ -830,7 +831,13 @@ extension DictationWindowController {
         let insert = ActionSwitch(value: preferences.autoInsertEnabled) { [weak self] value in self?.store.updatePreferences { $0.autoInsertEnabled = value } }
         fill(input, settingRow("自动填入原输入框", detail: "无法自动填入时，结果会自动复制，可直接按 ⌘V 粘贴。", control: insert))
         let language = ActionPopup(items: [("中文为主", 0), ("自动识别", 1)], selected: preferences.recognitionLanguage == "auto" ? 1 : 0) { [weak self] value in self?.store.updatePreferences { $0.recognitionLanguage = value == 1 ? "auto" : "zh" } }
-        fill(input, settingRow("识别语言", detail: "经常切换语言时，可以使用自动识别。", control: language)); fill(pageStack, card(input))
+        fill(input, settingRow("识别语言", detail: "经常切换语言时，可以使用自动识别。", control: language))
+        let waveform = ActionPopup(items: [("灵动", 0), ("柔和", 1)], selected: preferences.waveformStyle == .gentle ? 1 : 0) { [weak self] value in
+            self?.store.updatePreferences { $0.waveformStyle = value == 1 ? .gentle : .lively }
+        }
+        waveform.identifier = NSUserInterfaceItemIdentifier("waveform-style")
+        waveform.setAccessibilityLabel("波形动效")
+        fill(input, settingRow("波形动效", detail: "", control: waveform)); fill(pageStack, card(input))
         let historyStorage = vertical(10)
         fill(historyStorage, label("历史记录", size: 15, weight: .semibold))
         fill(historyStorage, label("永久保存原文和整理结果，不按天数或条数自动清理。数据与应用分开存放，更新应用后仍会保留。", size: 12, color: Palette.muted))
@@ -924,6 +931,7 @@ struct DictationWaveformEnvelope {
     private var reducedMotion = false
     private var wasVoiced = false
     private var forcePulse = false
+    private var style: DictationWaveformStyle = .lively
     private var bars = Array(repeating: 0.0, count: columnCount)
     private var decays = Array(repeating: 0.09, count: columnCount)
     private var arrivals: [Arrival] = []
@@ -973,7 +981,9 @@ struct DictationWaveformEnvelope {
         return average + max(0, peak - average) * 0.15
     }
 
-    mutating func advance(average: Double, peak: Double, seconds: Double, reduceMotion: Bool = false) {
+    mutating func advance(average: Double, peak: Double, seconds: Double, reduceMotion: Bool = false,
+                          style: DictationWaveformStyle = .lively) {
+        self.style = style
         guard seconds.isFinite else { return }
         let delta = max(0, min(seconds, 0.1))
         guard delta > 0 || reduceMotion else { return }
@@ -1020,12 +1030,12 @@ struct DictationWaveformEnvelope {
             bars[index] = min(current * 1.10, bars[index] * exp(-Self.step / decays[index]))
         }
         if !wasVoiced || forcePulse || elapsed + 1e-10 >= nextPulse {
-            // The first audible sample always injects a pulse. Subsequent
-            // 50 ms attempts vary only while actual microphone energy exists.
+            // Gentle motion spaces decorative pulses farther apart. Real
+            // syllable onsets and quieting still respond on the current frame.
             let emit = !wasVoiced || forcePulse || random() < min(0.95, 0.18 + current * 1.5)
             if emit { emitPulse() }
             forcePulse = false
-            nextPulse = elapsed + 0.05
+            nextPulse = elapsed + (style == .gentle ? 0.075 : 0.05)
         }
         wasVoiced = true
         for arrival in arrivals where arrival.time <= elapsed + 1e-10 {
@@ -1043,7 +1053,7 @@ struct DictationWaveformEnvelope {
         let center = random() < 0.5 ? 4 : 5
         let amplitude = min(1, current * (0.95 + random() * 0.10))
         bars[center] = amplitude
-        decays[center] = 0.075 + random() * 0.035
+        decays[center] = style == .gentle ? 0.095 + random() * 0.030 : 0.075 + random() * 0.035
         for index in 0..<Self.columnCount where index != center {
             let distance = abs(index - center)
             let sideLength = index < center ? center : Self.columnCount - 1 - center
@@ -1051,8 +1061,9 @@ struct DictationWaveformEnvelope {
             let attenuation = max(0.18, 1 - slope * Double(distance) / Double(sideLength))
             let level = amplitude * attenuation * (0.90 + random() * 0.20)
             let delay = Double(distance) * (0.012 + random() * 0.004) + random() * 0.015
-            arrivals.append(Arrival(time: elapsed + delay, column: index, level: level,
-                                    mix: 0.65 + random() * 0.10, decay: 0.065 + random() * 0.045))
+            let mix = 0.65 + random() * 0.10
+            let decay = style == .gentle ? 0.085 + random() * 0.035 : 0.065 + random() * 0.045
+            arrivals.append(Arrival(time: elapsed + delay, column: index, level: level, mix: mix, decay: decay))
         }
     }
 
@@ -1131,11 +1142,13 @@ private final class DictationActivityView: NSView {
     private var phase = 0.0
     private var reducedMotion = false
     private var lastInputAt = 0.0
+    private var waveformStyle: DictationWaveformStyle = .lively
     var onProcessingFrame: ((CGFloat) -> Void)?
 
     func receive(_ state: DictationUIState) {
         if processing != state.processing { reset() }
         processing = state.processing
+        waveformStyle = state.waveformStyle
         average = state.meterLevel
         peak = state.meterPeakLevel
         lastInputAt = ProcessInfo.processInfo.systemUptime
@@ -1152,7 +1165,7 @@ private final class DictationActivityView: NSView {
             // leaving a frozen, apparently active microphone on screen.
             let stale = !preview && ProcessInfo.processInfo.systemUptime - lastInputAt > 0.10
             envelope.advance(average: stale ? 0 : average, peak: stale ? 0 : peak,
-                             seconds: seconds, reduceMotion: reduceMotion)
+                             seconds: seconds, reduceMotion: reduceMotion, style: waveformStyle)
         }
         needsDisplay = true
     }
@@ -1214,14 +1227,14 @@ final class DictationHUD {
     private var hasExplicitStackFrame = false
     private(set) var stackIndex = 0
     private var stackCount = 1
-    private var preferredPanelWidth: CGFloat = 132
+    private var preferredPanelWidth: CGFloat = 118
     /// Called only when a visible card disappears, including a copy reminder's
     /// delayed dismissal. The owner can then compact the remaining cards.
     var onDidHide: (() -> Void)?
     var isVisible: Bool { panel.isVisible }
     var frame: NSRect { panel.frame }
     init() {
-        panel = NonactivatingHUDPanel(contentRect: NSRect(x: 0, y: 0, width: 132, height: 34), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel = NonactivatingHUDPanel(contentRect: NSRect(x: 0, y: 0, width: 118, height: 34), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isFloatingPanel = true; panel.becomesKeyOnlyIfNeeded = true; panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false; panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true
         panel.level = .floating; panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
@@ -1271,7 +1284,7 @@ final class DictationHUD {
             sessionCaption.centerYAnchor.constraint(equalTo: content.centerYAnchor),
             activity.widthAnchor.constraint(equalToConstant: 38), activity.heightAnchor.constraint(equalToConstant: 24),
             activity.centerXAnchor.constraint(equalTo: recordingRow.centerXAnchor), activity.centerYAnchor.constraint(equalTo: recordingRow.centerYAnchor),
-            title.widthAnchor.constraint(equalToConstant: 56), title.centerXAnchor.constraint(equalTo: recordingRow.centerXAnchor),
+            title.widthAnchor.constraint(equalToConstant: 50), title.centerXAnchor.constraint(equalTo: recordingRow.centerXAnchor, constant: -5),
             title.centerYAnchor.constraint(equalTo: recordingRow.centerYAnchor)
         ])
         // Progress supplies the motion. Keep foreground text fully opaque so
@@ -1335,7 +1348,7 @@ final class DictationHUD {
         sessionCaption.stringValue = ordinal.isEmpty ? state.sessionLabel : ordinal
         sessionCaption.isHidden = stackCount <= 1 || state.sessionLabel.isEmpty
         sessionCaption.setAccessibilityLabel(state.sessionLabel)
-        setPreferredPanelWidth(132)
+        setPreferredPanelWidth(118)
         surface.receive(state)
         let elapsed = max(0, state.elapsedSeconds)
         let duration = String(format: "%d:%02d", elapsed / 60, elapsed % 60)
@@ -1417,7 +1430,7 @@ final class DictationHUD {
     }
     /// The normal stack grows upward with a 12pt gap. On short displays use a
     /// second column instead of overlapping cards or placing controls offscreen.
-    static func stackFrame(index: Int, count: Int, visibleFrame: NSRect, preferredWidth: CGFloat = 132) -> NSRect {
+    static func stackFrame(index: Int, count: Int, visibleFrame: NSRect, preferredWidth: CGFloat = 118) -> NSRect {
         let height: CGFloat = 34, gap: CGFloat = 12
         let index = max(0, index), count = max(index + 1, count)
         let rows = min(count, max(1, Int((max(height, visibleFrame.height) + gap) / (height + gap))))

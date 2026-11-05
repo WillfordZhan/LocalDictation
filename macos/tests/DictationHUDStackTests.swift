@@ -39,7 +39,7 @@ enum DictationHUDStackTests {
         reusable.hide()
         try require(field(reusable, "stackVisibleFrame", NSRect.self) == nil, "Reused single HUD remained pinned to an old display")
         let first = DictationHUD.stackFrame(index: 0, count: 1, visibleFrame: normal)
-        try require(first == NSRect(x: normal.midX - 66, y: normal.minY + 30, width: 132, height: 34), "Compact card lost the bottom-center anchor")
+        try require(first == NSRect(x: normal.midX - 59, y: normal.minY + 30, width: 118, height: 34), "Compact card lost the bottom-center anchor")
         let four = (0..<4).map { DictationHUD.stackFrame(index: $0, count: 4, visibleFrame: normal) }
         try require(zip(four, four.dropFirst()).allSatisfy { $1.minY - $0.maxY == 12 }, "Normal vertical gap changed")
         let compact = (0..<8).map { DictationHUD.stackFrame(index: $0, count: 8, visibleFrame: NSRect(x: 0, y: 0, width: 700, height: 280)) }
@@ -104,7 +104,7 @@ enum DictationHUDStackTests {
                 try require(left.maxX <= right.minX + 0.5, "Compact HUD controls overlap: \(left) then \(right)")
                 try require(abs(left.midY - right.midY) <= 1, "Compact HUD reverted to uneven/two-line alignment")
             }
-            try require(body.bounds.width == 132 && card.frame.height == 34, "Normal activity retained oversized delivery dimensions: \(card.frame)")
+            try require(body.bounds.width == 118 && card.frame.height == 34, "Normal activity retained oversized delivery dimensions: \(card.frame)")
             let cancel = field(card, "cancel", NSButton.self)!, finish = field(card, "finish", NSButton.self)!
             try require(cancel.frame.size == NSSize(width: 24, height: 24) && finish.frame.size == cancel.frame.size, "Capsule controls lost their 24 pt hit targets: cancel=\(cancel.frame) finish=\(finish.frame)")
             let wave = field(card, "activity", NSView.self)!
@@ -112,8 +112,8 @@ enum DictationHUDStackTests {
             let status = field(card, "title", NSTextField.self)!
             try require(wave.isHidden != status.isHidden, "Waveform and status appeared together")
             if !status.isHidden {
-                try require(abs(status.frame.midX - body.bounds.midX) < 0.1, "Processing text was pushed off center by the ordinal")
-                try require(cancel.frame.minX > status.frame.maxX, "Processing cancel obscured centered text")
+                try require(abs(status.frame.midX - (body.bounds.midX - 5)) < 0.1, "Processing text lost its optical alignment")
+                try require(cancel.frame.minX - status.frame.maxX >= 7, "Processing cancel crowds its label")
             }
         }
         for (index, card) in cards.enumerated() {
@@ -134,11 +134,11 @@ enum DictationHUDStackTests {
         let identityCaption = field(identityCard, "sessionCaption", NSTextField.self)!
         identityPanel.contentView!.layoutSubtreeIfNeeded()
         let singleBodyCenter = identityCard.frame.minX + identityBody.frame.midX
-        try require(identityCaption.isHidden && identityCard.frame.width == 132, "Single card reserved or displayed an ordinal gutter")
+        try require(identityCaption.isHidden && identityCard.frame.width == 118, "Single card reserved or displayed an ordinal gutter")
         identityCard.setStackIndex(1, count: 2, animated: false, visibleFrame: normal)
         identityPanel.contentView!.layoutSubtreeIfNeeded()
         try require(!identityCaption.isHidden && identityCaption.stringValue == "7", "Stack used row index instead of original job number")
-        try require(identityCard.frame.width == 156 && identityCaption.frame.maxX < identityBody.frame.minX, "Ordinal was drawn inside the capsule")
+        try require(identityCard.frame.width == 142 && identityCaption.frame.maxX < identityBody.frame.minX, "Ordinal was drawn inside the capsule")
         try require(abs(identityCard.frame.minX + identityBody.frame.midX - singleBodyCenter) < 0.1, "Showing an ordinal shifted the capsule body")
         try require(identityBody.hitTest(identityBody.convert(identityCaption.frame.origin, from: identityPanel.contentView)) == nil, "Outer ordinal overlaps capsule hit testing")
         identityCard.showDelivery(message: "已复制 · 按 ⌘V 粘贴", needsPermission: false, show: false)
@@ -153,7 +153,7 @@ enum DictationHUDStackTests {
         identityCard.hide()
 
         let shortScreen = NSRect(x: 0, y: 0, width: 700, height: 280)
-        let mixedFrames = (0..<8).map { DictationHUD.stackFrame(index: $0, count: 8, visibleFrame: shortScreen, preferredWidth: $0.isMultiple(of: 3) ? 360 : 132) }
+        let mixedFrames = (0..<8).map { DictationHUD.stackFrame(index: $0, count: 8, visibleFrame: shortScreen, preferredWidth: $0.isMultiple(of: 3) ? 360 : 118) }
         for (i, rect) in mixedFrames.enumerated() {
             try require(shortScreen.contains(rect), "Wide delivery card escaped short screen")
             for other in mixedFrames.prefix(i) { try require(!rect.intersects(other), "Mixed delivery/activity widths overlapped") }
