@@ -132,8 +132,13 @@ enum DictationInsightsChecks {
         let tiles = try (0..<4).map { try metric($0, in: root) }
         let frames = tiles.map { $0.convert($0.bounds, to: root) }
         try require(frames.allSatisfy { $0.width > 250 && $0.height > 50 }, "Metric tile collapsed at width \(width)")
-        try require(frames.allSatisfy { near($0.width, frames[0].width) },
+        // An odd number of physical pixels cannot split evenly across two
+        // columns. AppKit assigns that one pixel to a column on a 1x display.
+        let pixel = 1 / (root.window?.backingScaleFactor ?? 1)
+        try require(frames.allSatisfy { abs($0.width - frames[0].width) <= pixel + 0.001 },
                     "Metric tiles have unequal widths at window \(width), scale \(root.window?.backingScaleFactor ?? 1): \(frames)")
+        try require(near(frames[0].width, frames[2].width) && near(frames[1].width, frames[3].width),
+                    "Metric widths differ within the same column")
         try require(near(frames[0].minY, frames[1].minY) && near(frames[2].minY, frames[3].minY) &&
                     near(frames[0].minX, frames[2].minX) && near(frames[1].minX, frames[3].minX),
                     "Metrics do not form aligned 2×2 rows/columns")
