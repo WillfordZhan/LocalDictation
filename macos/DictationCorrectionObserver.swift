@@ -52,7 +52,7 @@ enum DictationCorrectionDetector {
         let a = Array(oldWords[changed[0]]), b = Array(newWords[changed[0]])
         guard min(a.count, b.count) >= 3, abs(a.count - b.count) <= 1,
               editDistance(a, b) <= 2, hasTermShape(destination),
-              replacementExplainsEdit(original, edited: edited, source: source, destination: destination) else { return nil }
+              correctedRanges(in: original, edited: edited, source: source, destination: destination) != nil else { return nil }
         return (source, destination, true)
     }
 
@@ -64,7 +64,7 @@ enum DictationCorrectionDetector {
               let newRange = tokenRange(in: edited, characters: after, start: start, end: start + 1) else { return nil }
         let source = String(before[oldRange]), destination = String(after[newRange])
         guard isHighConfidence(source: source, destination: destination),
-              replacementExplainsEdit(original, edited: edited, source: source, destination: destination) else { return nil }
+              correctedRanges(in: original, edited: edited, source: source, destination: destination) != nil else { return nil }
         return (source, destination)
     }
 
@@ -128,30 +128,42 @@ enum DictationCorrectionDetector {
         return (tags.first == .noun || tags.first == .adjective) && tags.last == .noun
     }
 
-    private static func replacementExplainsEdit(_ original: String, edited: String,
-                                                source: String, destination: String) -> Bool {
+    /// Replay the complete edit once for both detection and provenance. Only
+    /// whole source terms may be replaced; an unchanged longer identifier must
+    /// not be consumed merely because it starts with the source spelling.
+    static func correctedRanges(in original: String, edited: String,
+                                source: String, destination: String) -> [Range<Int>]? {
         let before = Array(original), after = Array(edited), source = Array(source), destination = Array(destination)
-        guard !source.isEmpty, !destination.isEmpty, source != destination else { return false }
+        guard !source.isEmpty, !destination.isEmpty, source != destination else { return nil }
         func matches(_ term: [Character], in text: [Character], at index: Int) -> Bool {
             guard index + term.count <= text.count,
                   text[index..<index + term.count].elementsEqual(term) else { return false }
-            return (index == 0 || !isIdentifier(text[index - 1]))
-                && (index + term.count == text.count || !isIdentifier(text[index + term.count]))
+            // ASCII identifier boundaries apply only to ASCII term endpoints.
+            // A Chinese token already scoped by NLTokenizer may touch an API
+            // name on either side without becoming part of that identifier.
+            guard !isIdentifier(term[0]) || index == 0 || !isIdentifier(text[index - 1]) else { return false }
+            guard isIdentifier(term[term.count - 1]) else { return true }
+            var end = index + term.count
+            // tokenRange excludes trailing sentence dots. Honor the same
+            // boundary here while keeping dots inside names/paths intact.
+            while end < text.count, text[end] == "." { end += 1 }
+            return end == text.count || !isIdentifier(text[end])
         }
-        var oldIndex = 0, newIndex = 0, replacements = 0
+        var oldIndex = 0, newIndex = 0, ranges: [Range<Int>] = []
         while oldIndex < before.count {
             if matches(source, in: before, at: oldIndex) {
                 if matches(destination, in: after, at: newIndex) {
-                    oldIndex += source.count; newIndex += destination.count; replacements += 1
+                    ranges.append(oldIndex..<oldIndex + source.count)
+                    oldIndex += source.count; newIndex += destination.count
                 } else if matches(source, in: after, at: newIndex) {
                     oldIndex += source.count; newIndex += source.count
-                } else { return false }
+                } else { return nil }
             } else {
-                guard newIndex < after.count, before[oldIndex] == after[newIndex] else { return false }
+                guard newIndex < after.count, before[oldIndex] == after[newIndex] else { return nil }
                 oldIndex += 1; newIndex += 1
             }
         }
-        return newIndex == after.count && replacements > 0
+        return newIndex == after.count && !ranges.isEmpty ? ranges : nil
     }
 
     private static func tokenRange(in text: String, characters: [Character], start: Int, end: Int) -> Range<Int>? {
@@ -209,6 +221,7 @@ enum DictationCorrectionDetector {
     private static func isIdentifier(_ character: Character) -> Bool {
         character.unicodeScalars.allSatisfy { $0.isASCII && (CharacterSet.alphanumerics.contains($0) || "_+#./-".unicodeScalars.contains($0)) }
     }
+
     private static func isHan(_ character: Character) -> Bool {
         character.unicodeScalars.allSatisfy { (0x3400...0x9fff).contains($0.value) || (0x20000...0x3134f).contains($0.value) }
     }
@@ -240,6 +253,11 @@ final class DictationCorrectionObserver {
     var onAvailability: ((DictationCorrectionAvailability) -> Void)?
     private(set) var availability: DictationCorrectionAvailability = .idle
 
+    private struct CorrectionPair: Hashable {
+        let original: String
+        let corrected: String
+    }
+
     private struct Observation {
         let pid: pid_t
         let element: AXUIElement
@@ -248,10 +266,45 @@ final class DictationCorrectionObserver {
         let entryID: UUID
         let bundleID: String?
         let started: TimeInterval
+        var baseline: String
+        var dictatedCharacters: [Bool]
+        var reported: Set<CorrectionPair> = []
         var prefix: String?
         var suffix: String?
         var pending: String?
         var pendingSince: TimeInterval = 0
+
+        mutating func advanceBaseline(to edited: String, correctedRanges: [Range<Int>]?, replacementLength: Int) {
+            if let correctedRanges {
+                // A replayed term correction establishes every changed range.
+                // Preserve the origin of untouched text between repeated terms,
+                // shifting it by the actual replacement lengths.
+                var origin: [Bool] = [], cursor = 0
+                for range in correctedRanges {
+                    origin.append(contentsOf: dictatedCharacters[cursor..<range.lowerBound])
+                    origin.append(contentsOf: repeatElement(false, count: replacementLength))
+                    cursor = range.upperBound
+                }
+                origin.append(contentsOf: dictatedCharacters[cursor...])
+                baseline = edited; dictatedCharacters = origin; pending = nil
+                return
+            }
+            let before = Array(baseline), after = Array(edited)
+            var prefix = 0
+            while prefix < min(before.count, after.count), before[prefix] == after[prefix] { prefix += 1 }
+            var suffix = 0
+            while suffix < min(before.count, after.count) - prefix,
+                  before[before.count - suffix - 1] == after[after.count - suffix - 1] { suffix += 1 }
+            // Only unchanged positional anchors keep their dictation origin.
+            // Added/retyped text is ineligible even when it repeats a dictated
+            // word. Ambiguous middle content is conservatively excluded.
+            var origin = Array(repeating: false, count: after.count)
+            for index in 0..<prefix { origin[index] = dictatedCharacters[index] }
+            for index in 0..<suffix {
+                origin[after.count - index - 1] = dictatedCharacters[before.count - index - 1]
+            }
+            baseline = edited; dictatedCharacters = origin; pending = nil
+        }
     }
     private let reader: Reader
     private let clock: () -> TimeInterval
@@ -285,7 +338,8 @@ final class DictationCorrectionObserver {
             setAvailability(.unsupported); return
         }
         observation = Observation(pid: pid, element: element, range: NSRange(location: range.location, length: length),
-            original: text, entryID: entryID, bundleID: bundleID, started: clock())
+            original: text, entryID: entryID, bundleID: bundleID, started: clock(), baseline: text,
+            dictatedCharacters: Array(repeating: true, count: text.count))
         setAvailability(.confirming)
         if pollsAutomatically {
             activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -349,7 +403,8 @@ final class DictationCorrectionObserver {
                 guard clock() - item.started < 2 else { stop(); setAvailability(.unconfirmed); return }
                 guard NSMaxRange(item.range) <= text.length,
                       text.substring(with: item.range) == item.original,
-                      selection.location == NSMaxRange(item.range), selection.length == 0 else { return }
+                      selection.location >= item.range.location,
+                      selection.location + selection.length <= NSMaxRange(item.range) else { return }
                 item.prefix = text.substring(to: item.range.location)
                 item.suffix = text.substring(from: NSMaxRange(item.range))
                 observation = item; setAvailability(.observing); return
@@ -363,16 +418,46 @@ final class DictationCorrectionObserver {
             let range = NSRange(location: prefixLength, length: text.length - prefixLength - suffixLength)
             guard selection.location >= range.location, selection.location + selection.length <= NSMaxRange(range) else { stop(); return }
             let edited = text.substring(with: range)
-            if edited == item.original { item.pending = nil; observation = item; return }
+            if edited == item.baseline { item.pending = nil; observation = item; return }
             if edited != item.pending {
                 item.pending = edited; item.pendingSince = clock(); observation = item; return
             }
             guard clock() - item.pendingSince >= 1.5, selection.length == 0 else { return }
-            guard let correction = DictationCorrectionDetector.candidate(in: item.original, edited: edited) else { stop(); return }
+            let correction = DictationCorrectionDetector.candidate(in: item.baseline, edited: edited)
+            let correctedRanges = correction.flatMap {
+                DictationCorrectionDetector.correctedRanges(in: item.baseline, edited: edited,
+                                                            source: $0.original, destination: $0.corrected)
+            }
+            let comesFromDictation = correctedRanges.map { ranges in
+                ranges.allSatisfy { item.dictatedCharacters[$0].allSatisfy { $0 } }
+            } ?? false
+            // A stable punctuation change or sentence edit must not disable a
+            // later term correction. Advance only this verified span's baseline;
+            // its original text, surrounding anchors and deadline stay fixed.
+            item.advanceBaseline(to: edited, correctedRanges: correctedRanges,
+                                 replacementLength: correction?.corrected.count ?? 0)
+            observation = item
+            guard let correction, comesFromDictation else {
+                setAvailability(.observing); return
+            }
+            let pair = CorrectionPair(original: correction.original, corrected: correction.corrected)
+            let reverse = CorrectionPair(original: correction.corrected, corrected: correction.original)
+            // Undo/redo is not new learning. A source receives at most one
+            // interpretation during this short observation, even if edited again.
+            guard !item.reported.contains(reverse),
+                  !item.reported.contains(where: { $0.original == pair.original }) else { return }
             let candidate = DictationCorrectionCandidate(entryID: item.entryID, original: correction.original,
                 corrected: correction.corrected, bundleID: item.bundleID, observedAt: Date(),
                 requiresConfirmation: correction.requiresConfirmation)
-            stop(); setAvailability(correction.requiresConfirmation ? .awaitingConfirmation : .learned); onCorrection?(candidate)
+            if correction.requiresConfirmation {
+                // Keep one pending decision visible; another edit must not
+                // replace its confirmation toast before the user can respond.
+                stop(); setAvailability(.awaitingConfirmation)
+            } else {
+                item.reported.insert(pair); observation = item
+                setAvailability(.learned)
+            }
+            onCorrection?(candidate)
         }
     }
 

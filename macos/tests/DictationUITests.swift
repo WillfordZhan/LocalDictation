@@ -88,6 +88,21 @@ enum DictationUIChecks {
         controller.updateCorrectionLearning(status: unsupported)
         try require(!containsText(unsupported, in: root), "Learning status leaked outside the dictionary page")
         controller.showPage(.dictionary)
+        func sourceFilter() -> NSSegmentedControl {
+            descendants(root).compactMap { $0 as? NSSegmentedControl }.first { $0.identifier?.rawValue == "vocabulary-source-filter" }!
+        }
+        func selectSource(_ index: Int) throws {
+            let filter = sourceFilter(); filter.selectedSegment = index; try sendAction(filter)
+        }
+        func visibleWordCount() -> Int {
+            descendants(root).filter { $0.identifier?.rawValue == "vocabulary-row" }.count
+        }
+        try require((0..<3).map { sourceFilter().label(forSegment: $0) } == ["全部", "自动添加", "手动添加"], "Dictionary source labels are missing")
+        try selectSource(1)
+        try require(visibleWordCount() == 0 && containsText("还没有自动添加的词条。口述后纠正术语，可自动记住。", in: root), "Automatic dictionary empty state is missing")
+        try selectSource(2)
+        try require(visibleWordCount() == 0 && containsText("还没有手动添加的词条。在上方添加常用的人名或专业术语。", in: root), "Manual dictionary empty state is missing")
+        try selectSource(0)
         try require(containsText(unsupported, in: root), "Unreadable-input limitation was hidden")
         let initialToggle = try control(NSSwitch.self, beside: "自动学习术语", in: root)
         try require(initialToggle.state == .on && store.preferences.automaticVocabularyLearning, "Learning is not enabled by default")
@@ -119,6 +134,26 @@ enum DictationUIChecks {
         try require(!containsText("OldSpelling → SalesPart", in: root), "Older learned origin replaced the newest one")
         try require(!containsText("RejectedPart", in: root) && !containsText("RejectedPrat → RejectedPart", in: root), "Undone learning remained a dictionary row")
         let beforeHistory = store.entries.count
+        let draftInput = descendants(root).compactMap { $0 as? NSTextField }.first { $0.isEditable }!
+        edit(draftInput, text: "正在输入的手动词条")
+        try selectSource(1)
+        try require(visibleWordCount() == 2 && !containsText("BOM", in: root), "Automatic tab includes manual words or duplicate mapping rows")
+        try require(containsText("2 个词", in: root), "Automatic source count does not match the list")
+        try selectSource(2)
+        try require(visibleWordCount() == 1 && containsText("BOM", in: root), "Manual tab includes automatically owned words")
+        let known = store.learnVocabulary(original: "bom", corrected: "BOM", entryID: entryID, bundleID: nil)!
+        try require(sourceFilter().selectedSegment == 2 && visibleWordCount() == 1 && containsText("bom → BOM", in: root), "Learning an alias changed a manual word's source")
+        try require(draftInput.superview != nil && draftInput.stringValue == "正在输入的手动词条", "Source changes or automatic learning rebuilt the manual editor")
+        let knownUndo = descendants(root).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "undo-vocabulary-\(known.id.uuidString)" }!
+        knownUndo.performClick(nil)
+        try require(sourceFilter().selectedSegment == 2 && containsText("BOM", in: root) && visibleWordCount() == 1, "Undoing an alias removed its manual word or reset the source")
+        try selectSource(1)
+        let live = store.learnVocabulary(original: "CachePrat", corrected: "CachePart", entryID: entryID, bundleID: nil)!
+        try require(sourceFilter().selectedSegment == 1 && visibleWordCount() == 3 && containsText("CachePrat → CachePart", in: root), "New automatic word did not appear in the active filter")
+        try require(draftInput.superview != nil && draftInput.stringValue == "正在输入的手动词条", "Live automatic additions erased a manual draft")
+        store.undoLearnedVocabulary(id: live.id)
+        try require(sourceFilter().selectedSegment == 1 && visibleWordCount() == 2, "Undo did not update the current filtered list")
+        try selectSource(0)
         var output: URL?
         if let i = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.arguments.indices.contains(i + 1) {
             output = URL(fileURLWithPath: CommandLine.arguments[i + 1])
@@ -144,6 +179,17 @@ enum DictationUIChecks {
             try require(rightEdges.max()! - rightEdges.min()! < 1, "Learned and manual actions do not share a right edge")
             if let output { try controller.renderPNG(to: output.appendingPathComponent("dictionary-learning-\(Int(width)).png")) }
         }
+        if let output {
+            for source in [1, 2] {
+                try selectSource(source)
+                controller.window?.setContentSize(NSSize(width: 1000, height: 760)); root.layoutSubtreeIfNeeded()
+                // Settle the ordinary reveal before rendering the source tabs.
+                let until = Date().addingTimeInterval(0.18)
+                while Date() < until { RunLoop.current.run(until: min(until, Date().addingTimeInterval(0.01))) }
+                try controller.renderPNG(to: output.appendingPathComponent("dictionary-source-\(source)-1000.png"))
+            }
+            try selectSource(0)
+        }
         let undoID = "undo-vocabulary-\(second.id.uuidString)"
         let undo = descendants(root).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == undoID }!
         undo.performClick(nil)
@@ -154,6 +200,16 @@ enum DictationUIChecks {
         let manualRow = descendants(root).first { $0.identifier?.rawValue == "vocabulary-row" && containsText("ProductPart", in: $0) }!
         let manualDelete = try button("删除", in: manualRow)
         try require(manualDelete.isEnabled, "A later manual addition reused an undone learning origin")
+        try selectSource(1)
+        edit(draftInput, text: "SalesPart")
+        try click("添加", in: root)
+        let clearedAdd = try button("添加", in: root)
+        try require(draftInput.stringValue.isEmpty && !clearedAdd.isEnabled, "Successful manual addition did not clear the editor")
+        try require(sourceFilter().selectedSegment == 0 && visibleWordCount() == 3, "Explicit manual addition is hidden by the old source filter")
+        try selectSource(2)
+        try require(visibleWordCount() == 3 && containsText("SalesPrat → SalesPart", in: root), "Explicitly retaining an automatic term did not make it manual")
+        try selectSource(1)
+        try require(visibleWordCount() == 0, "Manually retained automatic word is still in the automatic list")
         controller.showPage(.home)
         try require(!descendants(root).contains { $0.identifier?.rawValue == "correction-learning-status" }, "Learning status is displayed outside dictionary")
         try require(controller.window?.isVisible == false, "Learning fixture unexpectedly displayed its window")
@@ -242,7 +298,7 @@ enum DictationUIChecks {
         toastUndo.performClick(nil)
         try require(actions == 2 && !toastUndo.isEnabled && !panel.isVisible && expiredCapture == nil, "Expired learning toast retained an action or visible panel")
         toast.hide()
-        print("PASS: automatic learning defaults/persistence; truthful app capability status without editor rebuild; newest active origin; compact aligned undo; undone/manual separation; independent nonactivating learning toast; one-shot undo, replacement, close and five-second expiry.")
+        print("PASS: automatic learning defaults/persistence; source filters and counts; manual/automatic ownership; active-filter updates and draft preservation; truthful app capability status without editor rebuild; newest active origin; compact aligned undo; undone/manual separation; independent nonactivating learning toast; one-shot undo, replacement, close and five-second expiry.")
     }
 
     @discardableResult

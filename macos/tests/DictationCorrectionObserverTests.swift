@@ -6,10 +6,22 @@ import ApplicationServices
 @main
 enum DictationCorrectionObserverTests {
     static func main() {
+        func replays(_ before: String, _ after: String, source: String, destination: String,
+                     file: StaticString, line: UInt) {
+            precondition(DictationCorrectionDetector.correctedRanges(in: before, edited: after,
+                source: source, destination: destination) != nil,
+                "Accepted correction cannot be replayed: \(before) -> \(after); \(source) -> \(destination)", file: file, line: line)
+        }
         func detects(_ before: String, _ after: String, _ expected: (String, String)?, file: StaticString = #file, line: UInt = #line) {
             let result = DictationCorrectionDetector.correction(in: before, edited: after)
             precondition(result?.original == expected?.0 && result?.corrected == expected?.1,
                 "Unexpected correction: \(before) -> \(after); got \(String(describing: result))", file: file, line: line)
+            // Every accepted path must provide the same complete edit ranges
+            // used by the observer, including candidates requiring confirmation.
+            if let result { replays(before, after, source: result.original, destination: result.corrected, file: file, line: line) }
+            if let candidate = DictationCorrectionDetector.candidate(in: before, edited: after) {
+                replays(before, after, source: candidate.original, destination: candidate.corrected, file: file, line: line)
+            }
         }
         detects("修复 SalesPrat 的问题。", "修复 SalesPart 的问题。", ("SalesPrat", "SalesPart"))
         detects("使用 bom 配置。", "使用 BOM 配置。", ("bom", "BOM"))
@@ -20,6 +32,9 @@ enum DictationCorrectionObserverTests {
         detects("更新 Cdoex。", "更新 Codex。", ("Cdoex", "Codex"))
         detects("测试 C+。", "测试 C++。", ("C+", "C++"))
         detects("调整莫型。", "调整模型。", ("莫型", "模型"))
+        detects("修正 API借口。", "修正 API接口。", ("借口", "接口"))
+        detects("修正 API绘画。", "修正 API会话。", ("绘画", "会话"))
+        detects("修正借口API。", "修正接口API。", ("借口", "接口"))
         detects("这里需要改变。", "这里需要修改。", nil)
         detects("请部署 SalesPart。", "请删除 SalesPart。", nil)
         detects("run cat", "run car", nil)
@@ -52,6 +67,7 @@ enum DictationCorrectionObserverTests {
             precondition(result?.original == expected?.0 && result?.corrected == expected?.1 &&
                          (result == nil || result?.requiresConfirmation == true),
                          "Unexpected confirmation: \(before) -> \(after); got \(String(describing: result))", file: file, line: line)
+            if let result { replays(before, after, source: result.original, destination: result.corrected, file: file, line: line) }
         }
         suggests("检查 cache lime 的值。", "检查 cache line 的值。", ("cache lime", "cache line"))
         suggests("检查 cache ration 的值。", "检查 cache ratio 的值。", ("cache ration", "cache ratio"))
@@ -117,9 +133,9 @@ enum DictationCorrectionObserverTests {
         precondition(candidates.count == 1 && candidates[0].entryID == entryID && candidates[0].original == "SalesPrat"
             && candidates[0].corrected == "SalesPart" && candidates[0].bundleID == "fixture.editor")
         precondition(observer.availability == .learned)
-        tick(1); precondition(candidates.count == 1, "An insertion can learn only once")
+        tick(1); precondition(candidates.count == 1, "An unchanged result must not be learned again")
 
-        begin(); text("修复 SalesPrat。", caret: 0); tick(); tick(2.1)
+        begin(offset: 3); text("前文：修复 SalesPrat。", caret: 0); tick(); tick(2.1)
         precondition(observer.availability == .unconfirmed, "Posting paste does not prove insertion")
         begin(); text("another field"); tick(); tick(2.1)
         precondition(observer.availability == .unconfirmed)
@@ -134,9 +150,9 @@ enum DictationCorrectionObserverTests {
         confirmed(); text("修复 SalesPart。"); tick(); tick(121)
         precondition(observer.availability == .idle && candidates.count == 1)
         confirmed(); text("修复 SalesPrat。追加内容。"); tick(); tick(1.6)
-        precondition(observer.availability == .idle && candidates.count == 1)
+        precondition(observer.availability == .observing && candidates.count == 1)
         confirmed(); text("请删除这个模块并重新写一遍。"); tick(); tick(1.6)
-        precondition(observer.availability == .idle && candidates.count == 1)
+        precondition(observer.availability == .observing && candidates.count == 1)
 
         let inserted = "🍎 修复 SalesPrat。", prefix = "前文：", suffix = " 后文"
         begin(inserted, offset: prefix.utf16.count)
@@ -171,6 +187,114 @@ enum DictationCorrectionObserverTests {
         precondition(candidates.count == 4, "A pending confirmation must not repeatedly prompt")
         precondition(candidates.prefix(3).allSatisfy { !$0.requiresConfirmation }, "Existing high-confidence corrections changed policy")
 
+        // A user often selects a typo as soon as text appears. The exact
+        // dictated span still proves insertion when the selection is inside it.
+        begin(); text("修复 SalesPrat。", caret: 3, selected: 9); tick()
+        precondition(observer.availability == .observing, "Selecting the dictated term must not prevent confirmation")
+        text("修复 SalesPart。"); tick(); tick(1.6)
+        precondition(candidates.count == 5 && candidates.last?.corrected == "SalesPart")
+
+        // Stable punctuation and appended prose may precede the actual term
+        // correction. They change the comparison baseline, not its provenance.
+        confirmed(); text("修复 SalesPrat！"); tick(); tick(1.6)
+        text("修复 SalesPrat！然后检查。"); tick(); tick(1.6)
+        precondition(candidates.count == 5 && observer.availability == .observing)
+        text("修复 SalesPart！然后检查。"); tick(); tick(1.6)
+        precondition(candidates.count == 6 && candidates.last?.corrected == "SalesPart",
+                     "A prior non-term edit must not disable a later correction")
+
+        // Both corrections belong to one verified paste and one fixed deadline.
+        confirmed("修复 SalesPrat 和 ProductPrat。")
+        text("修复 SalesPart 和 ProductPrat。"); tick(); tick(1.6)
+        text("修复 SalesPart 和 ProductPart。"); tick(); tick(1.6)
+        precondition(candidates.count == 8 && candidates[6].corrected == "SalesPart" &&
+                     candidates[7].corrected == "ProductPart" && candidates[6].entryID == candidates[7].entryID,
+                     "Distinct stable corrections in one insertion must both be learned")
+        tick(2); tick(2)
+        precondition(candidates.count == 8, "Polling an unchanged baseline must not duplicate learning")
+        text("修复 SalesPrat 和 ProductPart。"); tick(); tick(1.6)
+        text("修复 SalesPart 和 ProductPart。"); tick(); tick(1.6)
+        precondition(candidates.count == 8, "Undo and redo of a learned pair must not create inverse or duplicate learning")
+        tick(121)
+        precondition(observer.availability == .idle, "Rebasing must not renew the observation deadline")
+
+        // Text typed after dictation cannot become fresh ASR training data.
+        confirmed(); text("修复 SalesPrat。手动追加 ProductPrat。"); tick(); tick(1.6)
+        text("修复 SalesPrat。手动追加 ProductPart。"); tick(); tick(1.6)
+        precondition(candidates.count == 8, "A correction confined to newly typed text must not be learned")
+        text("修复 SalesPart。手动追加 ProductPart。"); tick(); tick(1.6)
+        precondition(candidates.count == 9 && candidates.last?.corrected == "SalesPart")
+
+        confirmed(); text("修复 SalesPrat。手动追加 SalesPrat。"); tick(); tick(1.6)
+        text("修复 SalesPrat。手动追加 SalesPart。"); tick(); tick(1.6)
+        precondition(candidates.count == 9,
+                     "A newly typed occurrence remains ineligible even when the same word was dictated")
+
+        // Existing valid words are not taught in reverse when a correction is
+        // undone, even when the destination already appeared elsewhere.
+        confirmed("比较 SalesPrat 和 SalesPart。")
+        text("比较 SalesPart 和 SalesPart。"); tick(); tick(1.6)
+        text("比较 SalesPrat 和 SalesPart。"); tick(); tick(1.6)
+        precondition(candidates.count == 10 && candidates.last?.original == "SalesPrat")
+
+        // After a successful learn, all original boundary protections remain.
+        snapshot = .focusChanged; tick()
+        precondition(observer.availability == .idle)
+        confirmed(); text("修复 SalesPart。"); tick(); tick(1.6)
+        text(""); tick()
+        precondition(candidates.count == 11 && observer.availability == .idle)
+        begin(inserted, offset: prefix.utf16.count)
+        text(prefix + inserted + suffix, caret: prefix.utf16.count + inserted.utf16.count); tick()
+        text(prefix + "🍎 修复 SalesPart。" + suffix, caret: prefix.utf16.count + inserted.utf16.count); tick(); tick(1.6)
+        text("被改的前文：" + "🍎 修复 SalesPart。" + suffix); tick()
+        precondition(candidates.count == 12 && observer.availability == .idle)
+
+        confirmed("修复 SalesPrat，再看 pass ratio。")
+        text("修复 SalesPart，再看 pass ratio。"); tick(); tick(1.6)
+        text("修复 SalesPart，再看 path ratio。"); tick(); tick(1.6)
+        precondition(candidates.count == 14 && candidates.last?.requiresConfirmation == true &&
+                     observer.availability == .awaitingConfirmation)
+        text("修复 SalesPART，再看 path ratio。"); tick(); tick(2)
+        precondition(candidates.count == 14, "A pending confirmation must retain its decision until handled")
+
+        // Disjoint replacements of the same term must not erase the origin of
+        // untouched text between them. Exercise equal, shorter and longer
+        // replacements so later eligibility does not depend on stale offsets.
+        for source in ["SalesPrat", "SalesPratt", "SalesPrt"] {
+            let count = candidates.count
+            confirmed("比较 \(source)、ProductPrat、\(source)。")
+            text("比较 SalesPart、ProductPrat、SalesPart。"); tick(); tick(1.6)
+            precondition(candidates.count == count + 1 && candidates.last?.corrected == "SalesPart",
+                         "Repeated source term \(source) must first produce one correction")
+            text("比较 SalesPart、ProductPart、SalesPart。"); tick(); tick(1.6)
+            precondition(candidates.count == count + 2 && candidates.last?.corrected == "ProductPart",
+                         "Unchanged middle term lost its dictation origin after disjoint replacements")
+        }
+
+        let prefixWordCount = candidates.count
+        confirmed("比较 SalesPart 和 SalesPar。")
+        text("比较 SalesPart 和 SalesPart。"); tick(); tick(1.6)
+        precondition(candidates.count == prefixWordCount + 1 && candidates.last?.original == "SalesPar" &&
+                     candidates.last?.corrected == "SalesPart",
+                     "An unchanged correct word must not consume the shorter source as an identifier prefix")
+
+        for ending in [".", "...", ". Then check."] {
+            let sentenceCount = candidates.count
+            confirmed("Use SalesPrat\(ending)")
+            text("Use SalesPart\(ending)"); tick(); tick(1.6)
+            precondition(candidates.count == sentenceCount + 1,
+                         "Sentence punctuation already excluded by tokenization must not block replay")
+        }
+        precondition(DictationCorrectionDetector.correctedRanges(in: "pkg.SalesPar", edited: "pkg.SalesPart",
+            source: "SalesPar", destination: "SalesPart") == nil,
+            "A qualified identifier must not be replayed as an isolated suffix")
+        precondition(DictationCorrectionDetector.correctedRanges(in: "SalesPar.js", edited: "SalesPart.js",
+            source: "SalesPar", destination: "SalesPart") == nil,
+            "An internal identifier dot is not sentence punctuation")
+        precondition(DictationCorrectionDetector.correctedRanges(in: "SalesPar./file", edited: "SalesPart./file",
+            source: "SalesPar", destination: "SalesPart") == nil,
+            "A path boundary must not be treated as sentence punctuation")
+
         // An older AX response may return after the next paste. Its generation
         // must be discarded even when the two fields contain identical text.
         let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
@@ -192,6 +316,6 @@ enum DictationCorrectionObserverTests {
         release.signal(); drain(delayedQueue)
         precondition(delayed.availability == .confirming && lateCandidates == 0)
         delayed.stop(); observer.stop()
-        print("PASS correction observer: automatic terminology confidence, complete phrase confirmation, repeated replacements, verified insertion, stability, UTF-16 scope, focus/submission/timeout, unsupported AX, one result, read/main completion ordering, blocked-reader late callback isolation")
+        print("PASS correction observer: automatic terminology confidence, complete phrase confirmation, repeated replacements, verified insertion and in-span selection, stability, continuous corrections, harmless-edit rebasing, original-term provenance, undo/redo deduplication, UTF-16 scope, focus/submission/fixed timeout, unsupported AX, read/main completion ordering, blocked-reader late callback isolation")
     }
 }

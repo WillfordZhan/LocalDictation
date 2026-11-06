@@ -282,6 +282,12 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     private var historyPager: NSView?
     private weak var searchField: NSSearchField?; private weak var vocabularyField: NSTextField?
     private var vocabularyFeedback: NSTextField?; private var vocabularyAdd: ActionButton?
+    private let vocabularyHint = "更改从下一次录音生效。不限制词条数量，每个词条最多 64 个字符；内容过大时会提示。"
+    private var vocabularySource = 0
+    private var vocabularyList: NSStackView?
+    private var vocabularyCount: NSTextField?
+    private weak var vocabularySources: ActionSegments?
+    private weak var vocabularyLearningSwitch: ActionSwitch?
     private var correctionLearningStatus = "等待下一次自动填入，检查当前应用是否支持术语学习。"
     private var correctionLearningLabel: NSTextField?
     private var shortcutRecorder: ShortcutRecorderView?
@@ -409,7 +415,18 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         if !state.shortcutWarning.isEmpty && shortcutRecorder?.isRecording != true { shortcutFeedback?.stringValue = state.shortcutWarning }
         if !state.canEditShortcut { shortcutRecorder?.cancel() }
     }
-    func reloadStore() { renderPage(); refreshReprocessingSheet() }
+    func reloadStore() {
+        if page == .dictionary, vocabularyList != nil {
+            // Auto-added words can arrive while a manual word is being typed.
+            // Refresh the results in place so that editor and its focus survive.
+            reloadVocabularyList()
+            vocabularyLearningSwitch?.state = store.preferences.automaticVocabularyLearning ? .on : .off
+            correctionLearningLabel?.stringValue = visibleCorrectionLearningStatus
+            vocabularyFeedback?.stringValue = store.storageError ?? vocabularyHint
+            vocabularyFeedback?.textColor = store.storageError == nil ? Palette.muted : .systemOrange
+        } else { renderPage() }
+        refreshReprocessingSheet()
+    }
     func updateReprocessing(entryID: UUID?, busy: Bool, error: String?) {
         reprocessingEntryID = entryID; reprocessingBusy = busy; reprocessingError = error
         refreshReprocessingSheet()
@@ -487,6 +504,7 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         clear(pageStack); liveStatus = nil; liveStart = nil; liveCancel = nil; microphoneStatus = nil; accessibilityStatus = nil
         historyList = nil; historyDetail = nil; historyListContainer = nil; historyListScroll = nil; historyPager = nil
         vocabularyFeedback = nil; vocabularyAdd = nil; correctionLearningLabel = nil
+        vocabularyList = nil; vocabularyCount = nil; vocabularySources = nil; vocabularyLearningSwitch = nil
         for (item, button) in navigation { button.selected = item == page }
 
         switch page { case .home: renderHome(); case .history: renderHistory(); case .dictionary: renderDictionary(); case .prompts: renderPrompts(); case .settings: renderSettings() }
@@ -816,6 +834,7 @@ extension DictationWindowController {
         let learning = ActionSwitch(value: store.preferences.automaticVocabularyLearning) { [weak self] value in
             self?.store.updatePreferences { $0.automaticVocabularyLearning = value }
         }
+        vocabularyLearningSwitch = learning
         learning.identifier = NSUserInterfaceItemIdentifier("automatic-vocabulary-learning")
         learning.setAccessibilityLabel("自动学习术语")
         learning.toolTip = "仅自动加入高置信度的术语纠错，可随时撤销。"
@@ -828,17 +847,51 @@ extension DictationWindowController {
         input.target = self; input.action = #selector(addVocabulary); vocabularyField = input
         let add = ActionButton("添加", icon: "plus", primary: true) { [weak self] in self?.addVocabulary() }; vocabularyAdd = add; add.isEnabled = false
         let row = horizontal([input, add]); input.setContentHuggingPriority(.defaultLow, for: .horizontal); fill(content, row)
-        let feedback = label("更改从下一次录音生效。不限制词条数量，每个词条最多 64 个字符；内容过大时会提示。", size: 11, color: Palette.muted)
+        let feedback = label(vocabularyHint, size: 11, color: Palette.muted)
         vocabularyFeedback = feedback; fill(content, feedback); fill(pageStack, card(content))
-        let terms = vertical(12); fill(terms, label("已添加 \(store.preferences.vocabulary.count) 个词", size: 15, weight: .semibold))
-        if store.preferences.vocabulary.isEmpty { fill(terms, label("还没有词条。先加入一个经常被识别错的名字。", color: Palette.muted)) }
+        let terms = vertical(16)
+        let sources = ActionSegments(selected: vocabularySource, labels: ["全部", "自动添加", "手动添加"]) { [weak self] source in
+            guard let self else { return }
+            self.vocabularySource = source; self.reloadVocabularyList()
+            if let list = self.vocabularyList { DictationMotion.reveal(list, duration: 0.12) }
+        }
+        sources.identifier = NSUserInterfaceItemIdentifier("vocabulary-source-filter")
+        sources.setAccessibilityLabel("词条来源")
+        sources.setContentHuggingPriority(.required, for: .horizontal)
+        sources.setContentCompressionResistancePriority(.required, for: .horizontal)
+        vocabularySources = sources
+        let count = label("", size: 12, color: Palette.muted)
+        count.identifier = NSUserInterfaceItemIdentifier("vocabulary-count")
+        count.setContentHuggingPriority(.required, for: .horizontal); vocabularyCount = count
+        fill(terms, horizontal([sources, NSView(), count]))
+        let list = vertical(12); vocabularyList = list; fill(terms, list)
+        fill(pageStack, card(terms)); reloadVocabularyList()
+    }
+    private func reloadVocabularyList() {
+        guard let terms = vocabularyList else { return }
+        DictationMotion.cancel(terms); clear(terms)
+        let activeLearning = store.preferences.learnedVocabulary.filter { !$0.undone }
+        // A correction can teach a new spelling for an existing manual word.
+        // Only records that own the word make it an automatically added entry.
+        let automaticTerms = store.preferences.automaticallyAddedTerms
+        let visibleTerms = store.preferences.vocabulary.filter {
+            vocabularySource == 0 || (vocabularySource == 1 ? automaticTerms.contains($0) : !automaticTerms.contains($0))
+        }
+        vocabularySources?.selectedSegment = vocabularySource
+        vocabularyCount?.stringValue = "\(visibleTerms.count) 个词"
+        if visibleTerms.isEmpty {
+            let empty = vocabularySource == 1 ? "还没有自动添加的词条。口述后纠正术语，可自动记住。"
+                : vocabularySource == 2 ? "还没有手动添加的词条。在上方添加常用的人名或专业术语。"
+                : "还没有词条。先加入一个经常被识别错的名字。"
+            fill(terms, label(empty, color: Palette.muted))
+        }
         // A term has one visible origin: its newest active correction. Undo
         // records remain in storage for rejection memory, never as extra rows.
         var learnedByTerm: [String: DictationLearnedVocabulary] = [:]
-        for record in store.preferences.learnedVocabulary.filter({ !$0.undone }).sorted(by: { $0.createdAt > $1.createdAt }) {
+        for record in activeLearning.sorted(by: { $0.createdAt > $1.createdAt }) {
             if learnedByTerm[record.corrected] == nil { learnedByTerm[record.corrected] = record }
         }
-        for term in store.preferences.vocabulary {
+        for term in visibleTerms {
             let learned = learnedByTerm[term]
             let text = label(learned.map { "\($0.original) → \($0.corrected)" } ?? term, size: 14)
             text.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -863,13 +916,19 @@ extension DictationWindowController {
             row.heightAnchor.constraint(greaterThanOrEqualToConstant: 30).isActive = true
             fill(terms, row)
         }
-        fill(pageStack, card(terms))
     }
     @objc private func addVocabulary() {
         guard let term = vocabularyField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), !term.isEmpty else { return }
-        var terms = store.preferences.vocabulary; if !terms.contains(term) { terms.append(term) }
-        if let error = DictationStore.validateVocabulary(terms) { vocabularyFeedback?.stringValue = error; vocabularyFeedback?.textColor = .systemOrange; return }
-        store.updatePreferences { $0.vocabulary = terms }
+        guard store.addManualVocabulary(term) else {
+            vocabularyFeedback?.stringValue = store.storageError ?? "词条未能保存，请重试。"
+            vocabularyFeedback?.textColor = .systemOrange; return
+        }
+        vocabularyField?.stringValue = ""; vocabularyAdd?.isEnabled = false
+        vocabularyFeedback?.stringValue = vocabularyHint
+        vocabularyFeedback?.textColor = Palette.muted
+        // A successful explicit addition stays visible regardless of the tab
+        // the user was browsing before entering it.
+        vocabularySource = 0; reloadVocabularyList()
     }
     func controlTextDidChange(_ notification: Notification) {
         if let search = notification.object as? NSSearchField, search === searchField {

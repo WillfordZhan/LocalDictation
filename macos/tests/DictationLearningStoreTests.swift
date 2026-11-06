@@ -11,14 +11,17 @@ enum DictationLearningStoreTests {
         let learned = store.learnVocabulary(original: "SalesPrat", corrected: "SalesPart",
             entryID: entryID, bundleID: "test.fixture")!
         precondition(store.preferences.vocabulary == ["ManualTerm", "SalesPart"])
+        precondition(store.preferences.automaticallyAddedTerms == ["SalesPart"])
         precondition(store.entries.isEmpty && store.usageSummary().dictationCount == 0)
         precondition(store.learnVocabulary(original: "SalesPrat", corrected: "SalesPart",
             entryID: entryID, bundleID: nil) == nil)
         let restarted = DictationStore(directory: folder)
         precondition(restarted.preferences.learnedVocabulary.first?.id == learned.id)
         precondition(restarted.preferences.learnedVocabulary.first?.entryID == entryID)
+        precondition(restarted.preferences.automaticallyAddedTerms == ["SalesPart"])
         restarted.undoLearnedVocabulary(id: learned.id)
         precondition(restarted.preferences.vocabulary == ["ManualTerm"])
+        precondition(restarted.preferences.automaticallyAddedTerms.isEmpty)
         precondition(restarted.preferences.learnedVocabulary.first?.undone == true)
         precondition(restarted.learnVocabulary(original: "SalesPrat", corrected: "SalesPart",
             entryID: entryID, bundleID: nil) == nil, "Undo must prevent immediate relearning")
@@ -34,6 +37,7 @@ enum DictationLearningStoreTests {
         precondition(old.vocabulary == ["Existing"] && old.learnedVocabulary.isEmpty)
         saved.updatePreferences { $0.automaticVocabularyLearning = true; $0.vocabulary.append("会话") }
         let known = saved.learnVocabulary(original: "绘画", corrected: "会话", entryID: entryID, bundleID: nil)!
+        precondition(!saved.preferences.automaticallyAddedTerms.contains("会话"), "A learned correction must not reclassify a manual word")
         precondition(saved.preferences.correctionHints.contains(.init(original: "绘画", corrected: "会话")))
         let payload = try DictationStore.encodeRequestOptions(cleanup: true, language: "zh",
             vocabulary: saved.preferences.vocabulary, corrections: saved.preferences.correctionHints)
@@ -44,6 +48,7 @@ enum DictationLearningStoreTests {
         let first = saved.learnVocabulary(original: "DemoPrat", corrected: "DemoPart", entryID: entryID, bundleID: nil)!
         let second = saved.learnVocabulary(original: "Demopart", corrected: "DemoPart", entryID: entryID, bundleID: nil)!
         precondition(saved.undoLearnedVocabulary(id: first.id) && saved.preferences.vocabulary.contains("DemoPart"))
+        precondition(saved.preferences.automaticallyAddedTerms.contains("DemoPart"), "Ownership transfers with remaining corrections")
         precondition(saved.undoLearnedVocabulary(id: second.id) && !saved.preferences.vocabulary.contains("DemoPart"))
         let overlap = DictationStore(memoryOnly: true)
         overlap.updatePreferences { $0.vocabulary = ["bom", "BOM"] }
@@ -94,6 +99,24 @@ enum DictationLearningStoreTests {
         try FileManager.default.removeItem(at: persisted)
         try beforeUndo.write(to: persisted)
         precondition(saved.undoLearnedVocabulary(id: retry.id))
+        let promoted = saved.learnVocabulary(original: "CachePrat", corrected: "CachePart", entryID: entryID, bundleID: nil)!
+        let alias = saved.learnVocabulary(original: "CahcePart", corrected: "CachePart", entryID: entryID, bundleID: nil)!
+        precondition(saved.preferences.automaticallyAddedTerms.contains("CachePart"))
+        precondition(saved.addManualVocabulary("  CachePart  "))
+        let manualRestart = DictationStore(directory: folder)
+        precondition(manualRestart.preferences.vocabulary.filter { $0 == "CachePart" }.count == 1)
+        precondition(!manualRestart.preferences.automaticallyAddedTerms.contains("CachePart"))
+        precondition(manualRestart.preferences.correctionHints.contains(.init(original: "CachePrat", corrected: "CachePart")))
+        precondition(manualRestart.undoLearnedVocabulary(id: promoted.id) && manualRestart.undoLearnedVocabulary(id: alias.id))
+        precondition(manualRestart.preferences.vocabulary.contains("CachePart"), "Explicit manual addition survives undo of all learned spellings")
+        precondition(!manualRestart.addManualVocabulary(String(repeating: "x", count: 65)))
+        precondition(!manualRestart.addManualVocabulary("  "))
+        let beforeManual = try Data(contentsOf: persisted)
+        try FileManager.default.removeItem(at: persisted)
+        try FileManager.default.createDirectory(at: persisted, withIntermediateDirectories: false)
+        precondition(!manualRestart.addManualVocabulary("UnsavedManual") && !manualRestart.preferences.vocabulary.contains("UnsavedManual"))
+        try FileManager.default.removeItem(at: persisted)
+        try beforeManual.write(to: persisted)
         print("PASS learning store: confirmed terms persist, undo is durable and blocks relearning, manual words preserved, disabled mode, no transcript or usage mutation")
     }
 }

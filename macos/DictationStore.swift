@@ -48,6 +48,13 @@ struct DictationPreferences: Codable {
             .map { DictationCorrectionHint(original: $0.original, corrected: $0.corrected) }
     }
 
+    /// A correction for an existing manual word learns a spelling, not a new
+    /// word. Ownership survives additional spellings and transfers on undo.
+    var automaticallyAddedTerms: Set<String> {
+        Set(learnedVocabulary.lazy.filter { !$0.undone && $0.vocabularyWasPresent != true }
+            .map(\.corrected)).intersection(vocabulary)
+    }
+
     init() {}
 
     private enum CodingKeys: String, CodingKey {
@@ -443,6 +450,24 @@ final class DictationStore {
         savePreferences()
         if hasUnsavedHistory { _ = persistHistory() }
         changed()
+    }
+
+    /// Explicitly adding an already learned word keeps it as a manual entry.
+    /// Undo may still remove its correction mappings, but cannot remove a word
+    /// the user chose to retain. Persist that ownership with the word atomically.
+    @discardableResult
+    func addManualVocabulary(_ value: String) -> Bool {
+        let term = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !term.isEmpty else { return false }
+        var next = preferences
+        next.vocabulary = Self.normalizedVocabulary(next.vocabulary + [term])
+        for index in next.learnedVocabulary.indices where
+            !next.learnedVocabulary[index].undone && next.learnedVocabulary[index].corrected == term {
+            next.learnedVocabulary[index].vocabularyWasPresent = true
+            next.learnedVocabulary[index].replacedVocabulary = nil
+            next.learnedVocabulary[index].supersededLearningIDs = nil
+        }
+        return saveLearningPreferences(next)
     }
 
     @discardableResult
