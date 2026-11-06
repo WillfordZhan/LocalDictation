@@ -6,7 +6,7 @@ jobs:
   backend:
     # The complete suite exercises the real macOS installer and atomic model
     # directory exchange; keep these checks on the platform the app supports.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,7 +19,7 @@ jobs:
       - name: Distribution validation
         run: python -m unittest discover -s packaging -p 'test_*.py' -q
   native:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: AppKit and storage tests without microphone or model access
