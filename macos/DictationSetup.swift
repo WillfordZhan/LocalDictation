@@ -39,6 +39,9 @@ struct SetupProcessOutput {
     private var pending = Data()
     private(set) var lastEvent: ModelDownloadEvent?
     private(set) var failure: String?
+    // Keep construction independent of compiler-specific memberwise access
+    // inference for the private streaming buffer.
+    init(streaming: Bool) { self.streaming = streaming }
     var retainedByteCount: Int { output.count + pending.count }
     mutating func append(_ chunk: Data) -> [ModelDownloadEvent] {
         guard failure == nil else { return [] }
