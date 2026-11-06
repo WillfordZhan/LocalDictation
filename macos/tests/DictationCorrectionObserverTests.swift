@@ -54,6 +54,11 @@ enum DictationCorrectionObserverTests {
         detects("比较 SalesPrat 和 SalesPrat。", "比较 SalesPart 和 SalesPrat。", ("SalesPrat", "SalesPart"))
         detects("比较 SalesPrat 和 ProductPrat。", "比较 SalesPart 和 ProductPart。", nil)
         detects("比较 SalesPrat 和 SalesPart。", "比较 SalesPart 和 SalesPrat。", nil)
+        detects("比较 AlphaPart、AlphaPar、BetaPrat、AlphaPar！", "比较 AlphaPart、AlphaPart、BetaPrat、AlphaPart！", ("AlphaPar", "AlphaPart"))
+        detects("比较 AlphaPart、AlphaPart！", "比较 AlphaPar、AlphaPar！", ("AlphaPart", "AlphaPar"))
+        detects("比较 AlphaPar、AlphaPar", "比较 AlphaPar、AlphaPart", nil)
+        detects("比较 AlphaPar、AlphaPar。", "删除 AlphaPart、AlphaPart。", nil)
+        detects("比较 AlphaPart、AlphaPart。", "比较 AlphaPar、AlphaPar。继续检查。", nil)
         detects("计算 pass ratio 的值。", "计算 pathRatio 的值。", ("pass ratio", "pathRatio"))
         detects("计算 pass ratio 的值。", "计算 path ratio 的值。", nil)
 
@@ -260,7 +265,7 @@ enum DictationCorrectionObserverTests {
         // Disjoint replacements of the same term must not erase the origin of
         // untouched text between them. Exercise equal, shorter and longer
         // replacements so later eligibility does not depend on stale offsets.
-        for source in ["SalesPrat", "SalesPratt", "SalesPrt"] {
+        for source in ["SalesPrat", "SalesPratt", "SalesPrt", "SalesPar", "SalesPartt"] {
             let count = candidates.count
             confirmed("比较 \(source)、ProductPrat、\(source)。")
             text("比较 SalesPart、ProductPrat、SalesPart。"); tick(); tick(1.6)
@@ -277,6 +282,14 @@ enum DictationCorrectionObserverTests {
         precondition(candidates.count == prefixWordCount + 1 && candidates.last?.original == "SalesPar" &&
                      candidates.last?.corrected == "SalesPart",
                      "An unchanged correct word must not consume the shorter source as an identifier prefix")
+
+        let repeatedBoundaryCount = candidates.count
+        confirmed("比较 AlphaPart、AlphaPar、BetaPrat、AlphaPar！")
+        text("比较 AlphaPart、AlphaPart、BetaPrat、AlphaPart！"); tick(); tick(1.6)
+        text("比较 AlphaPart、AlphaPart、BetaPart、AlphaPart！"); tick(); tick(1.6)
+        precondition(candidates.count == repeatedBoundaryCount + 2 &&
+                     candidates[repeatedBoundaryCount].original == "AlphaPar" && candidates.last?.corrected == "BetaPart",
+                     "Repeated suffix insertion must retain the untouched middle term for subsequent learning")
 
         for ending in [".", "...", ". Then check."] {
             let sentenceCount = candidates.count

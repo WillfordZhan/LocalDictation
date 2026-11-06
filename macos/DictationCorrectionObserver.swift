@@ -59,9 +59,15 @@ enum DictationCorrectionDetector {
     static func correction(in original: String, edited: String) -> (original: String, corrected: String)? {
         if let result = singleCorrection(in: original, edited: edited) { return result }
         let before = Array(original), after = Array(edited)
-        guard let start = firstChange(before, after),
-              let oldRange = tokenRange(in: original, characters: before, start: start, end: start + 1),
-              let newRange = tokenRange(in: edited, characters: after, start: start, end: start + 1) else { return nil }
+        guard let start = firstChange(before, after) else { return nil }
+        let oldIdentifier = isIdentifier(before[start]), newIdentifier = isIdentifier(after[start])
+        // Repeated suffix insertion/deletion puts one side's first difference
+        // on the following separator. Use the existing zero-width boundary
+        // lookup only on that side; replay must still explain the complete edit.
+        let oldEnd = !oldIdentifier && newIdentifier ? start : start + 1
+        let newEnd = oldIdentifier && !newIdentifier ? start : start + 1
+        guard let oldRange = tokenRange(in: original, characters: before, start: start, end: oldEnd),
+              let newRange = tokenRange(in: edited, characters: after, start: start, end: newEnd) else { return nil }
         let source = String(before[oldRange]), destination = String(after[newRange])
         guard isHighConfidence(source: source, destination: destination),
               correctedRanges(in: original, edited: edited, source: source, destination: destination) != nil else { return nil }
