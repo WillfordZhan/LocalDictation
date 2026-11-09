@@ -103,7 +103,8 @@ jobs:
               assert asset['state'] == 'uploaded' and asset['digest'] == digest and asset['size'] == len(content)
               print(path.name, len(content), digest)
           request = urllib.request.Request('https://api.github.com/repos/'+os.environ['GH_REPO']+'/releases/'+str(draft['id']),
-              data=json.dumps({'body':pathlib.Path('RELEASE.md').read_text()}).encode(),
+              data=json.dumps({'tag_name':draft['tag_name'],'target_commitish':draft['target_commitish'],
+                  'name':draft['name'],'draft':True,'prerelease':True,'body':pathlib.Path('RELEASE.md').read_text()}).encode(),
               headers={**headers,'Content-Type':'application/json'},method='PATCH')
           with urllib.request.urlopen(request,timeout=30) as response: assert json.load(response)['draft']
           PYUPLOAD
