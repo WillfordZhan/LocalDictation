@@ -6,6 +6,10 @@ on:
         description: 'Successful Windows preview package run ID'
         required: true
         type: string
+      draft_release:
+        description: 'Maintainer-created draft release ID'
+        required: true
+        type: string
 permissions:
   contents: write
   actions: read
@@ -18,6 +22,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           PACKAGE_RUN: ${{ inputs.package_run }}
+          DRAFT_RELEASE: ${{ inputs.draft_release }}
         shell: bash
         run: |
           set -euo pipefail
@@ -41,6 +46,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           PACKAGE_RUN: ${{ inputs.package_run }}
+          DRAFT_RELEASE: ${{ inputs.draft_release }}
         shell: bash
         run: |
           set -euo pipefail
@@ -75,7 +81,29 @@ jobs:
           # identity; the workflow token only uploads verified assets to it.
           gh api "repos/$GH_REPO/git/ref/tags/v0.6.0-windows-preview.1" > tag.json
           jq -e --arg sha "$source_commit" '.object.type == "commit" and .object.sha == $sha' tag.json
-          gh api "repos/$GH_REPO/releases/tags/v0.6.0-windows-preview.1" > draft.json
-          jq -e '.draft == true and .prerelease == true' draft.json
-          gh release upload v0.6.0-windows-preview.1 package/* Windows-validation-evidence.zip
-          gh release edit v0.6.0-windows-preview.1 --notes-file RELEASE.md
+          [[ "$DRAFT_RELEASE" =~ ^[0-9]+$ ]]
+          gh api "repos/$GH_REPO/releases/$DRAFT_RELEASE" > draft.json
+          jq -e '.draft == true and .prerelease == true and .tag_name == "v0.6.0-windows-preview.1"' draft.json
+          python3 - <<'PYUPLOAD'
+          import hashlib, json, os, pathlib, urllib.parse, urllib.request
+          draft = json.loads(pathlib.Path('draft.json').read_text())
+          base = draft['upload_url'].split('{', 1)[0]
+          assert urllib.parse.urlsplit(base).hostname == 'uploads.github.com'
+          headers = {'Authorization': 'Bearer '+os.environ['GH_TOKEN'], 'User-Agent': 'LocalDictation-release'}
+          for path in [*pathlib.Path('package').iterdir(), pathlib.Path('Windows-validation-evidence.zip')]:
+              content = path.read_bytes()
+              digest = 'sha256:'+hashlib.sha256(content).hexdigest()
+              prior = next((a for a in draft['assets'] if a['name'] == path.name), None)
+              if prior:
+                  assert prior['state'] == 'uploaded' and prior['digest'] == digest, prior['name']
+                  continue
+              request = urllib.request.Request(base+'?'+urllib.parse.urlencode({'name':path.name}), data=content,
+                  headers={**headers,'Content-Type':'application/octet-stream'}, method='POST')
+              with urllib.request.urlopen(request, timeout=300) as response: asset = json.load(response)
+              assert asset['state'] == 'uploaded' and asset['digest'] == digest and asset['size'] == len(content)
+              print(path.name, len(content), digest)
+          request = urllib.request.Request('https://api.github.com/repos/'+os.environ['GH_REPO']+'/releases/'+str(draft['id']),
+              data=json.dumps({'body':pathlib.Path('RELEASE.md').read_text()}).encode(),
+              headers={**headers,'Content-Type':'application/json'},method='PATCH')
+          with urllib.request.urlopen(request,timeout=30) as response: assert json.load(response)['draft']
+          PYUPLOAD
