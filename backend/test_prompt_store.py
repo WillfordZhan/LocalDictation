@@ -38,9 +38,12 @@ class PromptStoreTests(unittest.TestCase):
         self.assertEqual(original.model_id, "test-local-model")
         self.assertEqual(original.origin, "builtin")
         self.assertEqual(self.primary.read_bytes(), self.backup.read_bytes())
-        self.assertEqual(self.primary.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.backup.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.directory.stat().st_mode & 0o777, 0o700)
+        # Windows exposes a read-only bit through chmod/stat, not POSIX access
+        # permissions. Keep the durability assertions active on both platforms.
+        if os.name == "posix":
+            self.assertEqual(self.primary.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.backup.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.directory.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.reload().resolve(), original)
 
     def test_save_is_immutable_and_activation_is_explicit(self):
@@ -93,12 +96,12 @@ class PromptStoreTests(unittest.TestCase):
         self.assertEqual(self.backup.read_bytes(), b"bad-backup")
 
     def test_integrity_mismatch_is_not_silently_accepted(self):
-        value = json.loads(self.primary.read_text())
+        value = json.loads(self.primary.read_text(encoding="utf-8"))
         value["versions"][0]["system_prompt"] = "被改过但校验值未更新"
         for path in (self.primary, self.backup): path.write_bytes(json_bytes(value))
         loaded = self.reload()
         self.assertTrue(loaded.error)
-        self.assertEqual(json.loads(self.primary.read_text()), value)
+        self.assertEqual(json.loads(self.primary.read_text(encoding="utf-8")), value)
 
     def test_missing_mirror_is_repaired_without_new_version(self):
         first = self.store.resolve()
