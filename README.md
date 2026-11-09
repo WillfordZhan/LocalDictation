@@ -2,11 +2,11 @@
 
 在 Mac 上按快捷键说话，结束后把整理好的文字填入当前输入框。音频识别与默认文字整理都在本机运行。
 
-源码版本：**0.5.8 测试版**；当前公开下载为 **0.5.4**。首发支持 **Apple Silicon Mac / macOS 14 或更新版本**。Windows 在路线中，目前没有 Windows 安装包；原生界面、快捷键、音频和粘贴集成尚需移植，MLX 推理也需要 Windows 可用的后端。
+源码版本：**0.5.8 测试版**；当前 Mac 公开下载为 **0.5.8**。首发支持 **Apple Silicon Mac / macOS 14 或更新版本**。Windows x64 预览版正在进行独立构建与实测，使用 WPF、CPU Whisper 和 Qwen；进度与构建方法见 [Windows 说明](windows/README.md)。
 
 ## 使用
 
-1. 从[Mac 下载页](https://github.com/WillfordZhan/LocalDictation/releases/tag/v0.5.4)下载 `LocalDictation-0.5.4-AppleSilicon.zip`，解压后将应用放入 Applications。
+1. 从[Mac 下载页](https://github.com/WillfordZhan/LocalDictation/releases/tag/v0.5.8)下载 `LocalDictation-0.5.8-AppleSilicon.zip`，解压后将应用放入 Applications。
 2. 打开应用，使用内置配置检查与模型下载。发行包包含 Python 运行环境，模型在首次使用时下载到应用外。
 3. 允许麦克风和辅助功能；使用单独 Fn 时还需输入监控。也可以在设置中改为组合快捷键。
 4. 点击目标输入框，按一下快捷键开始，再按一下结束。整理期间可以继续说下一段。

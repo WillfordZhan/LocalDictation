@@ -1,0 +1,69 @@
+name: Windows preview package
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build complete portable bundle
+        shell: pwsh
+        run: |
+          ./windows/packaging/build.ps1 -PythonForBuild (Get-Command python).Source -Dotnet (Get-Command dotnet).Source -OutputDirectory "$env:RUNNER_TEMP/LocalDictation-Windows" -CacheDirectory "$env:RUNNER_TEMP/package-cache"
+      - name: Render application pages without microphone or clipboard
+        shell: pwsh
+        run: |
+          $result = "$env:RUNNER_TEMP/ui-results"
+          $p = Start-Process "$env:RUNNER_TEMP/LocalDictation-Windows/LocalDictation.exe" -ArgumentList '--ui-smoke','--data-dir',"$env:RUNNER_TEMP/ui-data",'--result-dir',$result -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw 'UI render failed' }
+          Get-Content "$result/ui-smoke.json"
+      - name: Interactive desktop acceptance probe
+        shell: pwsh
+        run: |
+          dotnet publish windows/tests/DesktopProbe.csproj -c Release -r win-x64 --self-contained true -o "$env:RUNNER_TEMP/desktop-probe"
+          if ($LASTEXITCODE -ne 0) { throw 'Probe compile failed' }
+          $p = Start-Process "$env:RUNNER_TEMP/desktop-probe/DesktopProbe.exe" -ArgumentList '--probe',"$env:RUNNER_TEMP/desktop-results" -Wait -PassThru
+          # Hosted sessions may not provide an interactive desktop. Keep the
+          # actual result as evidence; never label an unavailable desktop a pass.
+          if (Test-Path "$env:RUNNER_TEMP/desktop-results/desktop-result.json") { Get-Content "$env:RUNNER_TEMP/desktop-results/desktop-result.json" }
+          else { throw 'Desktop probe produced no result' }
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/model-data/Runtime/models
+          key: windows-cpu-models-${{ hashFiles('backend/windows-model-manifest.json') }}
+      - name: Download and verify production models
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/LocalDictation-Windows/runtime/python/python.exe" -B "$env:RUNNER_TEMP/LocalDictation-Windows/backend/windows_setup.py" --data-dir "$env:RUNNER_TEMP/model-data" --download
+          if ($LASTEXITCODE -ne 0) { throw 'Model setup failed' }
+      - name: Real CPU ASR and cleanup with synthetic speech
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/LocalDictation-Windows/runtime/python/python.exe" -B windows/tests/inference_smoke.py --bundle "$env:RUNNER_TEMP/LocalDictation-Windows" --data-dir "$env:RUNNER_TEMP/model-data" --result "$env:RUNNER_TEMP/inference-result.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Real model inference failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-preview-evidence
+          path: |
+            ${{ runner.temp }}/ui-results/
+            ${{ runner.temp }}/desktop-results/
+            ${{ runner.temp }}/inference-result.*
+            ${{ runner.temp }}/package-cache/build-*/native-self-test.json
+            ${{ runner.temp }}/LocalDictation-Windows/bundle-manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalDictation-Windows-x64-preview
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/LocalDictation-*-Windows-x64.zip
+            ${{ runner.temp }}/LocalDictation-*-Windows-x64.zip.sha256

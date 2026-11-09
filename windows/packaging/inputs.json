@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "architecture": "win-x64",
+  "python": {
+    "version": "3.11.9",
+    "filename": "python.nupkg",
+    "url": "https://api.nuget.org/v3-flatcontainer/python/3.11.9/python.3.11.9.nupkg",
+    "sha256": "9283876d58c017e0e846f95b490da3bca0fc0a6ee1134b2870677cfb7eec3c67"
+  },
+  "llama": {
+    "version": "b12211",
+    "filename": "llama-b12211-bin-win-cpu-x64.zip",
+    "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12211/llama-b12211-bin-win-cpu-x64.zip",
+    "sha256": "23729000408c6968faf5e322afc99319d3b8c576ba872ef7663d9b89810090f3"
+  },
+  "licenses": [
+    {
+      "name": "llama.cpp",
+      "filename": "llama-LICENSE",
+      "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b12211/LICENSE",
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    },
+    {
+      "name": "NAudio",
+      "filename": "NAudio-LICENSE",
+      "url": "https://raw.githubusercontent.com/naudio/NAudio/v2.2.1/license.txt",
+      "sha256": "303e01786b271eb464b3f43d18a375f2f17d37bc708a37c2fdf45b289fb5bfaa"
+    }
+  ],
+  "vc_redist": {
+    "version": "14-v17-release-2026-10-07",
+    "filename": "vc_redist.x64.exe",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/990c720a-46ce-4dc7-87b9-c2eb615d34b9/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
+    "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b",
+    "bytes": 25635768
+  }
+}
