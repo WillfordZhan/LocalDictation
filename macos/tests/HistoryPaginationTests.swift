@@ -150,10 +150,67 @@ enum HistoryPaginationChecks {
         }
         print("PASS: 20-row history pages; 28pt footer only when needed; first/last button bounds; detail/page synchronization; new-record boundary retention; full-history raw-text search; empty search; final-page deletion fallback; clear/repopulate; original records preserved.")
     }
+    static func latestNavigationChecks() throws {
+        let store = DictationStore(memoryOnly: true), now = Date()
+        for index in 0..<25 {
+            add(store, text: "Earlier record \(index)", date: now.addingTimeInterval(-Double(index)))
+        }
+        let controller = DictationWindowController(store: store, sessionStartedAt: now)
+        let window = controller.window!, root = window.contentView!
+        defer { window.close() }
+        store.onChange = { [weak controller] in controller?.reloadStore() }
+        controller.showPage(.history); layout(root)
+        // Automatic initial selection must not silently turn into a reading
+        // anchor and move history backwards as background recordings arrive.
+        for index in 1...20 {
+            add(store, text: "New recording \(index)", date: now.addingTimeInterval(Double(index)))
+        }
+        layout(root)
+        try require(pageLabel(root) == "1 / 3" && transcript(root) == "New recording 20",
+                    "Default latest history drifted to an old page after new recordings: page=\(pageLabel(root) ?? "none")")
+        try require(rows(root).first?.identifier?.rawValue == "history-row-\(store.entries[0].id.uuidString)",
+                    "The newest stored recording is not the first visible history row")
+        let reading = store.entries[0]
+        try click("history-row-\(reading.id.uuidString)", in: root)
+        add(store, text: "New recording 21", date: now.addingTimeInterval(21)); layout(root)
+        try require(transcript(root) == reading.text,
+                    "Clicking the currently selected latest row did not protect active reading")
+        try require((identified("history-latest", in: root) as? NSButton)?.isHidden == false,
+                    "Active reading has no compact path back to latest")
+        try click("history-latest", in: root)
+        try require(pageLabel(root) == "1 / 3" && transcript(root) == "New recording 21",
+                    "Latest action did not resume following new records")
+        try click("history-page-next", in: root)
+        controller.showPage(.home); controller.showPage(.history); layout(root)
+        try require(pageLabel(root) == "1 / 3" && transcript(root) == "New recording 21",
+                    "Explicit navigation back to history kept an old-page reading anchor")
+        try search("Earlier record", in: root)
+        controller.showPage(.history); layout(root)
+        let searchField = descendants(root).compactMap { $0 as? NSSearchField }.first!
+        try require(searchField.stringValue.isEmpty && transcript(root) == "New recording 21",
+                    "Explicit history navigation retained a stale search filter")
+        try search("No matching record", in: root)
+        try require(rows(root).isEmpty, "Empty-search recovery fixture is not empty")
+        try click("history-latest", in: root)
+        try require(transcript(root) == "New recording 21" && searchField.stringValue.isEmpty,
+                    "Latest action failed to recover from an empty filtered page")
+        try click("history-page-next", in: root)
+        controller.returnToLatestHistoryIfVisible(); layout(root)
+        try require(pageLabel(root) == "1 / 3" && transcript(root) == "New recording 21",
+                    "Reopening a history window retained its stale page")
+        controller.showPage(.dictionary); layout(root)
+        controller.returnToLatestHistoryIfVisible(); layout(root)
+        try require(identified("history-list-pane", in: root) == nil &&
+                    descendants(root).compactMap { $0 as? SidebarNavigationButton }.contains { $0.title == "个人词典" && $0.selected },
+                    "Reopening another page unexpectedly switched to history")
+        try require(store.entries.count == 46 && !window.isVisible && store.storageDirectory == nil,
+                    "Latest-history fixture mutated stored history or showed a window")
+        print("PASS: latest history follows new recordings without page drift; explicit reading remains pinned with compact latest action; navigation/reopen clears old page and search; empty search recovers; other pages stay open.")
+    }
     static func main() {
         NSApplication.shared.setActivationPolicy(.prohibited)
         do {
-            try run(); try boundaryChecks()
+            try run(); try boundaryChecks(); try latestNavigationChecks()
             print("PASS: exact 20/21/41-record boundaries at 1000px/1800px; selected record survives reprocessing; deleting the only last-page record collapses or removes pager.")
         } catch { fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1) }
     }

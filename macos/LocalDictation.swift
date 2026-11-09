@@ -2533,6 +2533,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
 
     @objc private func showResults() {
         createWindowIfNeeded()
+        // Opening the main window is a fresh visit. A retained history window
+        // must not reopen on a page anchored to an old recording.
+        windowController?.returnToLatestHistoryIfVisible()
         updateUI()
         NSApp.activate(ignoringOtherApps: true)
         windowController?.window?.makeKeyAndOrderFront(nil)

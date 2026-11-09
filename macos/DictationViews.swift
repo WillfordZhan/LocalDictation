@@ -274,6 +274,8 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     private var microphoneStatus: NSTextField?; private var accessibilityStatus: NSTextField?
     private var homeRaw = false; private var historyMode = 0
     private var selectedEntryID: UUID?; private var historySearch = ""
+    private var historyFollowsLatest = true
+    private var historyLatestButton: ActionButton?
     private var historyList: NSStackView?; private var historyDetail: NSStackView?
     private var historyPage = 0
     private let historyPageSize = 20
@@ -472,7 +474,10 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     }
     func showPage(_ page: DictationPage, compareHistory: Bool = false, promptVersionID: String? = nil) {
         let changedPage = self.page != page
-        if page == .history && compareHistory { historyMode = 2 }
+        if page == .history {
+            resetHistoryToLatest()
+            if compareHistory { historyMode = 2 }
+        }
         if let promptVersionID { promptStudio.selectVersion(id: promptVersionID) }
         shortcutRecorder?.cancel(); self.page = page; renderPage()
         if page == .prompts && !hasPromptCatalog { onReloadPrompts?() }
@@ -481,6 +486,19 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         window?.contentView?.layoutSubtreeIfNeeded()
         pageScroll.documentView?.scroll(.zero)
         if changedPage { DictationMotion.reveal(pageStack) }
+    }
+    // Reopening an existing history window is an explicit request to see the
+    // current records. Other pages retain their editor and navigation state.
+    func returnToLatestHistoryIfVisible() {
+        guard page == .history else { return }
+        showPage(.history)
+    }
+    private func resetHistoryToLatest() {
+        historyFollowsLatest = true; historyPage = 0; selectedEntryID = nil; historySearch = ""
+    }
+    private func showLatestHistory() {
+        resetHistoryToLatest(); searchField?.stringValue = ""
+        reloadHistoryList(); historyListScroll?.documentView?.scroll(.zero)
     }
     func windowWillClose(_ notification: Notification) { shortcutRecorder?.cancel(); DictationMotion.cancel(pageStack) }
     func windowDidResignKey(_ notification: Notification) { shortcutRecorder?.cancel() }
@@ -502,7 +520,7 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         homeInsertionNotice = nil; homeAllowInsertion = nil
         homeProcessingDetail = nil; cleanupSettingDetail = nil
         clear(pageStack); liveStatus = nil; liveStart = nil; liveCancel = nil; microphoneStatus = nil; accessibilityStatus = nil
-        historyList = nil; historyDetail = nil; historyListContainer = nil; historyListScroll = nil; historyPager = nil
+        historyList = nil; historyDetail = nil; historyListContainer = nil; historyListScroll = nil; historyPager = nil; historyLatestButton = nil
         vocabularyFeedback = nil; vocabularyAdd = nil; correctionLearningLabel = nil
         vocabularyList = nil; vocabularyCount = nil; vocabularySources = nil; vocabularyLearningSwitch = nil
         for (item, button) in navigation { button.selected = item == page }
@@ -719,7 +737,11 @@ extension DictationWindowController {
         // A preserved unreadable history file can leave the visible list empty.
         // Clearing is also the explicit recovery path for that stored file.
         removeAll.isEnabled = !store.entries.isEmpty || store.storageError != nil
-        let row = horizontal([search, removeAll]); row.setContentHuggingPriority(.required, for: .vertical)
+        let latest = ActionButton("最新", icon: "arrow.up.to.line") { [weak self] in self?.showLatestHistory() }
+        latest.identifier = NSUserInterfaceItemIdentifier("history-latest")
+        latest.toolTip = "清除搜索并回到最新记录"; latest.setAccessibilityLabel("回到最新记录")
+        latest.setContentHuggingPriority(.required, for: .horizontal); historyLatestButton = latest
+        let row = horizontal([search, latest, removeAll]); row.setContentHuggingPriority(.required, for: .vertical)
         search.setContentHuggingPriority(.defaultLow, for: .horizontal); fill(pageStack, row)
         let list = vertical(8), detail = vertical(14); historyList = list; historyDetail = detail
         // Fill the remaining viewport with independently scrolling panes. A long
@@ -755,9 +777,15 @@ extension DictationWindowController {
         guard let list = historyList else { return }; clear(list)
         let entries = filteredEntries
         let pageCount = max(1, (entries.count + historyPageSize - 1) / historyPageSize)
-        // Keep the selected transcript visible when a new recording shifts its
-        // index. Explicit search/page actions clear selection before reloading.
-        if let selected = entries.firstIndex(where: { $0.id == selectedEntryID }) {
+        if store.entries.isEmpty && historySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            historyFollowsLatest = true
+        }
+        // The automatic first-row selection follows new recordings. Only an
+        // explicit reading action pins a record, so passive background updates
+        // cannot migrate the latest page backwards one page at a time.
+        if historyFollowsLatest {
+            historyPage = 0; selectedEntryID = entries.first?.id
+        } else if let selected = entries.firstIndex(where: { $0.id == selectedEntryID }) {
             historyPage = selected / historyPageSize
         } else {
             historyPage = min(historyPage, pageCount - 1)
@@ -771,13 +799,19 @@ extension DictationWindowController {
             let button = HistoryRowButton(date: formatter.string(from: entry.createdAt),
                 summary: String(entry.text.replacingOccurrences(of: "\n", with: " ").prefix(22)),
                 selected: selectedEntryID == entry.id) { [weak self] in
-                    guard let self, self.selectedEntryID != entry.id else { return }
+                    guard let self else { return }
+                    // Clicking the already selected automatic row also means
+                    // reading it; do not replace that detail on the next result.
+                    self.historyFollowsLatest = false
+                    self.historyLatestButton?.isHidden = false
+                    guard self.selectedEntryID != entry.id else { return }
                     self.selectedEntryID = entry.id; self.reloadHistoryList()
                     if let detail = self.historyDetail { DictationMotion.reveal(detail, duration: 0.1) }
                 }
             button.identifier = NSUserInterfaceItemIdentifier("history-row-\(entry.id.uuidString)")
             fill(list, button)
         }
+        historyLatestButton?.isHidden = historyFollowsLatest
         reloadHistoryPager(pageCount: pageCount)
         reloadHistoryDetail()
     }
@@ -814,7 +848,7 @@ extension DictationWindowController {
         let pageCount = max(1, (filteredEntries.count + historyPageSize - 1) / historyPageSize)
         let target = min(max(historyPage + offset, 0), pageCount - 1)
         guard target != historyPage else { return }
-        historyPage = target; selectedEntryID = nil
+        historyFollowsLatest = false; historyPage = target; selectedEntryID = nil
         reloadHistoryList()
         historyListScroll?.documentView?.scroll(.zero)
         if let detail = historyDetail { DictationMotion.reveal(detail, duration: 0.1) }
@@ -932,7 +966,9 @@ extension DictationWindowController {
     }
     func controlTextDidChange(_ notification: Notification) {
         if let search = notification.object as? NSSearchField, search === searchField {
-            historySearch = search.stringValue; historyPage = 0; selectedEntryID = nil; reloadHistoryList()
+            historySearch = search.stringValue
+            historyFollowsLatest = historySearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            historyPage = 0; selectedEntryID = nil; reloadHistoryList()
             historyListScroll?.documentView?.scroll(.zero)
         }
         else if let field = notification.object as? NSTextField, field === vocabularyField { vocabularyAdd?.isEnabled = !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
