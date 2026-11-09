@@ -69,7 +69,7 @@ class CleanupCacheTests(unittest.TestCase):
                 prompt_cache[0].tokens.extend(b"private output")
             if self.fail_generation:
                 raise RuntimeError("generation failed")
-            yield SimpleNamespace(text="edited", generation_tokens=self.output_count,
+            yield SimpleNamespace(text='{"text":"edited"}', generation_tokens=self.output_count,
                                   finish_reason=self.output_finish)
 
         mx = SimpleNamespace(array=list)

@@ -69,6 +69,44 @@ CLEANUP_EXAMPLES = (
 )
 
 
+# Editing rules remain user-versioned; the transport contract belongs to the
+# application. A complete model response is not necessarily pasteable text.
+# Render examples through the same envelope instead of migrating saved rules.
+CLEANUP_OUTPUT_CONTRACT = """应用输出协议：以上规则中的“正文”“只输出”等要求均指 JSON 的 text 字段内容。最终响应必须是一个 JSON 对象，且只有一个字符串字段 text，例如 {"text":"整理后的正文。"}。不要输出 Markdown 代码围栏、JSON 以外的文字或其他字段。
+text 是直接填入输入框的最终成稿，只包含说话者要表达的内容。不得加入你作为编辑器的思考、纠错过程、修正说明、听错分析、备选稿或“最终正文”标签，也不要把初稿和终稿拼在一起。无法确定的原词保留在原句中，不另加注释，不猜测新内容。说话者原本口述或引用的说明、标签、代码仍属于正文，按原意保留。换行、引号和反斜杠须正确进行 JSON 转义。"""
+
+
+def parse_cleanup_output(output: str) -> str:
+    """Accept one final-text envelope, never guess which part of prose to paste.
+
+    Reject duplicate keys and trailing text as well as malformed/truncated JSON.
+    Invalid output reaches the existing ASR fallback without another generation.
+    This validates transport, not semantic fidelity inside the final text.
+    Errors deliberately exclude generated text so logs never contain dictation.
+    """
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate cleanup field")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(output, object_pairs_hook=unique_object)
+        if not isinstance(value, dict) or set(value) != {"text"}:
+            raise ValueError("invalid cleanup envelope")
+        text = value["text"]
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("empty or invalid cleanup text")
+        # Reject lone escaped surrogates before JSON HTTP encoding or the native
+        # client can fail while decoding an otherwise valid-looking response.
+        text.encode("utf-8")
+        return text.strip()
+    except (ValueError, TypeError, RecursionError, UnicodeError):
+        raise ValueError("Cleanup output did not match the final-text contract") from None
+
+
 class RequestError(Exception):
     def __init__(self, status: int, message: str):
         self.status = status
@@ -122,10 +160,10 @@ def cleanup_messages(raw_text: str, options: DictationOptions) -> list[dict[str,
         return prefix + json.dumps(
             {"transcript": text, "vocabulary": vocabulary}, ensure_ascii=False)
 
-    messages = [{"role": "system", "content": system}]
+    messages = [{"role": "system", "content": system + "\n\n" + CLEANUP_OUTPUT_CONTRACT}]
     for source, edited in examples:
         messages.extend([{"role": "user", "content": material(source)},
-                         {"role": "assistant", "content": edited}])
+                         {"role": "assistant", "content": json.dumps({"text": edited}, ensure_ascii=False)}])
     relevant = [{"original": source, "corrected": target}
                 for source, target in options.corrections if source in raw_text]
     if relevant:
@@ -548,7 +586,7 @@ class LocalModels:
                  "prefill=%.3fs generation=%.3fs output_tokens=%d total=%.3fs",
                  hit, cached_tokens, len(prompt), first_token_at - started,
                  finished - first_token_at, getattr(last, "generation_tokens", 0), finished - started)
-        return "".join(parts)
+        return parse_cleanup_output("".join(parts))
 
 
 class DictationService:

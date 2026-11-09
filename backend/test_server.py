@@ -160,7 +160,8 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         profile = self.service.models.cleanup.call_args.args[1].cleanup_profile
         self.assertEqual(profile.id, saved["id"])
-        self.assertEqual(cleanup_messages("原始口述", self.service.models.cleanup.call_args.args[1])[0]["content"], saved["system_prompt"])
+        self.assertEqual(cleanup_messages("原始口述", self.service.models.cleanup.call_args.args[1])[0]["content"],
+                         saved["system_prompt"] + "\n\n" + server_module.CLEANUP_OUTPUT_CONTRACT)
         self.assertEqual(result["cleanup_profile"], {"version_id": saved["id"], "name": saved["name"],
                          "content_sha256": saved["content_sha256"], "model_id": "test-editor"})
         self.assertEqual(result["asr_model"], "test-asr")
@@ -1027,7 +1028,7 @@ class ModelOptionsTests(unittest.TestCase):
             self.assertIsNone(whisper.transcribe.call_args.kwargs["initial_prompt"])
 
     def test_editor_receives_transcript_and_dictionary_as_separate_data_fields(self):
-        response = SimpleNamespace(text="请检查 MLX。", generation_tokens=1, finish_reason="stop")
+        response = SimpleNamespace(text='{"text":"请检查 MLX。"}', generation_tokens=1, finish_reason="stop")
         generator = Mock(return_value=iter([response]))
         sampler_factory = Mock()
         models = LocalModels(Path("test-asr"), Path("test-editor"))
