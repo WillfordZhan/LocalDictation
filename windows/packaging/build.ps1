@@ -33,7 +33,22 @@ function Get-VerifiedInput($item) {
     if ((Test-Path $path) -and ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -eq $item.sha256)) { return $path }
     $temporary = $path + '.download-' + [Guid]::NewGuid().ToString('N')
     try {
-        Invoke-WebRequest -UseBasicParsing -Uri $item.url -OutFile $temporary -TimeoutSec 600
+        # Official mirrors can return transient gateway errors. Retry only the
+        # transfer; a completed file must still match the pinned digest exactly.
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "Downloading $($item.filename) (attempt $attempt/3)"
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $item.url -OutFile $temporary -TimeoutSec 300
+                break
+            } catch {
+                $response = $_.Exception.Response
+                $status = if ($null -ne $response) { [int]$response.StatusCode } else { 0 }
+                if (Test-Path $temporary) { Remove-Item $temporary -Force }
+                if ($attempt -eq 3 -or $status -notin @(0, 408, 429, 500, 502, 503, 504)) { throw }
+                Write-Host "Temporary download failure for $($item.filename) (HTTP $status); retrying."
+                Start-Sleep -Seconds (2 * $attempt)
+            }
+        }
         if ((Get-FileHash $temporary -Algorithm SHA256).Hash.ToLowerInvariant() -ne $item.sha256) { throw "Hash mismatch: $($item.filename)" }
         Move-Item -Force $temporary $path
     } finally { if (Test-Path $temporary) { Remove-Item $temporary -Force } }

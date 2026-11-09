@@ -2,6 +2,7 @@ name: Windows preview package
 on:
   push:
     branches: ['codex/windows-preview']
+    paths: ['windows/**', 'backend/**', '.github/workflows/windows-package.yml']
   workflow_dispatch:
 permissions:
   contents: read
