@@ -28,6 +28,12 @@ jobs:
           gh run download "$PACKAGE_RUN" --name windows-preview-evidence --dir evidence
           test -f evidence/inference-result.json
           jq -e '.success == true and .microphone_used == false' evidence/inference-result.json
+          jq -e '.success == true' evidence/desktop-results/desktop-result.json
+          jq -e '.success == true' evidence/ui-results/ui-smoke.json
+          source_commit=$(jq -r .head_sha run.json)
+          gh api "repos/$GH_REPO/actions/runs?head_sha=$source_commit&per_page=100" > checks.json
+          jq -e '[.workflow_runs[] | select(.name == "Source checks" and .conclusion == "success")] | length > 0' checks.json
+          jq -e '[.workflow_runs[] | select(.name == "Windows checks" and .conclusion == "success")] | length > 0' checks.json
           cd package
           sha256sum -c LocalDictation-*.zip.sha256
       - name: Create source-pinned draft with verification evidence

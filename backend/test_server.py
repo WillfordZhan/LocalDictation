@@ -554,7 +554,10 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200, result)
         self.assertEqual(result["raw_text"], raw)
         self.assertEqual(self.service.models.cleanup.call_args.args[0], raw)
-        status, result = self.request("POST", "/cleanup/reprocess", payload + b" ", headers)
+        # The declared size is rejected before reading any body. Sending the
+        # oversized body races the server's early close on some TCP stacks.
+        status, result = self.request("POST", "/cleanup/reprocess", headers={
+            **headers, "Content-Length": str(server_module.MAX_REPROCESS_BYTES + 1)})
         self.assertEqual(status, 413, result)
         self.assertIn("128 KiB", result["error"])
         self.assertEqual(self.service.models.cleanup.call_count, 1)

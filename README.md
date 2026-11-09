@@ -2,7 +2,7 @@
 
 在 Mac 上按快捷键说话，结束后把整理好的文字填入当前输入框。音频识别与默认文字整理都在本机运行。
 
-源码版本：**0.5.8 测试版**；当前 Mac 公开下载为 **0.5.8**。首发支持 **Apple Silicon Mac / macOS 14 或更新版本**。Windows x64 预览版正在进行独立构建与实测，使用 WPF、CPU Whisper 和 Qwen；进度与构建方法见 [Windows 说明](windows/README.md)。
+源码版本：**0.5.8 测试版**；当前 Mac 公开下载为 **0.5.8**。首发支持 **Apple Silicon Mac / macOS 14 或更新版本**。Windows x64 首个预览版使用 WPF、CPU Whisper 和 Qwen；[Windows 下载](https://github.com/WillfordZhan/LocalDictation/releases/tag/v0.6.0-windows-preview.1)与[安装说明](windows/README.md)独立提供。Windows 自动纠错学习、热力图和 GPU 加速尚未移植。
 
 ## 使用
 
@@ -13,7 +13,7 @@
 
 这个测试包使用本地开发签名，尚未经过 Apple Developer ID 公证。首次打开若被 macOS 拦截，请在系统设置的“隐私与安全性”中核对来源后选择“仍要打开”。正式公证与跨设备安装验证仍在后续工作中。
 
-## 能力
+## Mac 能力
 
 - **边说边识别**：Qwen3-ASR 中文识别，停录后使用全文进行一次整理，保留跨段改口上下文。
 - **后台口述**：关闭主窗口后仍可通过快捷键录音；多段分别显示状态并依次填入。
@@ -67,7 +67,7 @@ bash packaging/package.sh "$PWD/build/LocalDictation.app" "$PWD/releases/0.5.4"
 
 ## 路线
 
-先完善 Mac 的真实输入框兼容性、低信号识别、术语纠正和安装体验；随后抽离平台接口，增加 Windows 的音频、全局快捷键、文本填入及可用推理后端。仓库会分别标明已实现能力和计划能力。
+继续完善 Mac 的真实输入框兼容性、低信号识别、术语纠正和安装体验。Windows 已提供独立预览实现，下一步验证真实麦克风和日常编辑器，并优化 CPU 首次整理速度；分别标明已实现能力与尚未验证的兼容性。
 
 ## 许可
 

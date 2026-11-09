@@ -48,7 +48,7 @@ public partial class App : System.Windows.Application
             if (smoke)
             {
                 string directory = Path.GetFullPath(Arg("--result-dir")!); Directory.CreateDirectory(directory);
-                foreach (string page in new[] { "home", "history", "dictionary", "settings" })
+                foreach (string page in new[] { "home", "history", "dictionary", "prompts", "settings" })
                 {
                     window.SelectPage(page); await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
                     await Task.Delay(100); window.UpdateLayout();
@@ -57,7 +57,7 @@ public partial class App : System.Windows.Application
                     using var stream = File.Create(Path.Combine(directory, page + ".png")); encoder.Save(stream);
                 }
                 File.WriteAllText(Path.Combine(directory, "ui-smoke.json"), JsonSerializer.Serialize(new
-                    { success = true, pages = new[] { "home", "history", "dictionary", "settings" }, history = store.History.Count,
+                    { success = true, pages = new[] { "home", "history", "dictionary", "prompts", "settings" }, history = store.History.Count,
                       microphone_access = false, hotkey_registered = false, backend_started = false, clipboard_access = false }, UserStore.Json));
                 window.CloseSmoke();
             }

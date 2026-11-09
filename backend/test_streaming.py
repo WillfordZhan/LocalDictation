@@ -384,12 +384,20 @@ class StreamHTTPTests(unittest.TestCase):
         self.assertEqual(self.request('POST',f'/stream/{sid}/audio',b'\0\0',{'Content-Type':'audio/wav','X-Audio-Offset':'0'})[0],415)
 
     def test_cross_finish_asr_is_wholly_post_stop_compute(self):
+        # Control model timestamps independently of platform sleep resolution:
+        # ASR spans 100.00–100.75 and stop occurs at 100.25. Its entire 0.75s
+        # belongs to post-stop compute, while user-visible waiting is 0.50s.
+        clock = Mock(return_value=100.0)
+        self.service.streams.clock = clock
         self.models.asr_release.clear();sid=self.start();self.append(sid,pcm(35))
-        self.assertTrue(self.models.asr_entered.wait(2));pending=self.requests.submit(self.finish,sid,35*SAMPLE_RATE)
+        self.assertTrue(self.models.asr_entered.wait(2))
+        clock.return_value = 100.25
+        pending=self.requests.submit(self.finish,sid,35*SAMPLE_RATE)
         wait_for(lambda:self.service.streams.sessions[sid].finish_at is not None)
-        time.sleep(.02);self.models.asr_release.set();result=pending.result(3)[1];m=result['streaming_metrics']
+        clock.return_value = 100.75
+        self.models.asr_release.set();result=pending.result(3)[1];m=result['streaming_metrics']
         self.assertEqual(m['asr_before_stop_seconds'],0);self.assertEqual(m['processed_audio_before_stop_seconds'],0)
-        self.assertGreaterEqual(m['asr_after_stop_seconds'],.02);self.assertGreaterEqual(m['stop_to_result_seconds'],.02)
+        self.assertEqual(m['asr_after_stop_seconds'],.75);self.assertEqual(m['stop_to_result_seconds'],.5)
         self.assertAlmostEqual(result['total_seconds'],result['asr_seconds']+result['cleanup_seconds'],delta=.002)
 
 
