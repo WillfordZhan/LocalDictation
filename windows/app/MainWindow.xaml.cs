@@ -183,7 +183,16 @@ public partial class MainWindow : Window
                     {
                         var delivery = await NativeInput.PasteAsync(job.Session.Target, job.Result.Text);
                         bool pasted = delivery == DeliveryOutcome.PasteDispatched;
-                        if (!pasted) { job.Hud.Message(delivery == DeliveryOutcome.Copied ? "已复制 · 按 Ctrl + V 粘贴" : "结果已保存在历史记录"); await Task.Delay(3500); }
+                        if (!pasted)
+                        {
+                            job.Hud.Message(delivery switch
+                            {
+                                DeliveryOutcome.Copied => "已复制 · 按 Ctrl + V 粘贴",
+                                DeliveryOutcome.AwaitingAcknowledgement => "请检查输入框 · 结果已保存",
+                                _ => "结果已保存在历史记录"
+                            });
+                            await Task.Delay(3500);
+                        }
                         Status(job.Result.Warning ?? (pasted ? "文字已填入。" : "结果已保存在历史记录。"));
                     }
                     else if (string.IsNullOrWhiteSpace(job.Result.Text)) Status(job.Result.Warning ?? "没有识别到语音。");
@@ -289,7 +298,20 @@ public partial class MainWindow : Window
         HistoryMetadata.Text = $"{entry.CreatedAt.LocalDateTime:yyyy-MM-dd HH:mm} · 识别 {entry.Result.AsrSeconds:F1}s · 整理 {entry.Result.CleanupSeconds:F1}s\n{entry.Result.AsrModel} · {model}";
     }
     private async void CopyHistory(object sender, RoutedEventArgs e)
-    { if (HistoryList.SelectedItem is HistoryEntry entry) Status(await NativeInput.CopyAsync(entry.Result.Text) ? "已复制。" : "剪贴板被占用，请稍后重试。"); }
+    {
+        if (HistoryList.SelectedItem is not HistoryEntry entry) return;
+        bool copied = await NativeInput.CopyAsync(entry.Result.Text);
+        if (!copied && NativeInput.HasUnsettledPaste)
+        {
+            var choice = MessageBox.Show(this,
+                "上一段自动填入尚未确认。请先检查目标输入框，确认目标应用已经响应后，再继续复制，避免重复填入。\n\n目标应用已经响应，要继续复制吗？",
+                "确认填入状态", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (choice == MessageBoxResult.Yes)
+            { NativeInput.ConfirmPreviousTargetResponded(); copied = await NativeInput.CopyAsync(entry.Result.Text); }
+            else { Status("结果仍在历史中，剪贴板保持不变。"); return; }
+        }
+        Status(copied ? "已复制。" : "剪贴板被占用，请稍后重试。");
+    }
     private void DeleteHistory(object sender, RoutedEventArgs e)
     {
         if (HistoryList.SelectedItem is not HistoryEntry entry) return;

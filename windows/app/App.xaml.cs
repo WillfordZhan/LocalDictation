@@ -100,6 +100,18 @@ public partial class App : System.Windows.Application
             var delivery = new DeliveryGate(); int dispatches = 0;
             Parallel.For(0, 32, _ => { if (delivery.TryBegin()) Interlocked.Increment(ref dispatches); });
             Require(dispatches == 1 && !delivery.TryBegin(), "delivery_attempt_is_exactly_once_after_callbacks_or_retry");
+            var receipt = new PasteReceipt("开头\r\n结尾", "第一段。\n", 3, 0);
+            Require(!receipt.Matches("开头\r\n结尾") && receipt.Matches("开头\r\n第一段。\r\n结尾"),
+                "paste_receipt_requires_observed_insertion_not_dispatch_or_delay");
+            Require(!receipt.Matches("开头\r\n别的文字\r\n结尾") && !receipt.Matches("第一段。\r\n开头\r\n结尾"),
+                "paste_receipt_rejects_unrelated_changes_or_wrong_selection");
+            Require(new PasteReceipt("abcDEFghi", "正文", 3, 3).Matches("abc正文ghi"),
+                "paste_receipt_handles_exact_selected_replacement");
+            Require(new PasteReceipt("ab", "bc").Matches("abcb")
+                && !new PasteReceipt("ab", "bc").Matches("abxx") && !new PasteReceipt("正文", "正文", 0, 2).Matches("正文"),
+                "paste_receipt_handles_shared_prefix_without_accepting_unchanged_text");
+            Require(!new PasteReceipt(new string('x', PasteReceipt.MaximumCharacters), "next").CanObserve,
+                "paste_receipt_observation_is_bounded");
             File.WriteAllText(Path.Combine(directory, "windows-history.json"), "broken");
             var recovered = new UserStore(directory);
             Require(recovered.History.Count == 1 && Directory.GetFiles(directory, "windows-history.json.preserved-*").Length == 1, "mirror_recovery_preserves_corrupt_source");

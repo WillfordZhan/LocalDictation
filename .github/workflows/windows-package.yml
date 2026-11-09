@@ -21,11 +21,21 @@ jobs:
         shell: pwsh
         run: |
           ./windows/packaging/build.ps1 -PythonForBuild (Get-Command python).Source -Dotnet (Get-Command dotnet).Source -OutputDirectory "$env:RUNNER_TEMP/LocalDictation-Windows" -CacheDirectory "$env:RUNNER_TEMP/package-cache"
+      - name: Verify ZIP relocated into a path with spaces
+        shell: pwsh
+        run: |
+          $zip = Get-Item "$env:RUNNER_TEMP/LocalDictation-*-Windows-x64.zip"
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath "$env:RUNNER_TEMP/relocation test"
+          $bundle = "$env:RUNNER_TEMP/relocation test/LocalDictation"
+          Remove-Item -Recurse -Force "$env:RUNNER_TEMP/LocalDictation-Windows"
+          & "$bundle/runtime/python/python.exe" -B windows/packaging/validate_bundle.py $bundle --runtime-check
+          if ($LASTEXITCODE -ne 0) { throw 'Relocated runtime verification failed' }
+          "WINDOWS_BUNDLE=$bundle" >> $env:GITHUB_ENV
       - name: Render application pages without microphone or clipboard
         shell: pwsh
         run: |
           $result = "$env:RUNNER_TEMP/ui-results"
-          $p = Start-Process "$env:RUNNER_TEMP/LocalDictation-Windows/LocalDictation.exe" -ArgumentList '--ui-smoke','--data-dir',"$env:RUNNER_TEMP/ui-data",'--result-dir',$result -Wait -PassThru
+          $p = Start-Process "$env:WINDOWS_BUNDLE/LocalDictation.exe" -ArgumentList '--ui-smoke','--data-dir',"$env:RUNNER_TEMP/ui-data",'--result-dir',$result -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw 'UI render failed' }
           Get-Content "$result/ui-smoke.json"
       - name: Interactive desktop acceptance probe
@@ -45,12 +55,12 @@ jobs:
       - name: Download and verify production models
         shell: pwsh
         run: |
-          & "$env:RUNNER_TEMP/LocalDictation-Windows/runtime/python/python.exe" -B "$env:RUNNER_TEMP/LocalDictation-Windows/backend/windows_setup.py" --data-dir "$env:RUNNER_TEMP/model-data" --download
+          & "$env:WINDOWS_BUNDLE/runtime/python/python.exe" -B "$env:WINDOWS_BUNDLE/backend/windows_setup.py" --data-dir "$env:RUNNER_TEMP/model-data" --download
           if ($LASTEXITCODE -ne 0) { throw 'Model setup failed' }
       - name: Real CPU ASR and cleanup with synthetic speech
         shell: pwsh
         run: |
-          & "$env:RUNNER_TEMP/LocalDictation-Windows/runtime/python/python.exe" -B windows/tests/inference_smoke.py --bundle "$env:RUNNER_TEMP/LocalDictation-Windows" --data-dir "$env:RUNNER_TEMP/model-data" --result "$env:RUNNER_TEMP/inference-result.json"
+          & "$env:WINDOWS_BUNDLE/runtime/python/python.exe" -B windows/tests/inference_smoke.py --bundle "$env:WINDOWS_BUNDLE" --data-dir "$env:RUNNER_TEMP/model-data" --result "$env:RUNNER_TEMP/inference-result.json"
           if ($LASTEXITCODE -ne 0) { throw 'Real model inference failed' }
       - uses: actions/upload-artifact@v4
         if: always()
@@ -61,7 +71,7 @@ jobs:
             ${{ runner.temp }}/desktop-results/
             ${{ runner.temp }}/inference-result.*
             ${{ runner.temp }}/package-cache/build-*/native-self-test.json
-            ${{ runner.temp }}/LocalDictation-Windows/bundle-manifest.json
+            ${{ env.WINDOWS_BUNDLE }}/bundle-manifest.json
       - uses: actions/upload-artifact@v4
         with:
           name: LocalDictation-Windows-x64-preview

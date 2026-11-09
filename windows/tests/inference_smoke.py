@@ -4,6 +4,7 @@ import base64
 import json
 from pathlib import Path
 import subprocess
+import sys
 import time
 import urllib.request
 import wave
@@ -94,4 +95,6 @@ def main():
                 try: child.wait(timeout=10)
                 except subprocess.TimeoutExpired: child.kill();child.wait()
 
-if __name__=='__main__': main()
+if __name__=='__main__':
+    sys.stdout.reconfigure(encoding='utf-8')
+    main()

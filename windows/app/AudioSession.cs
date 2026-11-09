@@ -109,7 +109,10 @@ public sealed class AudioSession : IDisposable
     {
         if (Volatile.Read(ref disposed) != 0) return;
         StopCapture(); cancellation.Cancel(); chunks.Writer.TryComplete();
-        try { await backend.RequestAsync("POST", $"/stream/{Id}/cancel", new { }); } catch { }
+        // Local capture/finish has already been cancelled. The best-effort
+        // server notification must not inherit the long inference deadline.
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        try { await backend.RequestAsync("POST", $"/stream/{Id}/cancel", new { }, cancellation: deadline.Token); } catch { }
     }
     public void Dispose()
     {
