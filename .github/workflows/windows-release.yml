@@ -71,4 +71,11 @@ jobs:
               for path in pathlib.Path('evidence').rglob('*'):
                   if path.is_file(): output.write(path,path.relative_to('evidence'))
           PY
-          gh release create v0.6.0-windows-preview.1 --draft --prerelease --target "$source_commit" --title 'LocalDictation 0.6.0 Windows Preview 1' --notes-file RELEASE.md package/* Windows-validation-evidence.zip
+          # The maintainer creates the tag and draft with their existing GitHub
+          # identity; the workflow token only uploads verified assets to it.
+          gh api "repos/$GH_REPO/git/ref/tags/v0.6.0-windows-preview.1" > tag.json
+          jq -e --arg sha "$source_commit" '.object.type == "commit" and .object.sha == $sha' tag.json
+          gh api "repos/$GH_REPO/releases/tags/v0.6.0-windows-preview.1" > draft.json
+          jq -e '.draft == true and .prerelease == true' draft.json
+          gh release upload v0.6.0-windows-preview.1 package/* Windows-validation-evidence.zip
+          gh release edit v0.6.0-windows-preview.1 --notes-file RELEASE.md
