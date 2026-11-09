@@ -6,7 +6,7 @@ import tempfile
 import unittest
 import zipfile
 
-from bundle import PTH, collect_python_licenses, extract
+from bundle import PTH, collect_python_licenses, extract, upstream_build_metadata
 from validate_bundle import validate
 
 
@@ -108,6 +108,31 @@ class BundleTests(unittest.TestCase):
         inputs.write_text(json.dumps({"licenses": [item]}))
         with self.assertRaisesRegex(ValueError, "Missing full license"):
             collect_python_licenses(self.root)
+
+
+    def test_public_wheel_build_metadata_requires_exact_bytes_and_provenance(self):
+        path = self.root / "runtime/python/Lib/site-packages/fixture/config.py"
+        path.parent.mkdir(parents=True)
+        path.write_text("# Upstream compiler metadata: " + str(Path.home()))
+        wheels = self.root.parent / "wheels"
+        wheels.mkdir()
+        wheel = wheels / "fixture-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("fixture/config.py", path.read_bytes())
+        origins = upstream_build_metadata(self.root, wheels)
+        inputs = {"wheels": [{"filename": wheel.name, "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()}],
+                  "upstream_build_metadata": origins}
+        (self.root / "build-inputs.json").write_text(json.dumps(inputs))
+        self.snapshot()
+        validate(self.root)
+        inputs["wheels"] = []
+        (self.root / "build-inputs.json").write_text(json.dumps(inputs))
+        self.snapshot()
+        with self.assertRaisesRegex(ValueError, "Builder home"):
+            validate(self.root)
+        path.write_text(path.read_text() + " added by local build")
+        with self.assertRaisesRegex(ValueError, "Non-upstream builder path"):
+            upstream_build_metadata(self.root, wheels)
 
 
 if __name__ == "__main__":

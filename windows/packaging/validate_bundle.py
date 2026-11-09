@@ -44,6 +44,10 @@ def validate(root):
         target = root / relative
         if target.is_symlink() or not target.is_file() or target.stat().st_size != item["bytes"] or digest(target) != item["sha256"]:
             raise ValueError("Bundle content changed: " + relative)
+    inputs_path = root / "build-inputs.json"
+    inputs = json.loads(inputs_path.read_text(encoding="utf-8")) if inputs_path.exists() else {}
+    wheels = {item["filename"]: item["sha256"] for item in inputs.get("wheels", [])}
+    public_metadata = {item["path"]: item for item in inputs.get("upstream_build_metadata", [])}
     actual = set()
     for target in root.rglob("*"):
         relative = target.relative_to(root).as_posix()
@@ -64,7 +68,14 @@ def validate(root):
             home = str(Path.home()).encode()
             variants = (home, home.replace(b"\\", b"/"), home.replace(b"\\", b"\\\\"))
             if any(value and value in data for value in variants):
-                raise ValueError("Builder home path in bundle: " + relative)
+                origin = public_metadata.get(relative, {})
+                # Only an unchanged file from a recorded wheel can carry a
+                # public upstream builder path. Other local paths still fail.
+                if (not relative.startswith("runtime/python/Lib/site-packages/")
+                        or not origin or origin.get("sha256") != digest(target)
+                        or origin.get("wheel") not in wheels
+                        or wheels[origin["wheel"]] != origin.get("wheel_sha256")):
+                    raise ValueError("Builder home path in bundle: " + relative)
             if b"-----BEGIN PRIVATE KEY-----" in data or b"-----BEGIN OPENSSH PRIVATE KEY-----" in data:
                 raise ValueError("Private key content in bundle")
     if actual != expected:

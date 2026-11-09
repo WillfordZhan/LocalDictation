@@ -180,6 +180,41 @@ def collect_nuget_licenses(repo, root):
     return result
 
 
+
+def upstream_build_metadata(root, wheels):
+    """Identify unchanged wheel metadata that names an upstream build account.
+
+    Public wheels can be built on the same hosted-runner account as this build.
+    Record exact byte provenance rather than treating that name collision as a
+    private-path leak or rewriting upstream library configuration arbitrarily.
+    """
+    home = str(Path.home()).encode()
+    variants = (home, home.replace(b"\\", b"/"), home.replace(b"\\", b"\\\\"))
+    site = root / "runtime/python/Lib/site-packages"
+    matches = []
+    wheel_paths = list(wheels.glob("*.whl"))
+    for path in site.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in (".py", ".json", ".pth", ".cfg", ".txt", ".md", ".xml", ".config"):
+            continue
+        content = path.read_bytes()
+        if not any(value and value in content for value in variants):
+            continue
+        relative = path.relative_to(site).as_posix()
+        for wheel in wheel_paths:
+            with zipfile.ZipFile(wheel) as archive:
+                try:
+                    original = archive.read(relative)
+                except KeyError:
+                    continue
+            if original == content:
+                matches.append({"path": path.relative_to(root).as_posix(), "sha256": sha(path),
+                                "wheel": wheel.name, "wheel_sha256": sha(wheel)})
+                break
+        else:
+            raise ValueError("Non-upstream builder path in installed dependency: " + relative)
+    return matches
+
+
 def finish(args):
     remove_caches(args.root)
     site = args.root / "runtime/python/Lib/site-packages"
@@ -211,7 +246,8 @@ def finish(args):
     write_json(args.root / "build-inputs.json", {
         "version": args.version, "architecture": "win-x64", "source_commit": commit, "source_tree_dirty": dirty,
         "source_files": [{"path": p.relative_to(args.repo).as_posix(), "sha256": sha(p)} for p in sorted(source_files)],
-        "wheels": [{"filename": p.name, "sha256": sha(p)} for p in sorted((args.work / "wheels").glob("*.whl"))]})
+        "wheels": [{"filename": p.name, "sha256": sha(p)} for p in sorted((args.work / "wheels").glob("*.whl"))],
+        "upstream_build_metadata": upstream_build_metadata(args.root, args.work / "wheels")})
     files = [{"path": p.relative_to(args.root).as_posix(), "bytes": p.stat().st_size, "sha256": sha(p)}
              for p in sorted(args.root.rglob("*")) if p.is_file() and p.name != "bundle-manifest.json"]
     write_json(args.root / "bundle-manifest.json", {"schema": 1, "version": args.version, "files": files})
