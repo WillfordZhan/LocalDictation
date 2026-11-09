@@ -60,6 +60,12 @@ jobs:
 
           完整解压 ZIP 后启动 LocalDictation.exe。未购买 Windows 代码签名证书，可能显示未知发布者；缺少 VC++ 运行库时，应用提供微软原始签名安装程序的显式安装入口。
           '''
+          measured = json.loads(pathlib.Path('evidence/inference-result.json').read_text())
+          audio = measured['audio_result']
+          warm = measured['cleanup_result']
+          notes += (f"\n托管 CPU 实测（合成录音，仅代表该机器）：{audio['audio_seconds']:.1f} 秒音频，"
+                    f"ASR {audio['asr_seconds']:.1f} 秒，首次整理 {audio['cleanup_seconds']:.1f} 秒；"
+                    f"随后另一条短文本整理 {warm['cleanup_seconds']:.1f} 秒。首次响应仍较慢。\n")
           pathlib.Path('RELEASE.md').write_text(notes + '\n源代码：`' + source + '`\n', encoding='utf-8')
           with zipfile.ZipFile('Windows-validation-evidence.zip','w',zipfile.ZIP_DEFLATED) as output:
               for path in pathlib.Path('evidence').rglob('*'):
