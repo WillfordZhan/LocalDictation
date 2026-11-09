@@ -47,9 +47,22 @@ def main():
             wav = Path(__file__).parent/'fixtures/chinese.wav'
             with wave.open(str(wav)) as audio:
                 assert audio.getframerate()==16000 and audio.getnchannels()==1 and audio.getsampwidth()==2
+                pcm=audio.readframes(audio.getnframes())
             options={'language':'zh','cleanup':True,'vocabulary':['订单','工单','交期甘特图']}
-            headers={'Content-Type':'audio/wav','X-Dictation-Options':base64.b64encode(json.dumps(options,ensure_ascii=False).encode()).decode()}
-            started=time.monotonic();result=request('/dictate',wav.read_bytes(),headers);elapsed=time.monotonic()-started
+            headers={'Content-Type':'application/json','X-Dictation-Options':base64.b64encode(json.dumps(options,ensure_ascii=False).encode()).decode()}
+            # Exercise the exact capture/upload/finish protocol used by the app,
+            # including little-endian PCM and sample offsets, using fixture audio.
+            sid=str(__import__('uuid').uuid4())
+            started=time.monotonic()
+            request('/stream/start',json.dumps({'session_id':sid}).encode(),headers)
+            for offset in range(0,len(pcm),16000):
+                request(f'/stream/{sid}/audio',pcm[offset:offset+16000],
+                    {'Content-Type':'application/octet-stream','X-Audio-Offset':str(offset//2)})
+            result=request(f'/stream/{sid}/finish',json.dumps({'total_samples':len(pcm)//2}).encode(),
+                {'Content-Type':'application/json'})
+            elapsed=time.monotonic()-started
+            assert result['streaming_metrics']['processed_samples']==len(pcm)//2, result
+            checks.append('production_streaming_pcm_and_sample_offsets')
             assert result['raw_text'].strip() and result['text'].strip(), 'Empty real inference'
             assert result['cleanup_applied'],result.get('warning','cleanup not applied')
             # Semantic checks are acceptance fixtures, never product replacements.

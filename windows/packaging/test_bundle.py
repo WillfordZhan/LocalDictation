@@ -90,5 +90,25 @@ class BundleTests(unittest.TestCase):
             collect_python_licenses(self.root)
 
 
+    def test_upstream_license_supplement_is_version_and_hash_bound(self):
+        metadata = self.root / "runtime/python/Lib/site-packages/fixture-1.0.dist-info"
+        metadata.mkdir(parents=True)
+        (metadata / "METADATA").write_text("Metadata-Version: 2.1\nName: fixture\nVersion: 1.0\nLicense: MIT\n")
+        license = self.root / "licenses/fixture-LICENSE"
+        license.write_text("Pinned upstream license text.")
+        item = {"package": "fixture", "version": "1.0", "filename": license.name,
+                "sha256": hashlib.sha256(license.read_bytes()).hexdigest()}
+        inputs = self.root / "runtime-inputs.json"
+        inputs.write_text(json.dumps({"licenses": [item]}))
+        self.assertEqual(collect_python_licenses(self.root)[0]["licenses"], ["licenses/fixture-LICENSE"])
+        license.write_text("modified")
+        with self.assertRaisesRegex(ValueError, "supplement changed"):
+            collect_python_licenses(self.root)
+        item["version"] = "0.9"
+        inputs.write_text(json.dumps({"licenses": [item]}))
+        with self.assertRaisesRegex(ValueError, "Missing full license"):
+            collect_python_licenses(self.root)
+
+
 if __name__ == "__main__":
     unittest.main()

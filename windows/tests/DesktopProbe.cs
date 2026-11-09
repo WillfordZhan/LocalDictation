@@ -52,6 +52,14 @@ public static class Program
         var window = new Window { Title = "LocalDictation isolated paste fixture", Width = 680, Height = 370, Content = panel };
         void Save() => WriteJson(Path.Combine(directory, "fields.json"), new { first = first.Text, second = second.Text });
         first.TextChanged += (_, _) => Save(); second.TextChanged += (_, _) => Save();
+        // Model a slow editor whose Ctrl+V handler has started but has not read
+        // the clipboard yet. The queue must wait for insertion acknowledgement.
+        first.PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key == System.Windows.Input.Key.V
+                && (System.Windows.Input.Keyboard.Modifiers & System.Windows.Input.ModifierKeys.Control) != 0)
+                Thread.Sleep(300);
+        };
         window.SourceInitialized += (_, _) => HwndSource.FromHwnd(new WindowInteropHelper(window).Handle).AddHook(
             (IntPtr hwnd, int message, IntPtr wp, IntPtr lp, ref bool handled) =>
             {

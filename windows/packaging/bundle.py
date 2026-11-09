@@ -97,6 +97,11 @@ def license_filename(path):
 
 def collect_python_licenses(root):
     site = root / "runtime/python/Lib/site-packages"
+    # Some wheels omit their upstream license. Supplements are tied to the
+    # exact distribution version and verified against pinned upstream hashes;
+    # a version upgrade must supply its own notice instead of silently reusing it.
+    inputs_path = root / "runtime-inputs.json"
+    supplements = json.loads(inputs_path.read_text()).get("licenses", []) if inputs_path.exists() else []
     result = []
     for distribution in sorted(importlib.metadata.distributions(path=[str(site)]),
                                key=lambda item: item.metadata["Name"].lower()):
@@ -122,6 +127,14 @@ def collect_python_licenses(root):
             target = destination / "LICENSE-from-package-metadata.txt"
             target.write_text(metadata_license + "\n", encoding="utf-8")
             copied.append(target.relative_to(root).as_posix())
+        if not copied:
+            for item in supplements:
+                if item.get("package", "").lower().replace("_", "-") != name.lower().replace("_", "-") or item.get("version") != distribution.version:
+                    continue
+                source = root / "licenses" / item["filename"]
+                if not source.is_file() or sha(source) != item["sha256"]:
+                    raise ValueError("Pinned license supplement changed: " + name)
+                copied.append(source.relative_to(root).as_posix())
         if not copied:
             raise ValueError("Missing full license text in wheel: " + name + " " + distribution.version)
         result.append({"name": name, "version": distribution.version,
