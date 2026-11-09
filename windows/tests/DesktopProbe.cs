@@ -70,9 +70,9 @@ public static class Program
         uint ownClipboard = 0; int exit = 1; DictationHud? hud = null;
         void Require(bool condition, string label) { if (!condition) throw new InvalidOperationException(label); checks.Add(label); }
         async Task WaitFor(Func<bool> test)
-        { for (int i = 0; i < 80; i++) { if (test()) return; await Task.Delay(100); } throw new TimeoutException("desktop fixture condition"); }
+        { for (int i = 0; i < 80; i++) { try { if (test()) return; } catch (IOException) { } catch (JsonException) { } await Task.Delay(100); } throw new TimeoutException("desktop fixture condition"); }
         string Field(string name)
-        { using var json = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "fields.json"))); return json.RootElement.GetProperty(name).GetString()!; }
+        { using var json = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "fields.json"))); return json.RootElement.GetProperty(name).GetString()!.Replace("\r\n", "\n"); }
         try
         {
             clipboard = System.Windows.Clipboard.GetDataObject();
@@ -95,7 +95,8 @@ public static class Program
             hud.Close(); hud = null;
             var result = await NativeInput.PasteAsync(hwnd, "Windows 本地口述：第一段。\n"); ownClipboard = GetClipboardSequenceNumber();
             Require(result == DeliveryOutcome.PasteDispatched, "first_paste_dispatched");
-            await WaitFor(() => Field("first") == "Windows 本地口述：第一段。\n");
+            // Submit back-to-back as the production queue does: PasteAsync must
+            // settle the first delivery before the clipboard is overwritten.
             result = await NativeInput.PasteAsync(hwnd, "第二段 API 3.28。"); ownClipboard = GetClipboardSequenceNumber();
             Require(result == DeliveryOutcome.PasteDispatched, "second_paste_dispatched");
             await WaitFor(() => Field("first") == "Windows 本地口述：第一段。\n第二段 API 3.28。");

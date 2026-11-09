@@ -1,5 +1,7 @@
 name: Windows preview package
 on:
+  push:
+    branches: ['codex/windows-preview']
   workflow_dispatch:
 permissions:
   contents: read
