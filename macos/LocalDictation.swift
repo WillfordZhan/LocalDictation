@@ -497,7 +497,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
     private var hasStreamingWork: Bool { !streamingJobs.isEmpty }
     private var hasPendingWork: Bool { phase.busy || hasStreamingWork || reprocessGeneration != nil }
     private var canBeginRecording: Bool {
-        serviceCanRecord && !configuringModels && phase != .preparing && phase != .recording &&
+        serviceCanRecord && !configuringModels && !modelConfigurationActive && pendingModelSelection == nil && phase != .preparing && phase != .recording &&
             (supportsStreaming ? streamingJobs.count < 8 : !phase.busy)
     }
     private var promptCatalog: CleanupPromptCatalog?
@@ -526,6 +526,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
     private var windowController: DictationWindowController?
     private var setupController: DictationSetupWindowController?
     private var configuringModels = false
+    private var modelConfigurationActive = false
+    private var selectedASRModelID = "qwen"
+    private var selectedCleanupModelID = "cleanup"
+    private var modelConfigurationMessage: String?
+    // Saving a selection is not readiness. Keep the home controls pending
+    // until health identifies the requested models and confirms both loaded.
+    private var pendingModelSelection: (asr: String, cleanup: String)?
+    private var modelSelectionTimedOut = false
+    private var modelSelectionGeneration = UUID()
     private var hud: DictationHUD?
     private let serviceSession: URLSession
 
@@ -557,6 +566,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             return
         }
         configureCorrectionLearning()
+        readSavedModelSelection()
         NSApp.setActivationPolicy(.regular)
         createMenu()
         registerHotKey()
@@ -1420,6 +1430,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         state.status = statusText; state.serviceMessage = serviceText; state.serviceReady = serviceCanRecord
         state.asrReadiness = asrReadiness; state.cleanupReadiness = cleanupReadiness
         state.asrModel = asrModel; state.cleanupModel = cleanupModel
+        state.selectedASRModelID = pendingModelSelection?.asr ?? selectedASRModelID
+        state.selectedCleanupModelID = pendingModelSelection?.cleanup ?? selectedCleanupModelID
+        state.canSwitchModels = !terminating && !hasPendingWork && !configuringModels && !modelConfigurationActive && (pendingModelSelection == nil || modelSelectionTimedOut) && !backendLaunching
+        state.modelConfigurationMessage = modelConfigurationMessage
+        if modelConfigurationActive || (pendingModelSelection != nil && !modelSelectionTimedOut) {
+            state.asrReadiness = .loading; state.cleanupReadiness = .loading
+        } else if pendingModelSelection != nil && modelSelectionTimedOut {
+            state.asrReadiness = .unavailable; state.cleanupReadiness = .unavailable
+        }
         state.recording = phase == .recording; state.processing = phase == .processing
         state.cleanupEnabled = (activePreferences ?? store.preferences).cleanupEnabled
         state.cleanupBackend = cleanupBackend
@@ -1493,6 +1512,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
     }
 
     private func scheduleHealthRefresh(after delay: TimeInterval) {
+        guard pendingModelSelection == nil || !modelSelectionTimedOut else { return }
         healthRetry?.cancel()
         let generation = healthGeneration
         let retry = DispatchWorkItem { [weak self] in
@@ -1519,12 +1539,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         return path
     }
 
-    @objc private func showSetup() {
-        guard let resources = Bundle.main.resourceURL else { return }
+    private func ensureSetupController() -> DictationSetupWindowController? {
+        guard let resources = Bundle.main.resourceURL else { return nil }
         if setupController == nil {
             let controller = DictationSetupWindowController(runtime: runtimeDirectory, resources: resources)
             controller.canConfigure = { [weak self] in self?.hasPendingWork == false }
-            controller.onReady = { [weak self] in self?.checkHealth() }
+            controller.onReady = { [weak self] in
+                guard let self else { return }
+                self.readSavedModelSelection()
+                self.waitForSelectedModels(asr: self.selectedASRModelID, cleanup: self.selectedCleanupModelID)
+                self.checkHealth()
+            }
+            controller.onConfigurationActivity = { [weak self] active in
+                guard let self else { return }
+                self.modelConfigurationActive = active
+                if active { self.modelConfigurationMessage = nil }
+                self.updateUI()
+            }
             controller.prepareDownload = { [weak self] completion in self?.prepareModelDownload(completion) }
             controller.onDownloadFinished = { [weak self] in
                 guard let self else { return }
@@ -1536,7 +1567,101 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             controller.onInputMonitoring = { [weak self] in self?.requestInputMonitoring() }
             setupController = controller
         }
-        setupController?.present()
+        return setupController
+    }
+
+    @objc private func showSetup() { ensureSetupController()?.present() }
+
+    private func readSavedModelSelection() {
+        // Only regular local files are read; pipes and links must never block
+        // UI updates. Installation diagnostics report invalid configurations.
+        func selection(_ name: String, allowed: [String], fallback: String) -> String {
+            let url = runtimeDirectory.appendingPathComponent(name)
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  attributes[.type] as? FileAttributeType == .typeRegular,
+                  let value = try? String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+                  allowed.contains(value) else { return fallback }
+            return value
+        }
+        selectedASRModelID = selection("asr-backend", allowed: ["qwen", "whisper"], fallback: "qwen")
+        selectedCleanupModelID = selection("cleanup-model", allowed: ["cleanup", "cleanup-9b"], fallback: "cleanup")
+    }
+
+    private func selectHomeModels(asr: String? = nil, cleanup: String? = nil) {
+        guard displayState.canSwitchModels, let setup = ensureSetupController() else { return }
+        let requestedASR = asr ?? selectedASRModelID
+        let requestedCleanup = cleanup ?? selectedCleanupModelID
+        guard ["qwen", "whisper"].contains(requestedASR), ["cleanup", "cleanup-9b"].contains(requestedCleanup) else { return }
+        guard requestedASR != selectedASRModelID || requestedCleanup != selectedCleanupModelID else { updateUI(); return }
+        let previousPending = pendingModelSelection
+        let previousTimeout = modelSelectionTimedOut
+        pendingModelSelection = (requestedASR, requestedCleanup)
+        modelSelectionTimedOut = false
+        modelConfigurationMessage = nil
+        let accepted = setup.configureModels(asr: requestedASR, cleanup: requestedCleanup) { [weak self] result in
+            guard let self else { return }
+            if case .failure(let error) = result {
+                self.readSavedModelSelection()
+                self.restoreModelSelectionAfterFailure(previous: previousPending, timedOut: previousTimeout, message: error.localizedDescription)
+                self.checkHealth()
+            }
+            self.updateUI()
+        }
+        if !accepted {
+            restoreModelSelectionAfterFailure(previous: previousPending, timedOut: previousTimeout,
+                message: "模型配置暂不可用，请完成当前操作后重试。")
+        }
+        updateUI()
+    }
+
+    private func restoreModelSelectionAfterFailure(previous: (asr: String, cleanup: String)?, timedOut: Bool, message: String) {
+        // A rejected retry does not prove the previously requested model ever
+        // loaded. Preserve its identity guard until health can confirm it.
+        pendingModelSelection = previous; modelSelectionTimedOut = timedOut
+        modelSelectionGeneration = UUID(); modelConfigurationMessage = message
+        if previous != nil { serviceCanRecord = false }
+    }
+
+    private func waitForSelectedModels(asr: String, cleanup: String) {
+        pendingModelSelection = (asr, cleanup)
+        modelSelectionTimedOut = false
+        let generation = UUID(); modelSelectionGeneration = generation
+        // A stalled loader must not leave the picker spinning forever. The
+        // saved choice remains intact and a later health reply can recover it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 90) { [weak self] in
+            self?.expireModelSelection(generation: generation)
+        }
+        updateUI()
+    }
+
+    private func expireModelSelection(generation: UUID) {
+        guard modelSelectionGeneration == generation, pendingModelSelection != nil else { return }
+        // Stop the animation and allow another choice, but retain the identity
+        // requirement: an old ready process must never masquerade as this model.
+        modelSelectionTimedOut = true; serviceCanRecord = false
+        healthRetry?.cancel(); healthRetry = nil
+        asrReadiness = .unavailable; cleanupReadiness = .unavailable
+        modelConfigurationMessage = "模型加载超时，请检查配置或切换其他模型。"
+        updateUI()
+    }
+
+    private func receiveSelectedModels(_ health: ServiceHealth) {
+        guard let pending = pendingModelSelection, !modelConfigurationActive, !configuringModels else { return }
+        let expectedASR = pending.asr == "whisper" ? "whisper-large-v3-turbo" : "Qwen3-ASR-1.7B-8bit"
+        let expectedCleanup = pending.cleanup == "cleanup-9b" ? "Qwen3.5-9B-4bit" : "Qwen3.5-4B-4bit"
+        guard health.models?["asr"] == expectedASR && health.models?["cleanup"] == expectedCleanup else {
+            serviceCanRecord = false
+            if modelSelectionTimedOut { asrReadiness = .unavailable; cleanupReadiness = .unavailable }
+            else { scheduleHealthRefresh(after: 1) }
+            return
+        }
+        if health.asr_ready && health.cleanup_ready {
+            pendingModelSelection = nil; modelSelectionTimedOut = false; modelSelectionGeneration = UUID()
+            modelConfigurationMessage = nil
+        } else if health.status != "loading" {
+            pendingModelSelection = nil; modelSelectionTimedOut = false; modelSelectionGeneration = UUID()
+            modelConfigurationMessage = "所选模型未能加载，请检查配置或切换其他模型。"
+        }
     }
 
     private func prepareModelDownload(_ completion: @escaping (Bool) -> Void) {
@@ -1745,6 +1870,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         // login environment must not silently override it on the next launch.
         // Direct CLI launches may still use start.sh's explicit override.
         environment.removeValue(forKey: "LOCAL_DICTATION_CLEANUP_MODEL")
+        environment.removeValue(forKey: "LOCAL_DICTATION_ASR_BACKEND")
         environment["LOCAL_DICTATION_WORK_DIR"] = runtime.path
         if let python = bundledPython {
             environment["LOCAL_DICTATION_PYTHON"] = python.path
@@ -1836,6 +1962,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
                 }
             }
             if health.status == "loading" || health.busy { scheduleHealthRefresh(after: 4) }
+            receiveSelectedModels(health)
         } else if response != nil {
             asrReadiness = .unavailable; cleanupReadiness = .unavailable
             serviceResponded = true
@@ -2214,9 +2341,51 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         assertStates(.unavailable, .unavailable)
         reply(status: "ready", asr: true, cleanup: true)
         assertStates(.ready, .ready)
+        // A save/check result and a stale ready service must not complete the
+        // home switch. The selected model names and both load flags must agree.
+        controller.pendingModelSelection = ("qwen", "cleanup-9b")
+        controller.selectedCleanupModelID = "cleanup-9b"
+        reply(status: "ready", asr: true, cleanup: true)
+        precondition(controller.displayState.asrReadiness == .loading && controller.displayState.cleanupReadiness == .loading)
+        precondition(!controller.displayState.canSwitchModels && !controller.canBeginRecording)
+        controller.invalidateHealthCallbacks()
+        controller.expireModelSelection(generation: controller.modelSelectionGeneration)
+        precondition(controller.pendingModelSelection != nil && controller.displayState.canSwitchModels && !controller.canBeginRecording)
+        assertStates(.unavailable, .unavailable)
+        reply(status: "ready", asr: true, cleanup: true)
+        precondition(!controller.canBeginRecording && controller.modelConfigurationMessage != nil)
+        assertStates(.unavailable, .unavailable)
+        let unresolved = controller.pendingModelSelection
+        controller.pendingModelSelection = ("whisper", "cleanup")
+        controller.modelSelectionTimedOut = false
+        controller.restoreModelSelectionAfterFailure(previous: unresolved, timedOut: true, message: "fixture rejected retry")
+        reply(status: "ready", asr: true, cleanup: true)
+        precondition(controller.pendingModelSelection?.cleanup == "cleanup-9b" && !controller.canBeginRecording)
+        assertStates(.unavailable, .unavailable)
+        reply(status: "loading", asr: false, cleanup: false)
+        assertStates(.unavailable, .unavailable)
+        controller.invalidateHealthCallbacks()
+        let selected = Data("""
+        {"service":"local-dictation","status":"ready","ready":true,"asr_ready":true,"cleanup_ready":true,"busy":false,"message":"fixture","supports_options":true,"models":{"asr":"Qwen3-ASR-1.7B-8bit","cleanup":"Qwen3.5-9B-4bit"}}
+        """.utf8)
+        controller.receiveHealthReply(generation: controller.healthGeneration, data: selected, response: response, error: nil)
+        precondition(controller.pendingModelSelection == nil && controller.displayState.canSwitchModels && controller.canBeginRecording)
+        precondition(controller.modelConfigurationMessage == nil && !controller.modelSelectionTimedOut)
+        assertStates(.ready, .ready)
+        controller.modelConfigurationActive = true
+        precondition(!controller.displayState.canSwitchModels && !controller.canBeginRecording)
+        assertStates(.loading, .loading)
+        controller.modelConfigurationActive = false
+        controller.pendingModelSelection = ("qwen", "cleanup-9b")
+        let failedModel = Data("""
+        {"service":"local-dictation","status":"degraded","ready":true,"asr_ready":true,"cleanup_ready":false,"busy":false,"message":"fixture","supports_options":true,"models":{"asr":"Qwen3-ASR-1.7B-8bit","cleanup":"Qwen3.5-9B-4bit"}}
+        """.utf8)
+        controller.receiveHealthReply(generation: controller.healthGeneration, data: failedModel, response: response, error: nil)
+        precondition(controller.pendingModelSelection == nil && controller.modelConfigurationMessage != nil)
+        assertStates(.ready, .unavailable)
         controller.terminating = true; controller.invalidateHealthCallbacks()
         precondition(controller.ownedBackend == nil && !controller.backendLaunching && controller.healthRequest == nil)
-        print("PASS model health lifecycle: ready→loading→load failure; ASR-only degradation; timeout/disconnect clear both ready states; stale replies rejected; recovery restores model identities. No real service contacted.")
+        print("PASS model health lifecycle: pending home switches require matching ready models; configuration blocks recording; load failures stop the spinner; stale replies rejected; recovery restores model identities. No real service contacted.")
     }
 
     static func verifyConfigurationGuards() throws {
@@ -2614,6 +2783,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         controller.onCopyText = { [weak self] text in self?.copy(text) }
         controller.onCheckService = { [weak self] in self?.checkHealth() }
         controller.onSetup = { [weak self] in self?.showSetup() }
+        controller.onSelectASRModel = { [weak self] id in self?.selectHomeModels(asr: id) }
+        controller.onSelectCleanupModel = { [weak self] id in self?.selectHomeModels(cleanup: id) }
         controller.onMicrophone = { [weak self] in self?.requestMicrophone() }
         controller.onAccessibility = { [weak self] in self?.requestAccessibility() }
         controller.onShortcutCapture = { [weak self] capturing in

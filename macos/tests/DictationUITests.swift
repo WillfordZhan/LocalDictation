@@ -87,20 +87,21 @@ enum DictationUIChecks {
         }
         var state = DictationUIState()
         state.functionKeySelected = false; state.accessibilityAllowed = true
-        state.asrModel = "Qwen3-ASR-1.7B-8bit"; state.cleanupModel = "Qwen3-4B-Instruct-2507-4bit"
+        state.asrModel = "Qwen3-ASR-1.7B-8bit"; state.cleanupModel = "Qwen3.5-9B-4bit"
+        state.selectedCleanupModelID = "cleanup-9b"
         state.asrReadiness = .loading; state.cleanupReadiness = .loading
         controller.updateState(state)
-        try require(field("sidebar-asr-status").stringValue == "ASR · 加载中" && field("sidebar-cleanup-status").stringValue == "润色 · 加载中", "Loading must describe both models independently")
+        try require(field("home-asr-status").stringValue == "加载中" && field("home-cleanup-status").stringValue == "加载中", "Loading must describe both models independently")
+        try require(!descendants(root).contains { ["sidebar-asr-status", "sidebar-cleanup-status"].contains($0.identifier?.rawValue ?? "") }, "Sidebar duplicated model readiness")
         state.serviceReady = true; state.asrReadiness = .ready; state.cleanupReadiness = .unavailable
         controller.updateState(state)
-        try require(field("sidebar-asr-status").stringValue == "ASR · 已就绪" && field("sidebar-cleanup-status").stringValue == "润色 · 不可用", "Recording readiness masked cleanup failure")
         try require(field("home-asr-status").stringValue == "已就绪" && field("home-cleanup-status").stringValue == "不可用", "Home lost independent readiness")
         state.cleanupReadiness = .ready; state.serviceReady = false
         state.cleanupBackend = .local; state.serviceMessage = "后台正在处理，可以继续口述。"
         controller.updateState(state)
-        try require(field("sidebar-asr-status").stringValue == "ASR · 已就绪" && field("sidebar-cleanup-status").stringValue == "润色 · 已就绪", "Temporary recording admission must not claim either model is unloaded")
+        try require(field("home-asr-status").stringValue == "已就绪" && field("home-cleanup-status").stringValue == "已就绪", "Temporary recording admission must not claim either model is unloaded")
         store.updatePreferences { $0.cleanupEnabled = false }
-        try require(field("sidebar-cleanup-status").stringValue == "润色 · 已关闭" && field("home-cleanup-status").stringValue == "已关闭", "Disabled cleanup was shown as enabled because its model is loaded")
+        try require(field("home-cleanup-status").stringValue == "已关闭", "Disabled cleanup was shown as enabled because its model is loaded")
         store.updatePreferences { $0.cleanupEnabled = true }
         let unchanged = store.add(rawText: "这是一条未改动的原文。", text: "这是一条未改动的原文。",
                                   asrSeconds: 0.3, cleanupSeconds: 1.2, totalSeconds: 1.5,
@@ -129,9 +130,89 @@ enum DictationUIChecks {
         try require(field("home-cleanup-result").stringValue == "最近润色：已调用 · 文本已修改 · 0.80 秒", "Latest successful return did not replace prior failure")
         state.asrReadiness = .unavailable; state.cleanupReadiness = .unavailable
         controller.updateState(state)
-        try require(field("sidebar-asr-status").stringValue == "ASR · 不可用" && field("sidebar-cleanup-status").stringValue == "润色 · 不可用", "Service outage retained false ready state")
+        try require(field("home-asr-status").stringValue == "不可用" && field("home-cleanup-status").stringValue == "不可用", "Service outage retained false ready state")
         try require(!controller.window!.isVisible && store.storageDirectory == nil, "Readiness checks escaped memory-only invisible fixture")
         print("PASS model status: independent ASR/cleanup loading, degraded, loaded/busy, disabled and unavailable states; current model names; recent edited/unchanged/fallback outcomes; history unchanged disclosure; 1000/1400 point layout.")
+    }
+
+    static func homeModelSelectionChecks() throws {
+        let store = DictationStore(memoryOnly: true)
+        let controller = DictationWindowController(store: store, sessionStartedAt: Date())
+        let root = controller.window!.contentView!
+        defer { controller.window?.close(); DictationMotion.reduceMotionOverride = nil }
+        store.onChange = { [weak controller] in controller?.reloadStore() }
+        func view<T: NSView>(_ id: String, as type: T.Type = T.self) -> T {
+            descendants(root).first { $0.identifier?.rawValue == id } as! T
+        }
+        let asr: NSPopUpButton = view("home-asr-model")
+        let cleanup: NSPopUpButton = view("home-cleanup-model")
+        let asrProgress: NSProgressIndicator = view("home-asr-progress")
+        let cleanupProgress: NSProgressIndicator = view("home-cleanup-progress")
+        let message: NSTextField = view("home-model-configuration-message")
+        var asrSelections: [String] = [], cleanupSelections: [String] = []
+        controller.onSelectASRModel = { asrSelections.append($0) }
+        controller.onSelectCleanupModel = { cleanupSelections.append($0) }
+        var state = DictationUIState()
+        state.selectedASRModelID = "qwen"; state.selectedCleanupModelID = "cleanup-9b"
+        state.canSwitchModels = true; state.asrReadiness = .ready; state.cleanupReadiness = .ready
+        state.asrModel = "mlx-community/Qwen3-ASR-1.7B-8bit"; state.cleanupModel = "mlx-community/Qwen3.5-9B-4bit"
+        state.functionKeySelected = false; state.accessibilityAllowed = true; state.cleanupBackend = .local
+        DictationMotion.reduceMotionOverride = false
+        controller.updateState(state)
+        try require(asr.itemArray.map { $0.representedObject as? String } == ["qwen", "whisper"]
+            && cleanup.itemArray.map { $0.representedObject as? String } == ["cleanup", "cleanup-9b"], "Home model choices do not match installation IDs")
+        try require(cleanup.titleOfSelectedItem == "Qwen3.5 9B" && cleanup.toolTip == state.cleanupModel && asr.toolTip == state.asrModel,
+                    "Home lost current 9B choice or actual loaded model identity")
+        try require(message.isHidden && !asrProgress.isIndeterminate && asrProgress.isHidden && cleanupProgress.isHidden, "Ready state retained idle animation or empty feedback")
+        asr.selectItem(at: 1); try sendAction(asr)
+        cleanup.selectItem(at: 0); try sendAction(cleanup)
+        try require(asrSelections == ["whisper"] && cleanupSelections == ["cleanup"], "Model selection callback used labels instead of IDs")
+        state.selectedASRModelID = "whisper"; state.selectedCleanupModelID = "cleanup"
+        state.asrReadiness = .checking; state.cleanupReadiness = .loading; state.canSwitchModels = false
+        controller.updateState(state)
+        try require(!asr.isEnabled && !cleanup.isEnabled && asrProgress.isIndeterminate && cleanupProgress.isIndeterminate
+            && !asrProgress.isHidden && !cleanupProgress.isHidden, "Switching did not lock pickers and show independent native spinners")
+        asr.selectItem(at: 0); try sendAction(asr)
+        cleanup.selectItem(at: 1); try sendAction(cleanup)
+        try require(asrSelections.count == 1 && cleanupSelections.count == 1 && asr.titleOfSelectedItem == "Whisper" && cleanup.titleOfSelectedItem == "Qwen3.5 4B",
+                    "Disabled or stale action bypassed model switch lock")
+        DictationMotion.reduceMotionOverride = true
+        try require(asrProgress.isHidden && cleanupProgress.isHidden && !asrProgress.isIndeterminate && !cleanupProgress.isIndeterminate,
+                    "Reduce Motion kept an active model spinner")
+        DictationMotion.reduceMotionOverride = false
+        try require(asrProgress.isIndeterminate && cleanupProgress.isIndeterminate, "Motion policy change did not resume loading feedback")
+        state.asrReadiness = .ready; state.cleanupReadiness = .ready; state.canSwitchModels = true
+        state.modelConfigurationMessage = "切换未完成，已保留当前模型。"
+        controller.updateState(state)
+        try require(message.stringValue == state.modelConfigurationMessage && !message.isHidden && asrProgress.isHidden && cleanupProgress.isHidden
+            && !asrProgress.isIndeterminate && !cleanupProgress.isIndeterminate, "Completion or failure feedback retained a spinner")
+        controller.window?.makeFirstResponder(cleanup)
+        let focus = controller.window?.firstResponder
+        for _ in 0..<12 { controller.updateState(state) }
+        let retained: NSPopUpButton = view("home-cleanup-model")
+        try require(retained === cleanup && controller.window?.firstResponder === focus, "Health refresh rebuilt model picker or stole focus")
+        try require(descendants(root).compactMap { $0 as? NSTextField }.filter { $0.stringValue == "已就绪" }.count == 2,
+                    "Ready feedback was duplicated outside the two home model states")
+        if let index = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.arguments.indices.contains(index + 1) {
+            let directory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            for size in [NSSize(width: 1000, height: 700), NSSize(width: 1400, height: 900)] {
+                controller.window?.setContentSize(size); root.layoutSubtreeIfNeeded()
+                let left = asr.convert(asr.bounds, to: root); let right = cleanup.convert(cleanup.bounds, to: root)
+                try require(left.maxX < right.minX && abs(left.midY - right.midY) < 1 && left.width > 120 && right.width > 120,
+                            "Model pickers overlap or collapse at supported window width")
+                try controller.renderPNG(to: directory.appendingPathComponent("model-picker-\(Int(size.width)).png"))
+            }
+            state.asrReadiness = .loading; state.cleanupReadiness = .loading; state.canSwitchModels = false
+            state.modelConfigurationMessage = nil; controller.updateState(state)
+            try controller.renderPNG(to: directory.appendingPathComponent("model-picker-loading.png"))
+        }
+        state.cleanupReadiness = .loading; controller.updateState(state)
+        store.updatePreferences { $0.cleanupEnabled = false }
+        let disabledProgress: NSProgressIndicator = view("home-cleanup-progress")
+        let disabledStatus: NSTextField = view("home-cleanup-status")
+        try require(disabledProgress.isHidden && !disabledProgress.isIndeterminate && disabledStatus.stringValue == "已关闭", "Disabled cleanup displayed loading animation")
+        print("PASS home model selectors: exact IDs, saved 9B choice, independent callbacks, busy guards, stable controls/focus, native loading transitions, reduced motion, disabled cleanup, single ready states, failure feedback; no service or user configuration accessed.")
     }
 
     static func learningChecks() throws {
@@ -592,6 +673,7 @@ enum DictationUIChecks {
         try require(store.storageError == nil, "Unexpected memory-only storage error")
         try learningChecks()
         try modelStatusChecks()
+        try homeModelSelectionChecks()
         print("PASS: invisible AppKit controls; independent Fn readiness and permission callbacks; navigation scroll reset; sidebar navigation; dictionary edit/add/delete; cleanup and auto-insert switches; language popup; history selection/raw/copy/search/delete; empty home synchronization.")
         print("LIMIT: destructive clear/retention modal and shortcut capture were not invoked. Copy was intercepted before clipboard access. No AppDelegate, model, microphone, global key listener, or production preferences were used.")
     }

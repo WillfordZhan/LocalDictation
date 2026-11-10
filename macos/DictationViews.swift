@@ -48,6 +48,10 @@ struct DictationUIState {
     var cleanupReadiness: DictationModelReadiness = .checking
     var asrModel: String?
     var cleanupModel: String?
+    var selectedASRModelID = "qwen"
+    var selectedCleanupModelID = "cleanup"
+    var canSwitchModels = false
+    var modelConfigurationMessage: String?
     var recording = false
     var processing = false
     // Recording and previously submitted utterances have independent lifetimes.
@@ -273,6 +277,8 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     var onStart: (() -> Void)?; var onCancel: (() -> Void)?; var onCopyText: ((String) -> Void)?
     var onCheckService: (() -> Void)?; var onMicrophone: (() -> Void)?; var onAccessibility: (() -> Void)?
     var onSetup: (() -> Void)?
+    var onSelectASRModel: ((String) -> Void)?
+    var onSelectCleanupModel: ((String) -> Void)?
     var onShortcutCapture: ((Bool) -> Void)?
     var onApplyShortcut: ((DictationShortcut) -> String?)?
     var onInputMonitoring: (() -> Void)?
@@ -303,9 +309,6 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     private let pageScroll = NSScrollView()
     private var pageMinimumHeight: NSLayoutConstraint?
     private var pagePreferredHeight: NSLayoutConstraint?
-    private let sidebarStatus = label("正在准备", size: 12, color: Palette.muted)
-    private let sidebarCleanupStatus = label("润色 · 待确认", size: 12, color: Palette.muted)
-    private let sidebarDetail = label("", size: 11, color: Palette.muted)
     private var navigation: [DictationPage: SidebarNavigationButton] = [:]
     private var activityPageOffset = 0
     private var calendarObservers: [NSObjectProtocol] = []
@@ -345,7 +348,9 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     private var homeAllowInsertion: ActionButton?
     private var homeProcessingDetail: NSTextField?
     private var homeASRStatus: NSTextField?; private var homeCleanupStatus: NSTextField?
-    private var homeASRModel: NSTextField?; private var homeCleanupModel: NSTextField?
+    private var homeASRPicker: NSPopUpButton?; private var homeCleanupPicker: NSPopUpButton?
+    private var homeASRProgress: NSProgressIndicator?; private var homeCleanupProgress: NSProgressIndicator?
+    private var homeModelConfigurationMessage: NSTextField?
     private var homeCleanupResult: NSTextField?
     private var cleanupSettingDetail: NSTextField?
 
@@ -366,6 +371,9 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
                 if self.page == .home { self.renderPage() }
             })
         }
+        calendarObservers.append(NotificationCenter.default.addObserver(forName: DictationMotion.policyDidChange, object: nil, queue: .main) { [weak self] _ in
+            self?.updateModelProgress()
+        })
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
@@ -403,11 +411,6 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
             footer.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -14),
             footer.topAnchor.constraint(greaterThanOrEqualTo: menu.bottomAnchor, constant: 24)
         ])
-        let local = vertical(6)
-        sidebarStatus.identifier = NSUserInterfaceItemIdentifier("sidebar-asr-status")
-        sidebarCleanupStatus.identifier = NSUserInterfaceItemIdentifier("sidebar-cleanup-status")
-        fill(local, sidebarStatus); fill(local, sidebarCleanupStatus); fill(local, sidebarDetail)
-        let localContainer = NSView(); pin(local, in: localContainer, inset: 14); fill(footer, localContainer)
         let separator = NSBox(); separator.boxType = .separator; fill(footer, separator)
         let settings = SidebarNavigationButton(title: DictationPage.settings.title, symbol: DictationPage.settings.icon) { [weak self] in self?.showPage(.settings) }
         navigation[.settings] = settings; fill(footer, settings)
@@ -431,20 +434,15 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         let cleanupEnabled = store.preferences.cleanupEnabled
         let cleanupStatus = cleanupEnabled ? state.cleanupReadiness.title : "已关闭"
         let cleanupColor = cleanupEnabled ? state.cleanupReadiness.color : Palette.muted
-        sidebarStatus.stringValue = "ASR · " + state.asrReadiness.title
-        sidebarStatus.textColor = state.asrReadiness.color
-        sidebarCleanupStatus.stringValue = "润色 · " + cleanupStatus
-        sidebarCleanupStatus.textColor = cleanupColor
-        sidebarDetail.stringValue = state.preview ? "界面预览" : state.serviceMessage
-        sidebarStatus.toolTip = state.asrModel
-        sidebarCleanupStatus.toolTip = state.cleanupModel
         homeASRStatus?.stringValue = state.asrReadiness.title
         homeASRStatus?.textColor = state.asrReadiness.color
         homeCleanupStatus?.stringValue = cleanupStatus
         homeCleanupStatus?.textColor = cleanupColor
-        homeASRModel?.stringValue = state.asrModel ?? "模型待确认"
-        homeCleanupModel?.stringValue = state.cleanupModel ?? "模型待确认"
-        homeASRModel?.toolTip = state.asrModel; homeCleanupModel?.toolTip = state.cleanupModel
+        updateModelPicker(homeASRPicker, selectedID: state.selectedASRModelID, model: state.asrModel)
+        updateModelPicker(homeCleanupPicker, selectedID: state.selectedCleanupModelID, model: state.cleanupModel)
+        updateModelProgress()
+        homeModelConfigurationMessage?.stringValue = state.modelConfigurationMessage ?? ""
+        homeModelConfigurationMessage?.isHidden = state.modelConfigurationMessage?.isEmpty != false
         let latest = store.entries.first
         homeCleanupResult?.stringValue = latest.map {
             "最近润色：" + $0.cleanupResultDescription + ($0.cleanupApplied ? String(format: " · %.2f 秒", $0.cleanupSeconds) : "")
@@ -482,6 +480,43 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         functionKeyStatus?.stringValue = state.functionKeySelected ? state.functionKeyMessage + (state.fallbackShortcut.map { "\n备用组合：" + $0 } ?? "") : "当前使用组合快捷键；可恢复默认 Fn。"
         if !state.shortcutWarning.isEmpty && shortcutRecorder?.isRecording != true { shortcutFeedback?.stringValue = state.shortcutWarning }
         if !state.canEditShortcut { shortcutRecorder?.cancel() }
+    }
+    private func updateModelPicker(_ picker: NSPopUpButton?, selectedID: String, model: String?) {
+        // Health refreshes keep the existing native control and selected item;
+        // they must not rebuild an open menu or move the keyboard focus.
+        if picker?.selectedItem?.representedObject as? String != selectedID,
+           let item = picker?.itemArray.first(where: { $0.representedObject as? String == selectedID }) { picker?.select(item) }
+        picker?.isEnabled = state.canSwitchModels
+        picker?.toolTip = model
+    }
+    private func updateModelProgress() {
+        for (indicator, readiness, enabled) in [(homeASRProgress, state.asrReadiness, true),
+                                                (homeCleanupProgress, state.cleanupReadiness, store.preferences.cleanupEnabled)] {
+            guard let indicator else { continue }
+            let animating = enabled && (readiness == .checking || readiness == .loading) && !DictationMotion.reduceMotion
+            // Meter and health updates can arrive frequently. Only transitions
+            // start/stop the native spinner; a ready model has no idle animation.
+            if indicator.isIndeterminate != animating {
+                if !animating { indicator.stopAnimation(nil) }
+                indicator.isIndeterminate = animating
+                if animating { indicator.startAnimation(nil) }
+            }
+            indicator.isHidden = !animating
+        }
+    }
+    @objc private func selectASRModel(_ sender: NSPopUpButton) {
+        guard state.canSwitchModels, let id = sender.selectedItem?.representedObject as? String,
+              ["qwen", "whisper"].contains(id), id != state.selectedASRModelID else {
+            updateModelPicker(sender, selectedID: state.selectedASRModelID, model: state.asrModel); return
+        }
+        onSelectASRModel?(id)
+    }
+    @objc private func selectCleanupModel(_ sender: NSPopUpButton) {
+        guard state.canSwitchModels, let id = sender.selectedItem?.representedObject as? String,
+              ["cleanup", "cleanup-9b"].contains(id), id != state.selectedCleanupModelID else {
+            updateModelPicker(sender, selectedID: state.selectedCleanupModelID, model: state.cleanupModel); return
+        }
+        onSelectCleanupModel?(id)
     }
     func reloadStore() {
         if page == .dictionary, vocabularyList != nil {
@@ -585,7 +620,9 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         homeShortcutNotice = nil; homeShortcutExplanation = nil; homeEnableFunctionKey = nil
         homeInsertionNotice = nil; homeAllowInsertion = nil
         homeProcessingDetail = nil; cleanupSettingDetail = nil
-        homeASRStatus = nil; homeCleanupStatus = nil; homeASRModel = nil; homeCleanupModel = nil; homeCleanupResult = nil
+        homeASRProgress?.stopAnimation(nil); homeCleanupProgress?.stopAnimation(nil)
+        homeASRStatus = nil; homeCleanupStatus = nil; homeASRPicker = nil; homeCleanupPicker = nil; homeCleanupResult = nil
+        homeASRProgress = nil; homeCleanupProgress = nil; homeModelConfigurationMessage = nil
         clear(pageStack); liveStatus = nil; liveStart = nil; liveCancel = nil; microphoneStatus = nil; accessibilityStatus = nil
         historyList = nil; historyDetail = nil; historyListContainer = nil; historyListScroll = nil; historyPager = nil; historyLatestButton = nil
         vocabularyFeedback = nil; vocabularyAdd = nil; correctionLearningLabel = nil
@@ -652,25 +689,40 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     private func renderModelStatus() {
         let asrStatus = label("", size: 12, weight: .medium)
         let cleanupStatus = label("", size: 12, weight: .medium)
-        let asrModel = label("", size: 11, color: Palette.muted)
-        let cleanupModel = label("", size: 11, color: Palette.muted)
         homeASRStatus = asrStatus; homeCleanupStatus = cleanupStatus
-        homeASRModel = asrModel; homeCleanupModel = cleanupModel
+        let asrPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+        let cleanupPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+        homeASRPicker = asrPicker; homeCleanupPicker = cleanupPicker
+        let asrProgress = NSProgressIndicator(); let cleanupProgress = NSProgressIndicator()
+        homeASRProgress = asrProgress; homeCleanupProgress = cleanupProgress
         let models = horizontal([], spacing: 24)
         models.distribution = .fillEqually
-        for (title, status, model, identifier) in [
-            ("语音识别（ASR）", asrStatus, asrModel, "home-asr-status"),
-            ("文字润色", cleanupStatus, cleanupModel, "home-cleanup-status")
+        for (title, status, picker, progress, identifier, options, action) in [
+            ("语音识别", asrStatus, asrPicker, asrProgress, "home-asr", [("qwen", "Qwen3 ASR"), ("whisper", "Whisper")], #selector(selectASRModel(_:))),
+            ("文字润色", cleanupStatus, cleanupPicker, cleanupProgress, "home-cleanup", [("cleanup", "Qwen3.5 4B"), ("cleanup-9b", "Qwen3.5 9B")], #selector(selectCleanupModel(_:)))
         ] {
-            status.identifier = NSUserInterfaceItemIdentifier(identifier)
+            status.identifier = NSUserInterfaceItemIdentifier(identifier + "-status")
             status.setContentHuggingPriority(.required, for: .horizontal)
             status.setContentCompressionResistancePriority(.required, for: .horizontal)
-            let column = vertical(5)
-            fill(column, horizontal([label(title, size: 13, weight: .medium), NSView(), status], spacing: 6))
-            model.maximumNumberOfLines = 1; model.lineBreakMode = .byTruncatingMiddle
-            fill(column, model); models.addArrangedSubview(column)
+            progress.style = .spinning; progress.controlSize = .small
+            progress.isIndeterminate = false; progress.isDisplayedWhenStopped = false; progress.isHidden = true
+            progress.identifier = NSUserInterfaceItemIdentifier(identifier + "-progress")
+            progress.widthAnchor.constraint(equalToConstant: 14).isActive = true
+            progress.heightAnchor.constraint(equalToConstant: 14).isActive = true
+            let statusRow = horizontal([progress, status], spacing: 5)
+            statusRow.setContentHuggingPriority(.required, for: .horizontal)
+            let column = vertical(9)
+            fill(column, horizontal([label(title, size: 13, weight: .medium), NSView(), statusRow], spacing: 6))
+            picker.identifier = NSUserInterfaceItemIdentifier(identifier + "-model")
+            picker.font = .systemFont(ofSize: 13); picker.controlSize = .regular
+            picker.target = self; picker.action = action; picker.setAccessibilityLabel(title + "模型")
+            for (id, name) in options { picker.addItem(withTitle: name); picker.lastItem?.representedObject = id }
+            fill(column, picker); models.addArrangedSubview(column)
         }
         let content = vertical(12); fill(content, models)
+        let configurationMessage = label("", size: 12, color: Palette.warning)
+        configurationMessage.identifier = NSUserInterfaceItemIdentifier("home-model-configuration-message")
+        homeModelConfigurationMessage = configurationMessage; fill(content, configurationMessage)
         let lastResult = label("", size: 11, color: Palette.secondary)
         lastResult.identifier = NSUserInterfaceItemIdentifier("home-cleanup-result")
         homeCleanupResult = lastResult; fill(content, lastResult)

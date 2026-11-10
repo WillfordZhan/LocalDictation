@@ -26,6 +26,14 @@ enum CleanupModelChoice: String, CaseIterable {
     case larger = "cleanup-9b"
     var title: String { self == .standard ? "Qwen3.5 4B（默认）" : "Qwen3.5 9B" }
 }
+enum ASRModelChoice: String, CaseIterable {
+    case qwen, whisper
+    var title: String { self == .qwen ? "Qwen3 ASR" : "Whisper" }
+}
+private struct ModelConfigurationError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
 struct ModelDownloadEvent: Decodable {
     let schema: Int
     let event: String
@@ -93,11 +101,14 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     var canConfigure: () -> Bool = { true }
     var prepareDownload: ((@escaping (Bool) -> Void) -> Void)?
     var onDownloadFinished: (() -> Void)?
+    var onConfigurationActivity: ((Bool) -> Void)?
+    private(set) var isConfiguringModels = false
     private let runtime: URL
     private let resources: URL
     private let message = NSTextField(wrappingLabelWithString: "检查这台 Mac 的运行环境与模型。")
     private let rows = NSStackView()
     private let cleanupPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let asrPicker = NSPopUpButton(frame: .zero, pullsDown: false)
     private let cleanupCaption = NSTextField(labelWithString: "")
     private let progress = NSProgressIndicator()
     private let configure = NSButton(title: "一键配置", target: nil, action: nil)
@@ -113,7 +124,9 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     private var cancelled = false
     private var report: InstallationReport?
     private enum CheckIntent { case check, prepare, verifyDownload }
-    private var activeASR = "qwen"
+    private var appliedASR: ASRModelChoice?
+    private var selectedASR: ASRModelChoice
+    private var activeASR: ASRModelChoice
     private var appliedCleanup: CleanupModelChoice?
     private var selectedCleanup: CleanupModelChoice
     private var activeCleanup: CleanupModelChoice
@@ -122,23 +135,21 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     private var fraction: Double?
     private var motionObserver: NSObjectProtocol?
     private var processFailure: String?
+    private var configurationCompletion: ((Result<Void, Error>) -> Void)?
+    private let writeSelection: (Data, URL) throws -> Void
     var pythonURL: URL { resources.appendingPathComponent("Python/bin/python3") }
     private var backend: URL { resources.appendingPathComponent("backend") }
 
-    init(runtime: URL, resources: URL) {
+    init(runtime: URL, resources: URL,
+         writeSelection: @escaping (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }) {
         self.runtime = runtime; self.resources = resources
-        let selection = runtime.appendingPathComponent("cleanup-model")
+        self.writeSelection = writeSelection
         // The runtime file is the single source of truth shared with start.sh.
         // An invalid saved choice remains unapplied until explicitly configured.
-        if let attributes = try? FileManager.default.attributesOfItem(atPath: selection.path) {
-            // Never read a pipe/device or follow a link on the UI thread.
-            // Invalid entries stay recoverable through explicit configuration.
-            if attributes[.type] as? FileAttributeType == .typeRegular {
-                let stored = (try? String(contentsOf: selection, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
-                appliedCleanup = stored.flatMap(CleanupModelChoice.init(rawValue:))
-            } else { appliedCleanup = nil }
-        } else { appliedCleanup = FileManager.default.fileExists(atPath: selection.path) ? nil : .standard }
+        appliedCleanup = Self.savedSelection(runtime.appendingPathComponent("cleanup-model"), fallback: "cleanup").flatMap(CleanupModelChoice.init(rawValue:))
+        appliedASR = Self.savedSelection(runtime.appendingPathComponent("asr-backend"), fallback: "qwen").flatMap(ASRModelChoice.init(rawValue:))
         selectedCleanup = appliedCleanup ?? .standard; activeCleanup = selectedCleanup
+        selectedASR = appliedASR ?? .qwen; activeASR = selectedASR
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 700),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "模型与配置"; window.isReleasedWhenClosed = false
@@ -150,6 +161,15 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit { if let motionObserver { NotificationCenter.default.removeObserver(motionObserver) } }
+    private static func savedSelection(_ url: URL, fallback: String) -> String? {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else { return nil }
+            return try String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch let error as NSError {
+            return error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError ? fallback : nil
+        }
+    }
     private func build() {
         guard let root = window?.contentView else { return }
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 16
@@ -166,6 +186,16 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
         message.identifier = NSUserInterfaceItemIdentifier("setup-message")
         stack.addArrangedSubview(title); stack.addArrangedSubview(message)
         message.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        let asrLabel = NSTextField(labelWithString: "语音识别模型")
+        asrLabel.font = .systemFont(ofSize: 14, weight: .semibold); asrLabel.textColor = Palette.ink
+        asrPicker.addItems(withTitles: ASRModelChoice.allCases.map(\.title))
+        asrPicker.selectItem(at: ASRModelChoice.allCases.firstIndex(of: selectedASR) ?? 0)
+        asrPicker.font = .systemFont(ofSize: 13)
+        asrPicker.identifier = NSUserInterfaceItemIdentifier("setup-asr-model")
+        asrPicker.target = self; asrPicker.action = #selector(selectASRModel)
+        asrPicker.setAccessibilityLabel("语音识别模型")
+        let asrRow = NSStackView(views: [asrLabel, NSView(), asrPicker]); asrRow.spacing = 16
+        stack.addArrangedSubview(asrRow); asrRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         let modelLabel = NSTextField(labelWithString: "文字润色模型")
         modelLabel.font = .systemFont(ofSize: 14, weight: .semibold); modelLabel.textColor = Palette.ink
         cleanupPicker.addItems(withTitles: CleanupModelChoice.allCases.map(\.title))
@@ -235,7 +265,7 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     func shutdown() {
         guard !shuttingDown else { return }
         shuttingDown = true; cancelled = true; DictationMotion.cancel(rows)
-        if let process { terminate(process) } else { releaseDownload() }
+        if let process { terminate(process) } else { finishWork("配置已取消，应用正在退出。") }
     }
     private func refreshPermissions() {
         let mic = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
@@ -249,6 +279,13 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     @objc private func allowInsertion() { onAccessibility?() }
     @objc private func allowMonitoring() { onInputMonitoring?() }
     @objc private func checkOnly() { checkConfiguration(intent: .check) }
+    @objc private func selectASRModel() {
+        guard !busy, !shuttingDown, canConfigure(), ASRModelChoice.allCases.indices.contains(asrPicker.indexOfSelectedItem) else {
+            asrPicker.selectItem(at: ASRModelChoice.allCases.firstIndex(of: selectedASR) ?? 0); return
+        }
+        selectedASR = ASRModelChoice.allCases[asrPicker.indexOfSelectedItem]
+        report = nil; updateCleanupCaption(); checkConfiguration(intent: .check)
+    }
     @objc private func selectCleanupModel() {
         guard !busy, !shuttingDown, canConfigure(), CleanupModelChoice.allCases.indices.contains(cleanupPicker.indexOfSelectedItem) else {
             cleanupPicker.selectItem(at: CleanupModelChoice.allCases.firstIndex(of: selectedCleanup) ?? 0); return
@@ -258,13 +295,14 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
         checkConfiguration(intent: .check)
     }
     private func updateCleanupCaption() {
-        cleanupCaption.stringValue = appliedCleanup == selectedCleanup
-            ? "当前配置 · \(selectedCleanup.title)"
+        cleanupCaption.stringValue = appliedCleanup == selectedCleanup && appliedASR == selectedASR
+            ? "当前配置 · \(selectedASR.title) + \(selectedCleanup.title)"
             : "完成一键配置后切换，当前模型继续使用。"
     }
     func refreshConfigurationAvailability() {
         let available = !busy && !shuttingDown
         cleanupPicker.isEnabled = available && canConfigure()
+        asrPicker.isEnabled = available && canConfigure()
         configure.isEnabled = available && canConfigure()
         download.isEnabled = available && canConfigure() && report?.can_download == true && report?.blocked == false
         check.isEnabled = available
@@ -272,6 +310,22 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     @objc private func prepareAll() {
         guard !busy, !shuttingDown else { return }
         guard canConfigure() else { message.stringValue = "本次口述结束后再配置，当前录音与结果会保留。"; return }
+        beginConfiguration(asr: selectedASR, cleanup: selectedCleanup)
+    }
+    /// Home-page switches reuse setup's validation and persistence path without
+    /// opening a window or overwriting a pending selection in that window.
+    @discardableResult
+    func configureModels(asr: String, cleanup: String, completion: @escaping (Result<Void, Error>) -> Void) -> Bool {
+        guard !busy, !isConfiguringModels, !shuttingDown, canConfigure(),
+              let asr = ASRModelChoice(rawValue: asr), let cleanup = CleanupModelChoice(rawValue: cleanup),
+              selectedASR == appliedASR, selectedCleanup == appliedCleanup else { return false }
+        configurationCompletion = completion
+        beginConfiguration(asr: asr, cleanup: cleanup)
+        return true
+    }
+    private func beginConfiguration(asr: ASRModelChoice, cleanup: CleanupModelChoice) {
+        activeASR = asr; activeCleanup = cleanup; cancelled = false
+        isConfiguringModels = true; onConfigurationActivity?(true)
         checkConfiguration(intent: .prepare)
     }
     @objc private func cancelWork() {
@@ -292,13 +346,19 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
         progress.doubleValue = fraction ?? 0
         if progress.isIndeterminate { progress.startAnimation(nil) }
     }
-    private func finishWork(_ text: String) { setBusy(false, text); releaseDownload() }
+    private func finishWork(_ text: String, success: Bool = false) {
+        generation = UUID()
+        setBusy(false, text); releaseDownload()
+        let completion = configurationCompletion; configurationCompletion = nil
+        if isConfiguringModels { isConfiguringModels = false; onConfigurationActivity?(false) }
+        completion?(success ? .success(()) : .failure(ModelConfigurationError(message: text)))
+    }
     private func releaseDownload() {
         guard downloadLease else { return }; downloadLease = false; onDownloadFinished?()
     }
     private func checkConfiguration(intent: CheckIntent) {
         guard (!busy || intent == .verifyDownload), !shuttingDown else { return }
-        if intent != .verifyDownload { cancelled = false; activeCleanup = selectedCleanup }
+        if intent == .check { cancelled = false; activeCleanup = selectedCleanup; activeASR = selectedASR }
         guard FileManager.default.isExecutableFile(atPath: pythonURL.path) else {
             finishWork("安装包缺少内置运行环境，请重新下载完整应用。"); return
         }
@@ -306,28 +366,28 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
         // Check the pending dropdown choice without saving it. Download and
         // final verification keep this same choice frozen until completion.
         run("diagnose.py", arguments: ["--installation", "--json", "--runtime-dir", runtime.path,
-                                       "--python-bin", pythonURL.path, "--cleanup-model", activeCleanup.rawValue]) { [weak self] status, output, _, failure in
+                                       "--python-bin", pythonURL.path, "--asr-backend", activeASR.rawValue,
+                                       "--cleanup-model", activeCleanup.rawValue]) { [weak self] status, output, _, failure in
             guard let self else { return }
-            if self.shuttingDown { self.releaseDownload(); return }
+            if self.shuttingDown { self.finishWork("配置已取消，应用正在退出。"); return }
             if self.cancelled { self.finishWork("已取消，可随时重新检查。"); return }
             guard failure == nil, status == 0, let report = try? JSONDecoder().decode(InstallationReport.self, from: output),
                   report.schema == 1, report.checks.count <= 128 else {
                 self.finishWork(failure ?? "检查未完成（退出码 \(status)），请重新检查或重新安装完整应用。"); return
             }
-            guard report.cleanup_model == self.activeCleanup.rawValue else {
+            guard report.cleanup_model == self.activeCleanup.rawValue, report.asr_backend == self.activeASR.rawValue else {
                 self.report = nil
-                self.finishWork("检查结果与所选润色模型不一致，请重新检查。"); return
+                self.finishWork("检查结果与所选模型不一致，请重新检查。"); return
             }
             self.report = report
-            if let selected = report.asr_backend, ["qwen", "whisper"].contains(selected) { self.activeASR = selected }
             self.render(report)
             switch intent {
             case .check:
-                let readyMessage = self.activeCleanup == self.appliedCleanup ? "运行环境与模型已就绪。" : "所选模型已就绪，点击“一键配置”应用。"
+                let readyMessage = self.activeCleanup == self.appliedCleanup && self.activeASR == self.appliedASR ? "运行环境与模型已就绪。" : "所选模型已就绪，点击“一键配置”应用。"
                 self.finishWork(report.ready ? readyMessage : report.can_download ? "检查完成，可继续配置模型。" : report.download_block_reason ?? "请先处理上方的运行环境问题。")
             case .prepare:
                 if report.ready {
-                    if self.activeCleanup != self.appliedCleanup { self.prepareServiceForConfiguration(download: false) }
+                    if self.activeCleanup != self.appliedCleanup || self.activeASR != self.appliedASR { self.prepareServiceForConfiguration(download: false) }
                     else { self.finishPreparation() }
                 }
                 else if report.blocked || !report.can_download { self.finishWork(report.download_block_reason ?? "请先处理上方的运行环境问题，再配置模型。") }
@@ -377,7 +437,7 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
         prepareDownload { [weak self] allowed in
             DispatchQueue.main.async {
                 guard let self, self.generation == token else { return }
-                if self.shuttingDown { self.releaseDownload(); return }
+                if self.shuttingDown { self.finishWork("配置已取消，应用正在退出。"); return }
                 if self.cancelled { self.finishWork("已取消，模型与记录保持不变。"); return }
                 guard allowed, self.canConfigure() else { self.finishWork("当前服务无法安全停止。请结束口述或关闭其他本地服务后重试。"); return }
                 if download { self.startModelTask() } else { self.finishPreparation() }
@@ -391,7 +451,7 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     private func startModelTask() {
         setBusy(true, "正在配置模型，完整文件会直接复用。关闭窗口后仍会继续。")
         run("download_models.py", arguments: ["--models-dir", runtime.appendingPathComponent("models").path,
-                                              "--asr-backend", activeASR, "--cleanup-model", activeCleanup.rawValue, "--json-events"], events: { [weak self] event in
+                                              "--asr-backend", activeASR.rawValue, "--cleanup-model", activeCleanup.rawValue, "--json-events"], events: { [weak self] event in
             guard let self, !self.cancelled else { return }
             if event.event == "start" { self.fraction = nil; self.updateProgress() }
             if event.event == "verified" || event.event == "complete" {
@@ -406,7 +466,7 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
             self.message.toolTip = self.message.stringValue
         }) { [weak self] status, _, event, failure in
             guard let self else { return }
-            if self.shuttingDown { self.releaseDownload(); return }
+            if self.shuttingDown { self.finishWork("配置已取消，应用正在退出。"); return }
             if self.cancelled || status == 130 { self.finishWork("已取消。已完成的文件已保留，可再次重试。"); return }
             guard failure == nil, status == 0, event?.event == "complete", event?.ready == true else {
                 // A final progress/verified event is not completion. Only an
@@ -419,17 +479,47 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     }
     private func finishPreparation() {
         guard !cancelled, !shuttingDown, canConfigure(), report?.service_busy != true else { finishWork("模型已就绪，本次口述结束后可再次完成配置。"); return }
-        guard activeCleanup == appliedCleanup || downloadLease else { finishWork("请结束口述后重新配置，当前模型保持不变。"); return }
+        guard (activeCleanup == appliedCleanup && activeASR == appliedASR) || downloadLease else { finishWork("请结束口述后重新配置，当前模型保持不变。"); return }
         do {
-            try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
-            let selection = runtime.appendingPathComponent("asr-backend")
-            if !FileManager.default.fileExists(atPath: selection.path) { try (activeASR + "\n").write(to: selection, atomically: true, encoding: .utf8) }
-            if activeCleanup != appliedCleanup || downloadLease {
-                try (activeCleanup.rawValue + "\n").write(to: runtime.appendingPathComponent("cleanup-model"), atomically: true, encoding: .utf8)
-                appliedCleanup = activeCleanup; updateCleanupCaption()
-            }
-            finishWork("模型已就绪，正在启动本地服务。"); onReady?(); refreshPermissions()
+            try saveSelections()
+            appliedASR = activeASR; appliedCleanup = activeCleanup
+            selectedASR = activeASR; selectedCleanup = activeCleanup
+            asrPicker.selectItem(at: ASRModelChoice.allCases.firstIndex(of: selectedASR) ?? 0)
+            cleanupPicker.selectItem(at: CleanupModelChoice.allCases.firstIndex(of: selectedCleanup) ?? 0)
+            updateCleanupCaption()
+            finishWork("模型已就绪，正在启动本地服务。", success: true); onReady?(); refreshPermissions()
         } catch { finishWork("无法保存配置：" + error.localizedDescription) }
+    }
+    private func saveSelections() throws {
+        try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+        let selections = [(runtime.appendingPathComponent("asr-backend"), activeASR.rawValue),
+                          (runtime.appendingPathComponent("cleanup-model"), activeCleanup.rawValue)]
+        // Capture both old values before the first write. A failed second
+        // replacement restores the first while the service remains stopped.
+        let previous: [Data?] = try selections.map { url, _ in
+            do {
+                let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+                guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                    throw ModelConfigurationError(message: "模型配置必须是普通文件，不能是目录或符号链接。")
+                }
+                return try Data(contentsOf: url)
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
+        }
+        var written = 0
+        do {
+            for (url, value) in selections {
+                try writeSelection(Data((value + "\n").utf8), url); written += 1
+            }
+        } catch {
+            let original = error
+            do {
+                for index in (0..<written).reversed() {
+                    if let data = previous[index] { try writeSelection(data, selections[index].0) }
+                    else { try FileManager.default.removeItem(at: selections[index].0) }
+                }
+            } catch { throw ModelConfigurationError(message: "保存失败且旧配置恢复失败，请检查存储权限后重新配置：" + error.localizedDescription) }
+            throw original
+        }
     }
     private func terminate(_ child: Process) {
         guard child.isRunning else { return }

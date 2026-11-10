@@ -51,10 +51,12 @@ enum DictationSetupChecks {
         let controller: DictationSetupWindowController
         let root: NSView
         let configure: NSButton, download: NSButton, check: NSButton, cancel: NSButton
-        let cleanup: NSPopUpButton
+        let cleanup: NSPopUpButton, asr: NSPopUpButton
         let message: NSTextField, progress: NSProgressIndicator
         var prepared = 0, released = 0, ready = 0
-        init(savedCleanup: String? = nil, selectionKind: String? = nil) throws {
+        var activity: [Bool] = []
+        init(savedCleanup: String? = nil, selectionKind: String? = nil, savedASR: String? = nil,
+             writeSelection: @escaping (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }) throws {
             directory = FileManager.default.temporaryDirectory.appendingPathComponent("dictation-setup-check-" + UUID().uuidString)
             runtime = directory.appendingPathComponent("Runtime"); resources = directory.appendingPathComponent("Resources")
             let bin = resources.appendingPathComponent("Python/bin")
@@ -90,6 +92,10 @@ enum DictationSetupChecks {
                 try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
                 try (savedCleanup + "\n").write(to: runtime.appendingPathComponent("cleanup-model"), atomically: true, encoding: .utf8)
             }
+            if let savedASR {
+                try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+                try (savedASR + "\n").write(to: runtime.appendingPathComponent("asr-backend"), atomically: true, encoding: .utf8)
+            }
             if let selectionKind {
                 try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
                 let selection = runtime.appendingPathComponent("cleanup-model")
@@ -102,30 +108,32 @@ enum DictationSetupChecks {
                 default: try FileManager.default.createDirectory(at: selection, withIntermediateDirectories: true)
                 }
             }
-            controller = DictationSetupWindowController(runtime: runtime, resources: resources)
+            controller = DictationSetupWindowController(runtime: runtime, resources: resources, writeSelection: writeSelection)
             root = controller.window!.contentView!
             configure = try find("setup-configure", in: root)
             download = try find("setup-download", in: root)
             check = try find("setup-check", in: root)
             cancel = try find("setup-cancel", in: root)
             cleanup = try find("setup-cleanup-model", in: root)
+            asr = try find("setup-asr-model", in: root)
             message = try find("setup-message", in: root)
             progress = try find("setup-progress", in: root)
             controller.prepareDownload = { [weak self] done in self?.prepared += 1; done(true) }
             controller.onDownloadFinished = { [weak self] in self?.released += 1 }
             controller.onReady = { [weak self] in self?.ready += 1 }
+            controller.onConfigurationActivity = { [weak self] active in self?.activity.append(active) }
             try report(ready: false)
             try report(ready: true, filename: "ready.json")
             try mode("hold")
         }
-        func report(ready: Bool, filename: String = "report.json", long: Bool = false, blocked: String? = nil, asr: String? = nil, cleanup: String = "cleanup", serviceBusy: Bool = false) throws {
+        func report(ready: Bool, filename: String = "report.json", long: Bool = false, blocked: String? = nil, asr: String = "qwen", cleanup: String = "cleanup", serviceBusy: Bool = false) throws {
             let row: [String: Any] = ["id": "model", "status": ready ? "ok" : "missing",
                 "message": long ? String(repeating: "模型校验与运行环境示例，完整文件会直接复用。", count: 8) : ready ? "本机运行环境与模型已就绪。" : "尚未下载语音识别与文字整理模型。"]
             var report: [String: Any] = ["schema": 1, "ready": ready, "blocked": false, "can_download": !ready && blocked == nil,
                 "checks": long ? (0..<12).map { index -> [String: Any] in var copy = row; copy["id"] = "row-\(index)"; return copy } : [row],
                 "required_download_bytes": ready ? 0 : 100, "cleanup_model": cleanup, "service_busy": serviceBusy]
             if let blocked { report["download_block_reason"] = blocked }
-            if let asr { report["asr_backend"] = asr }
+            report["asr_backend"] = asr
             try JSONSerialization.data(withJSONObject: report).write(to: resources.appendingPathComponent(filename))
         }
         func mode(_ value: String) throws {
@@ -139,9 +147,14 @@ enum DictationSetupChecks {
                 .split(separator: "\n").filter { $0.hasSuffix("/" + script + ".py") }.count
         }
         var savedCleanup: String? { try? String(contentsOf: runtime.appendingPathComponent("cleanup-model"), encoding: .utf8) }
+        var savedASR: String? { try? String(contentsOf: runtime.appendingPathComponent("asr-backend"), encoding: .utf8) }
         func choose(_ choice: CleanupModelChoice) {
             cleanup.selectItem(at: CleanupModelChoice.allCases.firstIndex(of: choice)!)
             NSApp.sendAction(cleanup.action!, to: cleanup.target, from: cleanup)
+        }
+        func chooseASR(_ choice: ASRModelChoice) {
+            asr.selectItem(at: ASRModelChoice.allCases.firstIndex(of: choice)!)
+            NSApp.sendAction(asr.action!, to: asr.target, from: asr)
         }
         func argument(_ name: String, script: String) throws -> String? {
             let args = try String(contentsOf: resources.appendingPathComponent(script + ".py.args"), encoding: .utf8).split(separator: "\n").map(String.init)
@@ -176,6 +189,9 @@ enum DictationSetupChecks {
         try cleanupModelDownloadsAndPersistence()
         try readyCleanupSwitchAndSafety()
         try cleanupSwitchFailures()
+        try externalModelConfiguration()
+        try externalFailureAndCancellation()
+        try selectionSaveRollback()
         try closeAndShutdown()
     }
     static func parserBounds() throws {
@@ -284,6 +300,8 @@ enum DictationSetupChecks {
     static func asrChoiceFreeze() throws {
         let f = try Fixture(); defer { f.dispose() }
         try f.report(ready: false, asr: "whisper")
+        f.chooseASR(.whisper)
+        try wait("ASR pending choice checked") { f.check.isEnabled }
         var answer: ((Bool) -> Void)?
         f.controller.prepareDownload = { done in f.prepared += 1; answer = done }
         f.configure.performClick(nil)
@@ -297,7 +315,7 @@ enum DictationSetupChecks {
         let selected = args.firstIndex(of: "--asr-backend").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }
         try require(selected == "whisper", "Download used a later selection instead of the diagnosed choice")
         let diagnose = try String(contentsOf: f.resources.appendingPathComponent("diagnose.py.args"), encoding: .utf8)
-        try require(!diagnose.contains("--asr-backend"), "Diagnosis silently overrode the stored ASR selection")
+        try require(diagnose.contains("--asr-backend\nwhisper\n"), "Diagnosis did not freeze the selected ASR")
         f.cancel.performClick(nil)
         try wait("choice download cancelled") { f.check.isEnabled && f.released == 1 }
         let retained = try String(contentsOf: f.runtime.appendingPathComponent("asr-backend"), encoding: .utf8)
@@ -436,5 +454,88 @@ enum DictationSetupChecks {
         try require(shutdown.ready == 0 && !shutdown.configure.isEnabled && shutdown.controller.window?.isVisible == false, "Shutdown claimed success or left configuration active")
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         try require(shutdown.released == 1, "Shutdown released the lease twice")
+    }
+
+    static func externalModelConfiguration() throws {
+        let f = try Fixture(savedCleanup: "cleanup", savedASR: "qwen"); defer { f.dispose() }
+        try f.report(ready: true, asr: "whisper", cleanup: "cleanup-9b")
+        var results: [Result<Void, Error>] = [], completionReleased = false
+        var answer: ((Bool) -> Void)?
+        f.controller.prepareDownload = { done in f.prepared += 1; answer = done }
+        let accepted = f.controller.configureModels(asr: "whisper", cleanup: "cleanup-9b") { result in
+            results.append(result); completionReleased = f.released == 1 && !f.controller.isConfiguringModels && f.activity.last == false
+        }
+        try require(accepted && f.controller.isConfiguringModels && f.activity == [true], "External request did not start exactly one configuration activity")
+        try require(!f.controller.configureModels(asr: "qwen", cleanup: "cleanup") { results.append($0) }, "Duplicate external operation was accepted")
+        try wait("external safe lease") { answer != nil }
+        try require(f.savedASR == "qwen\n" && f.savedCleanup == "cleanup\n" && !f.controller.window!.isVisible,
+                    "External request saved too early or opened setup window")
+        answer?(true)
+        try wait("external completion") { results.count == 1 && f.ready == 1 }
+        guard case .success = results[0] else { throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "External valid switch failed"]) }
+        try require(completionReleased && f.activity == [true, false] && f.savedASR == "whisper\n" && f.savedCleanup == "cleanup-9b\n", "External completion preceded release or failed to persist both choices")
+        let checkedASR = try f.argument("--asr-backend", script: "diagnose")
+        try require(checkedASR == "whisper" && f.calls("download_models") == 0, "Ready external switch checked wrong ASR or downloaded again")
+        answer?(true); answer?(false)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        try require(results.count == 1 && f.ready == 1 && f.released == 1, "Repeated lease callback completed an operation twice")
+        let reopened = DictationSetupWindowController(runtime: f.runtime, resources: f.resources)
+        defer { reopened.shutdown(); reopened.window?.close() }
+        let picker: NSPopUpButton = try find("setup-asr-model", in: reopened.window!.contentView!)
+        try require(picker.titleOfSelectedItem == ASRModelChoice.whisper.title, "ASR choice did not survive controller restart")
+
+        let pending = try Fixture(savedCleanup: "cleanup", savedASR: "qwen"); defer { pending.dispose() }
+        try pending.report(ready: true, cleanup: "cleanup-9b")
+        pending.choose(.larger); try wait("pending UI selection") { pending.check.isEnabled }
+        var callbacks = 0
+        try require(!pending.controller.configureModels(asr: "whisper", cleanup: "cleanup") { _ in callbacks += 1 }, "External switch overwrote settings draft")
+        try require(pending.cleanup.titleOfSelectedItem == CleanupModelChoice.larger.title && pending.activity.isEmpty && callbacks == 0, "Rejected request changed UI or emitted completion")
+        try require(!f.controller.configureModels(asr: "invalid", cleanup: "cleanup") { _ in callbacks += 1 }, "Invalid ASR accepted")
+        try require(!f.controller.configureModels(asr: "qwen", cleanup: "qwen") { _ in callbacks += 1 }, "ASR model accepted as cleanup")
+        f.controller.canConfigure = { false }
+        try require(!f.controller.configureModels(asr: "qwen", cleanup: "cleanup") { _ in callbacks += 1 } && callbacks == 0, "Busy service accepted request or called rejected completion")
+    }
+
+    static func externalFailureAndCancellation() throws {
+        for failure in ["download", "verify", "cancel", "denied", "mismatch", "shutdown"] {
+            let f = try Fixture(savedCleanup: "cleanup", savedASR: "qwen"); defer { f.dispose() }
+            let ready = ["denied", "mismatch"].contains(failure)
+            try f.report(ready: ready, asr: failure == "mismatch" ? "qwen" : "whisper", cleanup: "cleanup-9b")
+            try f.report(ready: true, filename: "ready.json", asr: "whisper", cleanup: "cleanup-9b")
+            try f.mode(failure == "download" ? "error" : failure == "verify" ? "incomplete" : "hold")
+            if failure == "denied" { f.controller.prepareDownload = { done in f.prepared += 1; done(false) } }
+            var results: [Result<Void, Error>] = []
+            try require(f.controller.configureModels(asr: "whisper", cleanup: "cleanup-9b") { results.append($0) }, "External \(failure) request was not accepted")
+            if failure == "cancel" || failure == "shutdown" {
+                try wait("external active download") { f.progress.doubleValue == 0.4 }
+                if failure == "shutdown" { f.controller.shutdown() } else { f.cancel.performClick(nil) }
+            }
+            try wait("external \(failure) settled") { results.count == 1 }
+            guard case .failure(let error) = results[0] else { throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "External \(failure) incorrectly succeeded"]) }
+            try require(!error.localizedDescription.isEmpty && f.activity == [true, false] && !f.controller.isConfiguringModels,
+                        "External failure lost explanation or left configuration active")
+            try require(f.savedASR == "qwen\n" && f.savedCleanup == "cleanup\n" && f.ready == 0,
+                        "External \(failure) changed saved pair or claimed model ready")
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            try require(results.count == 1, "External \(failure) called completion twice")
+        }
+    }
+
+    static func selectionSaveRollback() throws {
+        for absent in [false, true] {
+            var writes = 0
+            let f = try Fixture(savedCleanup: absent ? nil : "cleanup", savedASR: absent ? nil : "qwen", writeSelection: { data, url in
+                writes += 1
+                if writes == 2 { throw NSError(domain: "FixtureWrite", code: 1, userInfo: [NSLocalizedDescriptionKey: "second selection write failed"]) }
+                try data.write(to: url, options: .atomic)
+            }); defer { f.dispose() }
+            try f.report(ready: true, asr: "whisper", cleanup: "cleanup-9b")
+            var results: [Result<Void, Error>] = []
+            try require(f.controller.configureModels(asr: "whisper", cleanup: "cleanup-9b") { results.append($0) }, "Rollback test not accepted")
+            try wait("second selection failure") { results.count == 1 }
+            guard case .failure(let error) = results[0] else { throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "Partial persistence reported success"]) }
+            try require(error.localizedDescription.contains("second selection") && f.ready == 0 && f.released == 1 && f.activity == [true, false], "Save failure was hidden or retained service lease")
+            try require(f.savedASR == (absent ? nil : "qwen\n") && f.savedCleanup == (absent ? nil : "cleanup\n"), "Two-file failure left a mixed or newly created configuration")
+        }
     }
 }
