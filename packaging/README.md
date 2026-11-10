@@ -15,7 +15,7 @@ python3 packaging/sanitize_runtime.py \
 python3 packaging/validate_runtime.py "$PWD/build/python-public"
 LOCAL_DICTATION_PYTHON_BUNDLE="$PWD/build/python-public" \
   bash macos/build.sh "$PWD/build/LocalDictation.app"
-bash packaging/package.sh "$PWD/build/LocalDictation.app" "$PWD/releases/0.5.4"
+bash packaging/package.sh "$PWD/build/LocalDictation.app" "$PWD/releases/0.5.12"
 ```
 
 `build_runtime.py` 检查本机动态库引用和解释器导入；`sanitize_runtime.py` 创建副本，移除本机构建来源、修正 CPython 元数据的重定位路径，并补齐固定版本依赖许可证。它不会修改源运行环境。实际推理仍需对打包后的模型组合单独验收。
