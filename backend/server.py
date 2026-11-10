@@ -367,18 +367,51 @@ class LocalModels:
             mx.eval(whisper.parameters())
         self.asr_ready = True
         self.message = "正在加载文字整理模型。"
+        self.cleanup_ready = False
+        self.model = self.tokenizer = None
+        self._clear_cleanup_prefix()
         try:
             from mlx_lm import load
 
-            if not (self.cleanup_path / "model.safetensors").is_file():
-                raise RuntimeError("文字整理模型尚未下载。")
+            self._validate_cleanup_weights()
             self.model, self.tokenizer = load(str(self.cleanup_path))
             mx.eval(self.model.parameters())
             self.cleanup_ready = True
             self.message = "本地识别和文字整理已就绪。"
         except Exception:
+            self.model = self.tokenizer = None
             LOG.exception("Cleanup model unavailable; raw transcription remains available")
             self.message = "语音识别已就绪；文字整理不可用，将保留原始转写。"
+
+    def _validate_cleanup_weights(self):
+        # Setup verifies pinned hashes. Startup only checks that MLX will see a
+        # complete, unambiguous local weight set before load/eval confirms it.
+        # This Mac-only dependency stays lazy: Windows bundles its own loader.
+        from model_artifacts import artifact_path
+
+        index = artifact_path(self.cleanup_path, "model.safetensors.index.json")
+        if index.exists():
+            value = json.loads(index.read_text(encoding="utf-8"))
+            weights = value.get("weight_map") if isinstance(value, dict) else None
+            if not isinstance(weights, dict) or not weights or any(
+                not isinstance(key, str) or not key or not isinstance(name, str)
+                or Path(name).name != name or not name.startswith("model") or not name.endswith(".safetensors")
+                for key, name in weights.items()
+            ):
+                raise RuntimeError("文字整理模型的权重索引无效。")
+            names = set(weights.values())
+        else:
+            # Legacy single-file models remain supported; several arbitrary
+            # shards without an index never prove a complete installation.
+            names = {"model.safetensors"}
+        # mlx_lm loads every model*.safetensors file in this directory. A
+        # missing shard or stale unindexed file must not become usable weights.
+        if {path.name for path in self.cleanup_path.glob("model*.safetensors")} != names:
+            raise RuntimeError("文字整理模型分片与索引不一致，请重新检查模型。")
+        for name in names:
+            path = artifact_path(self.cleanup_path, name)
+            if not path.is_file() or path.stat().st_size == 0:
+                raise RuntimeError("文字整理模型权重缺失或为空，请重新检查模型。")
 
     def transcribe(self, recording: Recording, options: DictationOptions = DictationOptions()) -> str:
         return self._transcribe(recording, options)[0].strip()
@@ -465,6 +498,12 @@ class LocalModels:
         self._cleanup_prefix_key = None
         self._cleanup_prefix_cache = None
 
+    def _cleanup_chat_template(self, messages, *, add_generation_prompt):
+        # Both cached instructions and the complete request use the same
+        # non-thinking template. Reasoning text is not a final dictation result.
+        return self.tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=add_generation_prompt, enable_thinking=False)
+
     def _cleanup_prompt(self, messages, prompt, options, deadline):
         """Reuse only fixed editing instructions, on the existing model worker.
 
@@ -479,8 +518,7 @@ class LocalModels:
             from mlx_lm.models.cache import make_prompt_cache
             import mlx.core as mx
 
-            fixed = self.tokenizer.apply_chat_template(
-                messages[:-1], tokenize=True, add_generation_prompt=False)
+            fixed = self._cleanup_chat_template(messages[:-1], add_generation_prompt=False)
             count = 0
             for expected, actual in zip(fixed, prompt):
                 if expected != actual or count >= MAX_CLEANUP_PREFIX_TOKENS:
@@ -531,7 +569,7 @@ class LocalModels:
         started = time.monotonic()
         self.last_cleanup_metrics = None
         messages = cleanup_messages(raw_text, options)
-        prompt = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        prompt = self._cleanup_chat_template(messages, add_generation_prompt=True)
         # Allow complete edits for longer dictation without unbounded generation.
         # Token length is used instead of characters so Chinese and English have
         # the same completion policy. Truncation falls back to the original.

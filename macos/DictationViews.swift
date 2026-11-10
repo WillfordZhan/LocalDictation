@@ -5,10 +5,49 @@ enum DictationCleanupBackend: String {
     case local, cloud
 }
 
+/// Loading a model and receiving an edited result are separate facts. These
+/// states come from the health response, never from the ability to record.
+enum DictationModelReadiness {
+    case checking, loading, ready, unavailable
+
+    var title: String {
+        switch self {
+        case .checking: return "待确认"
+        case .loading: return "加载中"
+        case .ready: return "已就绪"
+        case .unavailable: return "不可用"
+        }
+    }
+    var color: NSColor {
+        switch self {
+        case .ready: return Palette.blue
+        case .unavailable: return Palette.warning
+        case .checking, .loading: return Palette.muted
+        }
+    }
+}
+
+extension DictationEntry {
+    // A successful response can legitimately leave a short sentence unchanged.
+    // Report that observable result without claiming either semantic success
+    // or a skipped model call; cleanupApplied records the invocation outcome.
+    var cleanupResultDescription: String {
+        if cleanupApplied { return rawText == text ? "已调用 · 文本未变" : "已调用 · 文本已修改" }
+        return warning?.isEmpty == false ? "整理未完成，已保留原文" : "未应用整理"
+    }
+    var cleanupResultTitle: String {
+        cleanupApplied ? (rawText == text ? "模型输出（文本未变）" : "整理结果") : "最终输出（未整理）"
+    }
+}
+
 struct DictationUIState {
     var status = "准备就绪"
     var serviceMessage = "正在准备本地模型…"
     var serviceReady = false
+    var asrReadiness: DictationModelReadiness = .checking
+    var cleanupReadiness: DictationModelReadiness = .checking
+    var asrModel: String?
+    var cleanupModel: String?
     var recording = false
     var processing = false
     // Recording and previously submitted utterances have independent lifetimes.
@@ -265,6 +304,7 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     private var pageMinimumHeight: NSLayoutConstraint?
     private var pagePreferredHeight: NSLayoutConstraint?
     private let sidebarStatus = label("正在准备", size: 12, color: Palette.muted)
+    private let sidebarCleanupStatus = label("润色 · 待确认", size: 12, color: Palette.muted)
     private let sidebarDetail = label("", size: 11, color: Palette.muted)
     private var navigation: [DictationPage: SidebarNavigationButton] = [:]
     private var activityPageOffset = 0
@@ -304,6 +344,9 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     private var homeInsertionNotice: NSStackView?
     private var homeAllowInsertion: ActionButton?
     private var homeProcessingDetail: NSTextField?
+    private var homeASRStatus: NSTextField?; private var homeCleanupStatus: NSTextField?
+    private var homeASRModel: NSTextField?; private var homeCleanupModel: NSTextField?
+    private var homeCleanupResult: NSTextField?
     private var cleanupSettingDetail: NSTextField?
 
     init(store: DictationStore, sessionStartedAt: Date) {
@@ -361,7 +404,9 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
             footer.topAnchor.constraint(greaterThanOrEqualTo: menu.bottomAnchor, constant: 24)
         ])
         let local = vertical(6)
-        fill(local, sidebarStatus); fill(local, sidebarDetail)
+        sidebarStatus.identifier = NSUserInterfaceItemIdentifier("sidebar-asr-status")
+        sidebarCleanupStatus.identifier = NSUserInterfaceItemIdentifier("sidebar-cleanup-status")
+        fill(local, sidebarStatus); fill(local, sidebarCleanupStatus); fill(local, sidebarDetail)
         let localContainer = NSView(); pin(local, in: localContainer, inset: 14); fill(footer, localContainer)
         let separator = NSBox(); separator.boxType = .separator; fill(footer, separator)
         let settings = SidebarNavigationButton(title: DictationPage.settings.title, symbol: DictationPage.settings.icon) { [weak self] in self?.showPage(.settings) }
@@ -383,8 +428,29 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     // lists, so audio metering cannot steal focus or reset an in-progress search.
     func updateState(_ state: DictationUIState) {
         self.state = state
-        sidebarStatus.stringValue = state.preview ? "●  界面预览" : state.serviceReady ? "●  本地识别已就绪" : "○  正在准备本地服务"
-        sidebarStatus.textColor = state.serviceReady ? Palette.blue : Palette.muted; sidebarDetail.stringValue = state.serviceMessage
+        let cleanupEnabled = store.preferences.cleanupEnabled
+        let cleanupStatus = cleanupEnabled ? state.cleanupReadiness.title : "已关闭"
+        let cleanupColor = cleanupEnabled ? state.cleanupReadiness.color : Palette.muted
+        sidebarStatus.stringValue = "ASR · " + state.asrReadiness.title
+        sidebarStatus.textColor = state.asrReadiness.color
+        sidebarCleanupStatus.stringValue = "润色 · " + cleanupStatus
+        sidebarCleanupStatus.textColor = cleanupColor
+        sidebarDetail.stringValue = state.preview ? "界面预览" : state.serviceMessage
+        sidebarStatus.toolTip = state.asrModel
+        sidebarCleanupStatus.toolTip = state.cleanupModel
+        homeASRStatus?.stringValue = state.asrReadiness.title
+        homeASRStatus?.textColor = state.asrReadiness.color
+        homeCleanupStatus?.stringValue = cleanupStatus
+        homeCleanupStatus?.textColor = cleanupColor
+        homeASRModel?.stringValue = state.asrModel ?? "模型待确认"
+        homeCleanupModel?.stringValue = state.cleanupModel ?? "模型待确认"
+        homeASRModel?.toolTip = state.asrModel; homeCleanupModel?.toolTip = state.cleanupModel
+        let latest = store.entries.first
+        homeCleanupResult?.stringValue = latest.map {
+            "最近润色：" + $0.cleanupResultDescription + ($0.cleanupApplied ? String(format: " · %.2f 秒", $0.cleanupSeconds) : "")
+        } ?? "最近润色：暂无记录"
+        let lastDetails = [latest?.cleanupProfile.map { "该次模型：" + $0.modelID + "\n润色规则：" + $0.name }, latest?.warning].compactMap { $0 }
+        homeCleanupResult?.toolTip = lastDetails.isEmpty ? nil : lastDetails.joined(separator: "\n")
         homeProcessingDetail?.stringValue = state.homeProcessingDescription
         // Settings describe the next recording; an in-flight session keeps its
         // captured preference without making the visible switch text stale.
@@ -519,6 +585,7 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         homeShortcutNotice = nil; homeShortcutExplanation = nil; homeEnableFunctionKey = nil
         homeInsertionNotice = nil; homeAllowInsertion = nil
         homeProcessingDetail = nil; cleanupSettingDetail = nil
+        homeASRStatus = nil; homeCleanupStatus = nil; homeASRModel = nil; homeCleanupModel = nil; homeCleanupResult = nil
         clear(pageStack); liveStatus = nil; liveStart = nil; liveCancel = nil; microphoneStatus = nil; accessibilityStatus = nil
         historyList = nil; historyDetail = nil; historyListContainer = nil; historyListScroll = nil; historyPager = nil; historyLatestButton = nil
         vocabularyFeedback = nil; vocabularyAdd = nil; correctionLearningLabel = nil
@@ -553,6 +620,7 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         let processingDetail = label(state.homeProcessingDescription, size: 13, color: Palette.muted)
         homeProcessingDetail = processingDetail; fill(heading, processingDetail)
         fill(pageStack, heading)
+        renderModelStatus()
         renderInsights()
         let shortcut = vertical(10); let shortcutTitle = label(state.shortcutDisplay, size: 17, weight: .semibold, color: Palette.ink)
         homeShortcut = shortcutTitle
@@ -581,6 +649,36 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         else { fill(latest, label("下一次口述，会从这里开始。", size: 17, weight: .medium)); fill(latest, label("原文与输出文字会一起保留，方便你查看和复制。", color: Palette.muted)) }
         fill(pageStack, card(latest))
     }
+    private func renderModelStatus() {
+        let asrStatus = label("", size: 12, weight: .medium)
+        let cleanupStatus = label("", size: 12, weight: .medium)
+        let asrModel = label("", size: 11, color: Palette.muted)
+        let cleanupModel = label("", size: 11, color: Palette.muted)
+        homeASRStatus = asrStatus; homeCleanupStatus = cleanupStatus
+        homeASRModel = asrModel; homeCleanupModel = cleanupModel
+        let models = horizontal([], spacing: 24)
+        models.distribution = .fillEqually
+        for (title, status, model, identifier) in [
+            ("语音识别（ASR）", asrStatus, asrModel, "home-asr-status"),
+            ("文字润色", cleanupStatus, cleanupModel, "home-cleanup-status")
+        ] {
+            status.identifier = NSUserInterfaceItemIdentifier(identifier)
+            status.setContentHuggingPriority(.required, for: .horizontal)
+            status.setContentCompressionResistancePriority(.required, for: .horizontal)
+            let column = vertical(5)
+            fill(column, horizontal([label(title, size: 13, weight: .medium), NSView(), status], spacing: 6))
+            model.maximumNumberOfLines = 1; model.lineBreakMode = .byTruncatingMiddle
+            fill(column, model); models.addArrangedSubview(column)
+        }
+        let content = vertical(12); fill(content, models)
+        let lastResult = label("", size: 11, color: Palette.secondary)
+        lastResult.identifier = NSUserInterfaceItemIdentifier("home-cleanup-result")
+        homeCleanupResult = lastResult; fill(content, lastResult)
+        let statusCard = card(content, inset: 16)
+        statusCard.identifier = NSUserInterfaceItemIdentifier("model-status-card")
+        fill(pageStack, statusCard)
+    }
+
     private func metricValue(_ value: String, size: CGFloat = 32) -> NSTextField {
         let attributed = NSMutableAttributedString(string: value, attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .medium), .foregroundColor: Palette.ink])
         let expression = try! NSRegularExpression(pattern: "[0-9,，.]+|—")
@@ -666,10 +764,8 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     }
     private func renderEntry(_ entry: DictationEntry, into stack: NSStackView, raw: Bool, history: Bool) {
         let date = DateFormatter(); date.dateFormat = "M月d日 HH:mm"
-        // Equal text is a valid successful edit. Use the saved processing state,
-        // never a string comparison, to distinguish an edit from raw fallback.
-        let status = entry.cleanupApplied ? "已整理" : (entry.warning?.isEmpty == false ? "整理未完成，已保留原文" : "未应用整理")
-        let resultTitle = entry.cleanupApplied ? "整理结果" : "最终输出（未整理）"
+        let status = entry.cleanupResultDescription
+        let resultTitle = entry.cleanupResultTitle
         let timing = String(format: "识别 %.2f 秒  ·  整理 %.2f 秒  ·  总处理 %.2f 秒", entry.asrSeconds, entry.cleanupSeconds, entry.totalSeconds)
         let compared = history && historyMode == 2
         let comparison = "ASR 原文\n\(entry.rawText)\n\n\(resultTitle)\n\(entry.text)"

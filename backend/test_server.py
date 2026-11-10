@@ -830,7 +830,7 @@ class ASRBackendTests(unittest.TestCase):
             asr.mkdir(); editor.mkdir()
             for name in ("config.json", "model.safetensors", "weights.safetensors"):
                 (asr / name).touch()
-            (editor / "model.safetensors").touch()
+            (editor / "model.safetensors").write_bytes(b"inert fixture weights")
             for backend in ("whisper", "qwen"):
                 with self.subTest(backend=backend):
                     mx = MagicMock()

@@ -51,6 +51,13 @@ private struct ServiceHealth: Decodable {
     let supports_streaming: Bool?
     let accepts_streaming: Bool?
     let supports_reprocess: Bool?
+    let models: [String: String]?
+    var asrReadiness: DictationModelReadiness {
+        asr_ready ? .ready : status == "loading" ? .loading : .unavailable
+    }
+    var cleanupReadiness: DictationModelReadiness {
+        cleanup_ready ? .ready : status == "loading" ? .loading : .unavailable
+    }
     var permitsRecording: Bool {
         ready && asr_ready && supports_options == true &&
             (supports_streaming == true ? accepts_streaming == true : !busy)
@@ -431,6 +438,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
     private var serviceText = "正在准备本地识别服务…"
     private var serviceCanRecord = false
     private var serviceResponded = false
+    private var asrReadiness: DictationModelReadiness = .checking
+    private var cleanupReadiness: DictationModelReadiness = .checking
+    private var asrModel: String?
+    private var cleanupModel: String?
     private var cleanupBackend: DictationCleanupBackend?
     private var healthRequest: URLSessionDataTask?
     private var healthRetry: DispatchWorkItem?
@@ -1407,6 +1418,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
     private var displayState: DictationUIState {
         var state = DictationUIState()
         state.status = statusText; state.serviceMessage = serviceText; state.serviceReady = serviceCanRecord
+        state.asrReadiness = asrReadiness; state.cleanupReadiness = cleanupReadiness
+        state.asrModel = asrModel; state.cleanupModel = cleanupModel
         state.recording = phase == .recording; state.processing = phase == .processing
         state.cleanupEnabled = (activePreferences ?? store.preferences).cleanupEnabled
         state.cleanupBackend = cleanupBackend
@@ -1531,6 +1544,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         // Do not replace its model files or send signals to it.
         guard ownedBackend != nil || !serviceResponded else { completion(false); return }
         configuringModels = true; serviceCanRecord = false
+        asrReadiness = .loading; cleanupReadiness = .loading
         invalidateHealthCallbacks(); cancelPendingBackendLaunch()
         serviceText = "正在配置模型…"; updateUI()
         guard let child = ownedBackend, child.isRunning else {
@@ -1624,6 +1638,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         ownedBackend = nil
         closeBackendLog()
         serviceCanRecord = false
+        asrReadiness = .unavailable; cleanupReadiness = .unavailable
         cleanupBackend = nil
         target = nil
         targetChanged = true
@@ -1642,6 +1657,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         let id = UUID()
         backendLaunching = true; backendLaunchID = id
         serviceCanRecord = false
+        asrReadiness = .loading; cleanupReadiness = .loading
         cleanupBackend = nil
         serviceText = "正在准备本地服务…"
         updateUI()
@@ -1710,6 +1726,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         cancelPendingBackendLaunch()
         guard available else {
             if let log { backendIO.async { try? log.close() } }
+            asrReadiness = .unavailable; cleanupReadiness = .unavailable
             serviceText = "首次使用需要准备模型，请打开“模型与配置”。"
             updateUI()
             if bundledPython != nil && setupController == nil { showSetup() }
@@ -1751,6 +1768,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             if let log { backendIO.async { try? log.close() } }
             recordBackendLifecycle(event: "backend_launch_failed", pid: nil, reason: "launch_error", code: nil)
             serviceCanRecord = false
+            asrReadiness = .unavailable; cleanupReadiness = .unavailable
             serviceText = "无法启动本地服务，请检查安装是否完成后重试。"
             updateUI()
         }
@@ -1783,6 +1801,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             serviceResponded = true
             cancelPendingBackendLaunch()
             serviceCanRecord = health.permitsRecording
+            asrReadiness = health.asrReadiness; cleanupReadiness = health.cleanupReadiness
+            asrModel = health.models?["asr"]; cleanupModel = health.models?["cleanup"]
             cleanupBackend = health.cleanupBackend
             supportsPromptVersions = health.supports_prompt_versions == true
             supportsStreaming = health.supports_streaming == true
@@ -1809,28 +1829,33 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             }
             if health.status == "loading" || health.busy { scheduleHealthRefresh(after: 4) }
         } else if response != nil {
+            asrReadiness = .unavailable; cleanupReadiness = .unavailable
             serviceResponded = true
             cancelPendingBackendLaunch()
             serviceCanRecord = false
             serviceText = "本地服务端口已被其他程序占用，或服务协议不匹配。未改动该程序。"
         } else if (error as NSError?)?.code == NSURLErrorCannotConnectToHost {
+            asrReadiness = .unavailable; cleanupReadiness = .unavailable
             serviceResponded = false
             invalidatePromptCallbacks()
             serviceCanRecord = false
             if recoveryBudget.isPaused {
                 serviceText = "自动恢复已暂停。请点击“检查服务”重试。"
             } else if backendLaunching {
+                asrReadiness = .loading; cleanupReadiness = .loading
                 serviceText = "正在准备本地服务，请稍候…"
                 scheduleHealthRefresh(after: 2)
             } else if ownedBackend == nil { startBackend() }
             else if let ownedBackend, !ownedBackend.isRunning { handleBackendTermination(ownedBackend) }
             else {
+                asrReadiness = .loading; cleanupReadiness = .loading
                 serviceText = "正在启动本地服务并加载模型…"
                 scheduleHealthRefresh(after: 2)
             }
         } else {
             cancelPendingBackendLaunch()
             serviceCanRecord = false
+            asrReadiness = .unavailable; cleanupReadiness = .unavailable
             serviceText = "本地服务暂未响应。点击“检查服务”可重试。"
         }
         updateUI()
@@ -2132,6 +2157,58 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         controller.handleBackendTermination(currentChild)
         controller.receiveHealthReply(generation: controller.healthGeneration, data: ready, response: response, error: nil)
         precondition(controller.ownedBackend === currentChild && !controller.serviceCanRecord)
+    }
+
+    static func verifyModelHealthTransitions() {
+        let controller = AppDelegate()
+        let response = HTTPURLResponse(url: serviceBase, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        func reply(status: String, asr: Bool, cleanup: Bool) {
+            let data = Data("""
+            {"service":"local-dictation","status":"\(status)","ready":\(asr),"asr_ready":\(asr),"cleanup_ready":\(cleanup),"busy":false,"message":"fixture","supports_options":true,"models":{"asr":"fixture-asr","cleanup":"fixture-cleanup"}}
+            """.utf8)
+            controller.receiveHealthReply(generation: controller.healthGeneration, data: data, response: response, error: nil)
+        }
+        func assertStates(_ asr: DictationModelReadiness, _ cleanup: DictationModelReadiness) {
+            precondition(controller.displayState.asrReadiness == asr && controller.displayState.cleanupReadiness == cleanup)
+        }
+        reply(status: "ready", asr: true, cleanup: true)
+        assertStates(.ready, .ready)
+        precondition(controller.displayState.asrModel == "fixture-asr" && controller.displayState.cleanupModel == "fixture-cleanup")
+        reply(status: "loading", asr: false, cleanup: false)
+        assertStates(.loading, .loading)
+        controller.invalidateHealthCallbacks() // Keep the fixture off the real loopback service.
+        reply(status: "error", asr: false, cleanup: false)
+        assertStates(.unavailable, .unavailable)
+        reply(status: "degraded", asr: true, cleanup: false)
+        assertStates(.ready, .unavailable)
+        precondition(controller.serviceCanRecord)
+        reply(status: "ready", asr: true, cleanup: true)
+        controller.receiveHealthReply(generation: controller.healthGeneration, data: nil, response: nil,
+                                      error: NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut))
+        assertStates(.unavailable, .unavailable)
+        precondition(!controller.serviceCanRecord)
+        // A failed connection may normally start recovery. Pause only this
+        // in-memory fixture so no child process or model is reached by the test.
+        _ = controller.recoveryBudget.nextDelay(now: 1)
+        _ = controller.recoveryBudget.nextDelay(now: 2)
+        _ = controller.recoveryBudget.nextDelay(now: 3)
+        precondition(controller.recoveryBudget.isPaused)
+        reply(status: "ready", asr: true, cleanup: true)
+        let obsolete = controller.healthGeneration
+        controller.invalidateHealthCallbacks()
+        controller.receiveHealthReply(generation: controller.healthGeneration, data: nil, response: nil,
+                                      error: NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost))
+        assertStates(.unavailable, .unavailable)
+        let stale = Data("""
+        {"service":"local-dictation","status":"ready","ready":true,"asr_ready":true,"cleanup_ready":true,"busy":false,"message":"stale","supports_options":true}
+        """.utf8)
+        controller.receiveHealthReply(generation: obsolete, data: stale, response: response, error: nil)
+        assertStates(.unavailable, .unavailable)
+        reply(status: "ready", asr: true, cleanup: true)
+        assertStates(.ready, .ready)
+        controller.terminating = true; controller.invalidateHealthCallbacks()
+        precondition(controller.ownedBackend == nil && !controller.backendLaunching && controller.healthRequest == nil)
+        print("PASS model health lifecycle: ready→loading→load failure; ASR-only degradation; timeout/disconnect clear both ready states; stale replies rejected; recovery restores model identities. No real service contacted.")
     }
 
     static func verifyConfigurationGuards() throws {
@@ -2589,6 +2666,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         case nil: state.serviceMessage = "本地识别已就绪，整理方式待确认。"
         }
         state.serviceReady = true; state.canStart = true; state.microphoneAllowed = true; state.accessibilityAllowed = true
+        state.asrReadiness = .ready; state.cleanupReadiness = .ready
+        state.asrModel = "Qwen3-ASR-1.7B-8bit"
+        state.cleanupModel = "Qwen3-4B-Instruct-2507-4bit"
         state.lastEntryID = store.entries.first?.id; state.preview = true
         state.functionKeyMessage = "Fn 已启用（界面预览）"
         state.functionKeyEnabled = true
@@ -2831,14 +2911,22 @@ private func selfTest() throws {
     {"service":"local-dictation","status":"loading","ready":false,"asr_ready":false,"cleanup_ready":false,"busy":false,"message":"loading models","models":{}}
     """.utf8))
     precondition(!loading.asr_ready && loading.supports_options == nil && !loading.permitsRecording)
+    precondition(loading.asrReadiness == .loading && loading.cleanupReadiness == .loading)
     let degraded = try JSONDecoder().decode(ServiceHealth.self, from: Data("""
     {"service":"local-dictation","status":"degraded","ready":true,"asr_ready":true,"cleanup_ready":false,"busy":false,"message":"cleanup unavailable","models":{},"supports_options":true}
     """.utf8))
     precondition(degraded.asr_ready && !degraded.cleanup_ready && degraded.permitsRecording)
+    precondition(degraded.asrReadiness == .ready && degraded.cleanupReadiness == .unavailable)
     let oldService = try JSONDecoder().decode(ServiceHealth.self, from: Data("""
     {"service":"local-dictation","status":"ready","ready":true,"asr_ready":true,"cleanup_ready":true,"busy":false,"message":"ready"}
     """.utf8))
     precondition(oldService.ready && !oldService.permitsRecording)
+    precondition(oldService.asrReadiness == .ready && oldService.cleanupReadiness == .ready && oldService.models == nil)
+    let namedModels = try JSONDecoder().decode(ServiceHealth.self, from: Data("""
+    {"service":"local-dictation","status":"ready","ready":true,"asr_ready":true,"cleanup_ready":true,"busy":true,"message":"busy","supports_options":true,"models":{"asr":"ASR-fixture","cleanup":"Qwen-fixture"}}
+    """.utf8))
+    precondition(!namedModels.permitsRecording && namedModels.asrReadiness == .ready && namedModels.cleanupReadiness == .ready)
+    precondition(namedModels.models?["asr"] == "ASR-fixture" && namedModels.models?["cleanup"] == "Qwen-fixture")
     precondition(oldService.cleanup_backend == nil && oldService.cleanupBackend == .local)
     let cloudFixture = """
     {"service":"local-dictation","status":"ready","ready":true,"asr_ready":true,"cleanup_ready":true,"busy":false,"message":"configured","supports_options":true,"cleanup_backend":"cloud"}
@@ -2871,6 +2959,7 @@ private func selfTest() throws {
     precondition(recovery.nextDelay(now: 500) == 1)
     precondition(recovery.nextDelay(now: 560) == 1)
     AppDelegate.verifyLateRecoveryCallbacks()
+    AppDelegate.verifyModelHealthTransitions()
     try AppDelegate.verifyConfigurationGuards()
     try AppDelegate.verifyPromptSnapshots()
     try AppDelegate.verifyUploadFailureRecovery()

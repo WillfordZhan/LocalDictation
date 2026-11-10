@@ -16,11 +16,13 @@ class Tokenizer:
     def __init__(self, divergent=False, mismatch=False):
         self.divergent = divergent
         self.mismatch = mismatch
+        self.template_calls = []
 
     def encode(self, text):
         return list(text.encode())
 
-    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, enable_thinking=True):
+        self.template_calls.append((add_generation_prompt, enable_thinking))
         text = "".join(f"<{m['role']}>{m['content']}</end>" for m in messages)
         if not add_generation_prompt and self.divergent:
             # Like templates that give the last example a special think marker.
@@ -28,6 +30,8 @@ class Tokenizer:
             text = text[:index] + "<think>" + text[index:]
         if not add_generation_prompt and self.mismatch:
             text = "!" + text
+        if enable_thinking:
+            text = "<thinking-mode>" + text
         return self.encode(text + ("<assistant>" if add_generation_prompt else ""))
 
 
@@ -86,7 +90,13 @@ class CleanupCacheTests(unittest.TestCase):
 
     def full_prompt(self, text, options=None):
         return self.models.tokenizer.apply_chat_template(cleanup_messages(text, options or self.options),
-                                                        tokenize=True, add_generation_prompt=True)
+                                                        tokenize=True, add_generation_prompt=True, enable_thinking=False)
+
+    def test_full_request_and_cached_prefix_explicitly_disable_thinking(self):
+        self.models.cleanup("private", self.options)
+        self.assertEqual(self.models.tokenizer.template_calls, [(True, False), (False, False)])
+        self.assertEqual(self.generations[-1]["tokens"], self.full_prompt("private"))
+        self.assertNotIn(b"<thinking-mode>", bytes(self.generations[-1]["tokens"]))
 
     def test_reuse_keeps_identical_request_and_only_fixed_state(self):
         for raw in ["first private sentence", "different later sentence"]:

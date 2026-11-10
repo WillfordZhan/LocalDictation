@@ -76,6 +76,64 @@ enum DictationUIChecks {
         }
     }
 
+    static func modelStatusChecks() throws {
+        let store = DictationStore(memoryOnly: true)
+        let controller = DictationWindowController(store: store, sessionStartedAt: Date())
+        let root = controller.window!.contentView!
+        defer { controller.window?.close() }
+        store.onChange = { [weak controller] in controller?.reloadStore() }
+        func field(_ id: String) -> NSTextField {
+            descendants(root).compactMap { $0 as? NSTextField }.first { $0.identifier?.rawValue == id }!
+        }
+        var state = DictationUIState()
+        state.functionKeySelected = false; state.accessibilityAllowed = true
+        state.asrModel = "Qwen3-ASR-1.7B-8bit"; state.cleanupModel = "Qwen3-4B-Instruct-2507-4bit"
+        state.asrReadiness = .loading; state.cleanupReadiness = .loading
+        controller.updateState(state)
+        try require(field("sidebar-asr-status").stringValue == "ASR · 加载中" && field("sidebar-cleanup-status").stringValue == "润色 · 加载中", "Loading must describe both models independently")
+        state.serviceReady = true; state.asrReadiness = .ready; state.cleanupReadiness = .unavailable
+        controller.updateState(state)
+        try require(field("sidebar-asr-status").stringValue == "ASR · 已就绪" && field("sidebar-cleanup-status").stringValue == "润色 · 不可用", "Recording readiness masked cleanup failure")
+        try require(field("home-asr-status").stringValue == "已就绪" && field("home-cleanup-status").stringValue == "不可用", "Home lost independent readiness")
+        state.cleanupReadiness = .ready; state.serviceReady = false
+        state.cleanupBackend = .local; state.serviceMessage = "后台正在处理，可以继续口述。"
+        controller.updateState(state)
+        try require(field("sidebar-asr-status").stringValue == "ASR · 已就绪" && field("sidebar-cleanup-status").stringValue == "润色 · 已就绪", "Temporary recording admission must not claim either model is unloaded")
+        store.updatePreferences { $0.cleanupEnabled = false }
+        try require(field("sidebar-cleanup-status").stringValue == "润色 · 已关闭" && field("home-cleanup-status").stringValue == "已关闭", "Disabled cleanup was shown as enabled because its model is loaded")
+        store.updatePreferences { $0.cleanupEnabled = true }
+        let unchanged = store.add(rawText: "这是一条未改动的原文。", text: "这是一条未改动的原文。",
+                                  asrSeconds: 0.3, cleanupSeconds: 1.2, totalSeconds: 1.5,
+                                  audioSeconds: 3, cleanupApplied: true, warning: nil)
+        try require(field("home-cleanup-result").stringValue == "最近润色：已调用 · 文本未变 · 1.20 秒", "No-op model response is hidden or mislabeled as skipped")
+        for size in [NSSize(width: 1000, height: 700), NSSize(width: 1400, height: 900)] {
+            controller.window?.setContentSize(size); root.layoutSubtreeIfNeeded()
+            let left = field("home-asr-status"); let right = field("home-cleanup-status")
+            let leftRect = left.convert(left.bounds, to: root); let rightRect = right.convert(right.bounds, to: root)
+            try require(leftRect.maxX < rightRect.minX && abs(leftRect.midY - rightRect.midY) < 1, "Model status columns overlap or lose baseline alignment")
+            if let index = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.arguments.indices.contains(index + 1) {
+                let directory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try controller.renderPNG(to: directory.appendingPathComponent("model-status-\(Int(size.width))x\(Int(size.height)).png"))
+            }
+        }
+        controller.showPage(.history)
+        try require(descendants(root).compactMap { $0 as? NSTextField }.contains { $0.stringValue.contains(unchanged.cleanupResultDescription) }, "History hides unchanged cleanup outcome")
+        controller.showPage(.home)
+        let failed = store.add(rawText: "保留的原文", text: "保留的原文", asrSeconds: 0.3, cleanupSeconds: 3,
+                               totalSeconds: 3.3, audioSeconds: 3, cleanupApplied: false, warning: "模型响应超时")
+        try require(field("home-cleanup-result").stringValue == "最近润色：整理未完成，已保留原文", "Loaded model masks last-call failure")
+        try require(field("home-cleanup-result").toolTip == failed.warning, "Last-call diagnostic is unavailable")
+        store.add(rawText: "嗯，测试。", text: "测试。", asrSeconds: 0.3, cleanupSeconds: 0.8,
+                  totalSeconds: 1.1, audioSeconds: 3, cleanupApplied: true, warning: nil)
+        try require(field("home-cleanup-result").stringValue == "最近润色：已调用 · 文本已修改 · 0.80 秒", "Latest successful return did not replace prior failure")
+        state.asrReadiness = .unavailable; state.cleanupReadiness = .unavailable
+        controller.updateState(state)
+        try require(field("sidebar-asr-status").stringValue == "ASR · 不可用" && field("sidebar-cleanup-status").stringValue == "润色 · 不可用", "Service outage retained false ready state")
+        try require(!controller.window!.isVisible && store.storageDirectory == nil, "Readiness checks escaped memory-only invisible fixture")
+        print("PASS model status: independent ASR/cleanup loading, degraded, loaded/busy, disabled and unavailable states; current model names; recent edited/unchanged/fallback outcomes; history unchanged disclosure; 1000/1400 point layout.")
+    }
+
     static func learningChecks() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("dictation-learning-ui-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -466,7 +524,7 @@ enum DictationUIChecks {
         let pair = "ASR 原文\n\(first.rawText)\n\n整理结果\n\(first.text)"
         try require(containsText(pair, in: root), "Comparison changed or omitted a stored result")
         try click("复制对照", in: root)
-        try require(copies.count == 2 && copies.last!.contains(pair) && copies.last!.contains("已整理") && copies.last!.contains("识别 0.20 秒"), "Comparison copy omitted text, status or timing")
+        try require(copies.count == 2 && copies.last!.contains(pair) && copies.last!.contains("已调用 · 文本已修改") && copies.last!.contains("识别 0.20 秒"), "Comparison copy omitted text, status or timing")
         let restoredSegments = descendants(root).compactMap { $0 as? NSSegmentedControl }.first!
         restoredSegments.selectedSegment = 1
         try sendAction(restoredSegments)
@@ -495,7 +553,7 @@ enum DictationUIChecks {
 
         // Two equal fields can mean fallback, disabled editing or a successful
         // no-op edit. Preserve the saved status instead of guessing from text.
-        for (applied, warning, expected) in [(false, Optional("文字整理未完成，已保留原始转写。"), "整理未完成，已保留原文"), (false, nil, "未应用整理"), (true, nil, "已整理")] {
+        for (applied, warning, expected) in [(false, Optional("文字整理未完成，已保留原始转写。"), "整理未完成，已保留原文"), (false, nil, "未应用整理"), (true, nil, "已调用 · 文本未变")] {
             let entry = store.add(rawText: "保留原文", text: "保留原文", asrSeconds: 0.2, cleanupSeconds: 0,
                 totalSeconds: 0.2, audioSeconds: 2, cleanupApplied: applied, warning: warning)
             try click("历史记录", in: root)
@@ -503,7 +561,7 @@ enum DictationUIChecks {
             segment.selectedSegment = 2; try sendAction(segment)
             try click("复制对照", in: root)
             try require(copies.last!.contains(expected), "Comparison fabricated processing state")
-            try require(copies.last!.contains(applied ? "整理结果\n保留原文" : "最终输出（未整理）\n保留原文"), "Fallback shown as model output")
+            try require(copies.last!.contains(applied ? "模型输出（文本未变）\n保留原文" : "最终输出（未整理）\n保留原文"), "Fallback shown as model output")
             store.delete(id: entry.id)
         }
 
@@ -533,6 +591,7 @@ enum DictationUIChecks {
         try require(controller.window?.isVisible == false, "UI checks unexpectedly showed a window")
         try require(store.storageError == nil, "Unexpected memory-only storage error")
         try learningChecks()
+        try modelStatusChecks()
         print("PASS: invisible AppKit controls; independent Fn readiness and permission callbacks; navigation scroll reset; sidebar navigation; dictionary edit/add/delete; cleanup and auto-insert switches; language popup; history selection/raw/copy/search/delete; empty home synchronization.")
         print("LIMIT: destructive clear/retention modal and shortcut capture were not invoked. Copy was intercepted before clipboard access. No AppDelegate, model, microphone, global key listener, or production preferences were used.")
     }
