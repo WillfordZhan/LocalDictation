@@ -35,6 +35,36 @@ enum HeatmapHoverChecks {
     static func hover(_ map: DictationActivityHeatmap, cell: DictationActivityHeatmap.Cell) throws {
         try move(map, at: NSPoint(x: cell.rect.midX, y: cell.rect.midY))
     }
+    static func revealAndHover(_ map: DictationActivityHeatmap, date: Date) throws {
+        guard let root = map.window?.contentView, let clip = map.enclosingScrollView?.contentView,
+              let target = map.cells.first(where: { $0.date == date }) else { throw NSError(domain: "HomeHoverFixture", code: 1) }
+        // Scrolling can finish in a later AppKit run-loop pass. A bounds/frame
+        // change correctly dismisses the tooltip, so the mouse event must
+        // target a settled viewport rather than race deferred scroll completion.
+        // Reveal the actual target, then require stable viewport geometry before
+        // sending one mouse event. Do not retry mouse events to mask dismissal.
+        map.scrollToVisible(target.rect.insetBy(dx: -4, dy: -4))
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        var previous: [NSRect] = [], stableSince = ProcessInfo.processInfo.systemUptime
+        var visibleCell: DictationActivityHeatmap.Cell?
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            map.window?.layoutIfNeeded(); root.layoutSubtreeIfNeeded(); map.layoutSubtreeIfNeeded()
+            guard let cell = map.cells.first(where: { $0.date == date }) else { break }
+            let geometry = [root.bounds, map.frame, map.bounds, clip.bounds, map.convert(cell.rect, to: root)]
+            let now = ProcessInfo.processInfo.systemUptime
+            if geometry != previous { previous = geometry; stableSince = now }
+            if map.visibleRect.contains(cell.rect), now - stableSince >= 0.10 { visibleCell = cell; break }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        try require(visibleCell != nil, "Home hover target did not settle in viewport: map=\(map.frame) visible=\(map.visibleRect) clip=\(clip.bounds)")
+        try hover(map, cell: visibleCell!)
+        // Timing fidelity is covered by DictationMotionTests. This integration
+        // check waits for the queued UI result without weakening its contents.
+        let hoverDeadline = ProcessInfo.processInfo.systemUptime + 1
+        while card(in: root) == nil && ProcessInfo.processInfo.systemUptime < hoverDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+    }
     static func leave(_ map: DictationActivityHeatmap) throws {
         guard let window = map.window,
               let event = NSEvent.enterExitEvent(with: .mouseExited, location: .zero, modifierFlags: [], timestamp: 0,
@@ -152,10 +182,9 @@ enum HeatmapHoverChecks {
         state.functionKeyEnabled = true; state.accessibilityAllowed = true; state.microphoneAllowed = true
         controller.updateState(state); prepare(appRoot)
         let homeMap = descendants(appRoot).compactMap { $0 as? DictationActivityHeatmap }.first!
-        homeMap.scrollToVisible(homeMap.bounds); prepare(appRoot)
         let latest = homeMap.cells.first { $0.count > 100 }!
-        try hover(homeMap, cell: latest)
-        try require(contents(in: appRoot).contains("1,000 字"), "Home hover did not display its daily statistics")
+        try revealAndHover(homeMap, date: latest.date)
+        try require(contents(in: appRoot).contains("1,000 字"), "Home hover did not display its daily statistics: contents=\(contents(in: appRoot)), map=\(homeMap.frame), visible=\(homeMap.visibleRect), target=\(latest.rect)")
         try require(appRoot.bounds.insetBy(dx: 10, dy: 10).contains(card(in: appRoot)!.frame), "Home hover escaped viewport")
         try screenshot(appRoot, name: "home-hover-1000.png")
         let previous = descendants(appRoot).compactMap { $0 as? NSButton }.first { $0.toolTip == "查看前 26 周" }!
@@ -163,8 +192,7 @@ enum HeatmapHoverChecks {
         previous.performClick(nil); prepare(appRoot)
         try require(card(in: appRoot) == nil, "Page change retained previous date's overlay")
         let priorMap = descendants(appRoot).compactMap { $0 as? DictationActivityHeatmap }.first!
-        priorMap.scrollToVisible(priorMap.bounds); prepare(appRoot)
-        try hover(priorMap, cell: priorMap.cells.last!)
+        try revealAndHover(priorMap, date: priorMap.cells.last!.date)
         try require(!contents(in: appRoot).contains("1,000 字") && card(in: appRoot) != nil, "Prior page hover reused current statistics")
         guard let outer = appRoot.subviews.compactMap({ $0 as? NSScrollView }).first else { throw NSError(domain: "Scroll", code: 1) }
         let oldOrigin = outer.contentView.bounds.origin
