@@ -137,6 +137,25 @@ enum HistoryReprocessClientTests {
             let value = valid.merging(modification) { _, replacement in replacement }
             if case .success = call(.http(200, try JSONSerialization.data(withJSONObject: value))) { preconditionFailure("Accepted invalid or unapplied result") }
         }
+        for status in ["unchanged", "suspected_insufficient", "future_status"] {
+            let value = valid.merging(["cleanup_outcome": ["status": status, "reason": "fixture_reason"]]) { _, replacement in replacement }
+            let decoded = try call(.http(200, try JSONSerialization.data(withJSONObject: value))).get()
+            precondition(decoded.cleanup_outcome?.status == status && decoded.cleanup_outcome?.reason == "fixture_reason")
+        }
+        for status in ["failed", "skipped"] {
+            for applied in [true, false] {
+                let outcome = ["status": status, "reason": "invalid_model_output", "error_type": "CleanupOutputError"]
+                let value = valid.merging(["cleanup_applied": applied, "cleanup_outcome": outcome]) { _, replacement in replacement }
+                switch call(.http(200, try JSONSerialization.data(withJSONObject: value))) {
+                case .success: preconditionFailure("A failed/skipped attempt became a successful history revision")
+                case .failure(let error):
+                    let detail = (error as NSError).userInfo
+                    precondition(detail["cleanup_outcome_status"] as? String == status)
+                    precondition(detail["cleanup_outcome_reason"] as? String == "invalid_model_output")
+                    precondition(detail["cleanup_outcome_error_type"] as? String == "CleanupOutputError")
+                }
+            }
+        }
         for status in [400, 409, 503] {
             if case .success = call(.http(status, Data("{\"error\":\"fixture unavailable\"}".utf8))) { preconditionFailure() }
             precondition(HistoryStubProtocol.requests().count == 1)

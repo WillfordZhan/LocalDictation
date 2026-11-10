@@ -228,6 +228,69 @@ class PromptStoreTests(unittest.TestCase):
         self.assertEqual(self.primary.read_bytes(), old_bytes)
         self.assertEqual(len(loaded.versions), 2)
 
+    def test_note_only_reimport_preserves_saved_metadata_without_writes(self):
+        active = self.store.resolve()
+        original = PromptVersion.create(
+            {**draft("旧规则"), "note": "首次导入时保存的详细说明。"}, "older-model",
+            version_id="import-note-only", origin="imported", created_at="2026-10-30T10:00:00Z")
+        self.store.import_versions([original.as_dict()])
+        before = self.primary.read_bytes()
+        snapshot = {**original.as_dict(), "note": "新版安装包中的简短说明。"}
+        manifest = {key: value for key, value in snapshot.items()
+                    if key not in ("created_at", "content_sha256")}
+        with patch.object(self.store, "_persist") as persist:
+            self.store.import_versions([snapshot])
+            self.store.import_versions([manifest])
+            persist.assert_not_called()
+        self.assertEqual(self.store.resolve(original.id), original)
+        self.assertEqual(self.store.resolve(), active)
+        self.assertEqual(len(self.store.versions), 2)
+        self.assertEqual(self.primary.read_bytes(), before)
+        self.assertEqual(self.backup.read_bytes(), before)
+        self.assertEqual(self.reload().resolve(original.id), original)
+
+    def test_note_difference_does_not_hide_content_or_other_metadata_conflicts(self):
+        original = PromptVersion.create(draft("旧规则"), "older-model", version_id="import-conflict",
+                                       origin="imported", created_at="2026-10-30T10:00:00Z")
+        self.store.import_versions([original.as_dict()])
+        active = self.store.resolve()
+        before = self.primary.read_bytes()
+        changes = {
+            "name": "另一个名称",
+            "system_prompt": "不同的正文编辑规则。",
+            "user_prefix": "不同的素材前缀：",
+            "examples": [{"source": "嗯，继续。", "edited": "继续。"}],
+            "model_id": "different-model",
+            "origin": "user",
+            "created_at": "2026-10-31T10:00:00Z",
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                changed = {**original.as_dict(), "note": "仅说明已更新", field: value}
+                # Valid hashes must not let changed editing content bypass the
+                # immutable version check; metadata conflicts are separate too.
+                candidate = PromptVersion.create(
+                    {key: changed[key] for key in ("name", "note", "system_prompt", "user_prefix", "examples")},
+                    changed["model_id"], version_id=changed["id"], origin=changed["origin"],
+                    created_at=changed["created_at"])
+                with patch.object(self.store, "_persist") as persist:
+                    with self.assertRaises(PromptValidationError):
+                        self.store.import_versions([candidate.as_dict()])
+                    persist.assert_not_called()
+                self.assertEqual(self.store.resolve(original.id), original)
+                self.assertEqual(self.store.resolve(), active)
+                self.assertEqual(self.primary.read_bytes(), before)
+                self.assertEqual(self.backup.read_bytes(), before)
+
+    def test_note_only_reimport_still_revalidates_content_hash(self):
+        original = self.store.resolve()
+        changed = {**original.as_dict(), "note": "新版说明", "system_prompt": "未重新计算校验值的内容"}
+        with patch.object(self.store, "_persist") as persist:
+            with self.assertRaisesRegex(PromptValidationError, "内容校验不一致"):
+                self.store.import_versions([changed])
+            persist.assert_not_called()
+        self.assertEqual(self.store.resolve(), original)
+
     def test_temporary_cleanup_failure_does_not_reverse_a_successful_commit(self):
         actual_unlink = Path.unlink
         def fail_temporary_cleanup(path, **kwargs):

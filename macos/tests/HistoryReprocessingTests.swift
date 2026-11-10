@@ -114,6 +114,11 @@ enum HistoryReprocessingTests {
         _ = store.addRevision(entryID: stored.id, text: first.text, cleanupSeconds: 2.4, cleanupProfile: alternateProfile)
         controller.reloadStore(); controller.updateReprocessing(entryID: stored.id, busy: false, error: nil)
         try require(field(opened, "resultText", NSTextView.self)?.string == first.text, "Saved revision did not reach an already-open comparison")
+        let notificationRevision = store.addRevision(entryID: stored.id, text: second.text, cleanupSeconds: 1, cleanupProfile: originalProfile)!
+        controller.reloadStore()
+        pick(field(opened, "resultPicker", NSPopUpButton.self)!, 1)
+        controller.showReprocessing(entryID: stored.id, revisionID: notificationRevision.id, show: false)
+        try require(field(opened, "resultText", NSTextView.self)?.string == second.text, "Notification reopened a retained sheet on an older revision")
         try require(store.entries.count == 1 && store.entries[0].text == originalText, "Sheet integration replaced original history")
         try require(controller.window?.isVisible == false && opened.window?.isVisible == false, "Integration test stole application focus")
 

@@ -7,6 +7,7 @@ struct HistoryReprocessResult: Decodable {
     let cleanup_applied: Bool
     let warning: String?
     let cleanup_profile: DictationCleanupProfile?
+    var cleanup_outcome: DictationCleanupOutcome? = nil
 }
 
 /// Explicit text-only request to the existing loopback worker. There is no
@@ -49,8 +50,8 @@ final class HistoryReprocessClient {
                         throw Self.failure(object?["error"] as? String ?? "重新整理失败，请检查本地服务。")
                     }
                     let value = try JSONDecoder().decode(HistoryReprocessResult.self, from: data)
-                    guard value.cleanup_applied else {
-                        throw Self.failure(value.warning ?? "本次整理未完成，原记录仍保留。")
+                    guard value.cleanup_applied, !["failed", "skipped"].contains(value.cleanup_outcome?.status ?? "") else {
+                        throw Self.failure(value.warning ?? "本次整理未完成，原记录仍保留。", outcome: value.cleanup_outcome)
                     }
                     guard value.raw_text == rawText, value.cleanup_profile?.versionID == versionID,
                           !value.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -70,7 +71,15 @@ final class HistoryReprocessClient {
             return nil
         }
     }
-    private static func failure(_ message: String) -> NSError {
-        NSError(domain: "HistoryReprocess", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    private static func failure(_ message: String, outcome: DictationCleanupOutcome? = nil) -> NSError {
+        var detail: [String: Any] = [NSLocalizedDescriptionKey: message]
+        // Keep the worker's failure category for diagnostics even though a
+        // failed attempt must not create a successful history revision.
+        if let outcome {
+            detail["cleanup_outcome_status"] = outcome.status
+            detail["cleanup_outcome_reason"] = outcome.reason
+            detail["cleanup_outcome_error_type"] = outcome.errorType
+        }
+        return NSError(domain: "HistoryReprocess", code: 1, userInfo: detail)
     }
 }

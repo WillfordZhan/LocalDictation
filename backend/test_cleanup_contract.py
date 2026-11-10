@@ -1,4 +1,5 @@
 """Final-text protocol tests; no local model, personal text or clipboard access."""
+import hashlib
 import http.client
 from http.server import ThreadingHTTPServer
 import io
@@ -12,10 +13,11 @@ from unittest.mock import Mock, patch
 import uuid
 import wave
 
-from prompt_store import PromptVersion
-from server import (CLEANUP_OUTPUT_CONTRACT, DictationOptions, DictationService,
-                    LocalModels, cleanup_messages, light_edit, make_handler,
-                    parse_cleanup_output)
+from prompt_store import PromptStoreError, PromptVersion
+from server import (CLEANUP_OUTPUT_CONTRACT, MAX_CLEANUP_COMPARISON_CHARACTERS,
+                    CleanupCompletionLimitError, CleanupEmptyOutputError, CleanupOutputError,
+                    DictationOptions, DictationService, LocalModels, cleanup_change_outcome,
+                    cleanup_messages, edit_with_outcome, light_edit, make_handler, parse_cleanup_output)
 
 
 def model_fixture():
@@ -118,6 +120,136 @@ class CleanupContractTests(unittest.TestCase):
         generator.assert_called_once()
 
 
+class CleanupOutcomeTests(unittest.TestCase):
+    long_source = (
+        "我们先确认各个房间的照明和插座，再核对厨房设备的尺寸以及预留位置。"
+        "客厅的灯光需要支持调节亮度，卧室则应避免光线直射床头。"
+        "这些事项本周只做现场测量，还没有确定最终的采购清单。"
+        "如果厨房的管线需要重新布置，请先提供估价，不要直接施工。"
+        "另外，入户门的颜色还没有决定，我们会在看过样板以后再讨论。"
+    )
+
+    def test_identical_output_is_completed_but_neutrally_reported_even_when_short(self):
+        for raw, edited in (("可以。", "可以。"), ("  暂时不要删除。\n", "暂时不要删除。")):
+            generator = Mock(return_value=edited)
+            text, applied, warning, outcome = edit_with_outcome(raw, generator)
+            self.assertEqual(text, edited)
+            self.assertTrue(applied)
+            self.assertIsNone(warning)
+            self.assertEqual(outcome, {"status": "unchanged", "reason": "identical"})
+            generator.assert_called_once_with(raw)
+
+    def test_near_identical_long_output_is_a_notice_not_failure_or_replacement(self):
+        # A one-word change may be the only necessary edit. The heuristic must
+        # never discard it, claim semantic failure or automatically retry.
+        edited = self.long_source.replace("本周", "下周")
+        generator = Mock(return_value=edited)
+        text, applied, warning, outcome = edit_with_outcome(self.long_source, generator)
+        self.assertEqual(text, edited)
+        self.assertTrue(applied)
+        self.assertIsNone(warning)
+        self.assertEqual(outcome, {"status": "suspected_insufficient", "reason": "near_identical"})
+        generator.assert_called_once()
+
+    def test_whitespace_changes_do_not_hide_a_near_identical_long_output(self):
+        self.assertEqual(cleanup_change_outcome(self.long_source, "\n".join(self.long_source.split("。"))),
+                         {"status": "suspected_insufficient", "reason": "near_identical"})
+
+    def test_short_changed_text_and_substantial_long_edit_have_no_suspicion(self):
+        cases = (("明天三点开会。", "明天四点开会。"),
+                 (self.long_source, "先测量房间和厨房，再确认灯光、设备和管线方案。"))
+        for raw, edited in cases:
+            self.assertEqual(cleanup_change_outcome(raw, edited),
+                             {"status": "applied", "reason": "changed"})
+
+    def test_similarity_cost_is_bounded_without_truncating_returned_text(self):
+        raw = "文" * (MAX_CLEANUP_COMPARISON_CHARACTERS + 1)
+        edited = raw + "末尾仍须保留。"
+        with patch("server.SequenceMatcher", side_effect=AssertionError("oversized diff")):
+            text, applied, _, outcome = edit_with_outcome(raw, lambda _: edited)
+            self.assertEqual(text, edited)
+            self.assertTrue(applied)
+            self.assertEqual(outcome["status"], "applied")
+            self.assertEqual(cleanup_change_outcome(raw, raw)["status"], "unchanged")
+
+    def test_common_characters_are_not_treated_as_noise_in_near_copy_detection(self):
+        raw = "这段内容仍然需要保留，只有最后的时间需要调整。" * 20
+        edited = raw[:-3] + "确认。"
+        self.assertEqual(cleanup_change_outcome(raw, edited)["status"], "suspected_insufficient")
+
+    def test_dense_repetition_cannot_force_expensive_diff_or_discard_output(self):
+        raw = "文" * 4096
+        edited = "甲" + raw[1:]
+        with patch("server.SequenceMatcher", side_effect=AssertionError("dense comparison")):
+            text, applied, _, outcome = edit_with_outcome(raw, lambda _: edited)
+        self.assertEqual(text, edited)
+        self.assertTrue(applied)
+        self.assertEqual(outcome["status"], "applied")
+
+    def test_empty_transcript_is_skipped_without_model_request(self):
+        generate = Mock()
+        self.assertEqual(edit_with_outcome(" \n ", generate),
+                         ("", False, None, {"status": "skipped", "reason": "empty_transcript"}))
+        generate.assert_not_called()
+
+    def test_failures_preserve_exact_raw_and_only_expose_categories_and_types(self):
+        private = "PRIVATE_EXCEPTION_TRANSCRIPT_SENTINEL"
+        errors = ((TimeoutError(private), "timeout"),
+                  (CleanupCompletionLimitError(private), "completion_limit"),
+                  (CleanupOutputError(private), "invalid_output"),
+                  (CleanupEmptyOutputError(private), "empty_output"),
+                  (MemoryError(private), "inference_error"))
+        raw = "  先不要发布，确认以后再说。\n"
+        for error, reason in errors:
+            with self.subTest(reason=reason), self.assertLogs("local-dictation", level="ERROR") as logs:
+                generate = Mock(side_effect=error)
+                text, applied, warning, outcome = edit_with_outcome(raw, generate)
+            self.assertEqual(text, raw)
+            self.assertFalse(applied)
+            self.assertTrue(warning)
+            self.assertEqual(outcome, {"status": "failed", "reason": reason,
+                                       "error_type": type(error).__name__})
+            self.assertNotIn(private, "\n".join(logs.output))
+            generate.assert_called_once_with(raw)
+
+    def test_actual_adapter_distinguishes_timeout_limit_empty_and_invalid_output(self):
+        cases = (("not JSON", None, None, "invalid_output", "CleanupOutputError"),
+                 ('{"text":""}', None, None, "empty_output", "CleanupEmptyOutputError"),
+                 ("", None, None, "empty_output", "CleanupEmptyOutputError"),
+                 ('{"text":"尚未完成"}', "length", None, "completion_limit", "CleanupCompletionLimitError"),
+                 ('{"text":"尚未完成"}', None, [10, 10, 41], "timeout", "TimeoutError"))
+        for output, finish, times, reason, error_type in cases:
+            with self.subTest(reason=reason, output=output):
+                response = SimpleNamespace(text=output, generation_tokens=1, finish_reason=finish)
+                generator = Mock(side_effect=lambda *args, **kwargs: iter([response]))
+                model = model_fixture()
+                timing = patch("server.time.monotonic", side_effect=times) if times else patch("server.time.monotonic", return_value=10)
+                with inference_modules(generator), timing:
+                    text, applied, _, outcome = edit_with_outcome("检查灯光。", model.cleanup)
+                self.assertEqual(text, "检查灯光。")
+                self.assertFalse(applied)
+                self.assertEqual(outcome, {"status": "failed", "reason": reason, "error_type": error_type})
+                generator.assert_called_once()
+
+    def test_request_log_proves_selected_profile_without_logging_private_content(self):
+        private = "PRIVATE_PROMPT_AND_TRANSCRIPT_SENTINEL"
+        profile = PromptVersion.create({"name": "fixture", "note": "", "system_prompt": private,
+            "user_prefix": "请编辑：", "examples": []}, "fixture-editor")
+        options = DictationOptions(cleanup_profile=profile)
+        model = model_fixture()
+        generator = Mock(side_effect=lambda *args, **kwargs: response_chunks('{"text":"请检查。"}'))
+        with inference_modules(generator), self.assertLogs("local-dictation", level="INFO") as logs:
+            model.cleanup(private, options)
+        logged = "\n".join(logs.output)
+        system_hash = hashlib.sha256((private + "\n\n" + CLEANUP_OUTPUT_CONTRACT).encode()).hexdigest()
+        for expected in ("model_id=fixture-editor", "prompt_version=" + profile.id,
+                         "profile_sha256=" + profile.content_sha256, "system_sha256=" + system_hash,
+                         "messages=2", "input_chars=" + str(len(private)), "prompt_tokens=3"):
+            self.assertIn(expected, logged)
+        self.assertNotIn(private, logged)
+        generator.assert_called_once()
+
+
 class CleanupContractHTTPTests(unittest.TestCase):
     def setUp(self):
         self.raw = "嗯，任务列表先保留，时间轴还没决定。"
@@ -157,6 +289,68 @@ class CleanupContractHTTPTests(unittest.TestCase):
             return response.status, json.loads(response.read())
         finally:
             client.close()
+
+    def test_outcome_contract_is_shared_by_recording_stream_and_reprocess(self):
+        long_raw = CleanupOutcomeTests.long_source
+        cases = ((self.raw, json.dumps({"text": self.body}), "applied", "changed", True),
+                 (self.raw, json.dumps({"text": self.raw}), "unchanged", "identical", True),
+                 (long_raw, json.dumps({"text": long_raw.replace("本周", "下周")}),
+                  "suspected_insufficient", "near_identical", True),
+                 (self.raw, "not JSON", "failed", "invalid_output", False),
+                 (self.raw, '{"text":""}', "failed", "empty_output", False))
+        for route in ("recording", "stream", "history"):
+            for raw, wire, outcome, reason, applied in cases:
+                with self.subTest(route=route, outcome=outcome, reason=reason):
+                    self.raw = raw; self.output = wire
+                    self.models.transcribe.return_value = raw
+                    self.models.transcribe_segment.return_value = (raw, 4)
+                    before = self.generator.call_count
+                    status, result = self.complete(route)
+                    self.assertEqual(status, 200, result)
+                    self.assertEqual(result["cleanup_outcome"]["status"], outcome)
+                    self.assertEqual(result["cleanup_outcome"]["reason"], reason)
+                    self.assertEqual(result["cleanup_applied"], applied)
+                    self.assertEqual(result["raw_text"], raw)
+                    self.assertEqual(result["text"], json.loads(wire)["text"] if applied else raw)
+                    self.assertEqual(self.generator.call_count, before + 1)
+                    if outcome == "failed":
+                        self.assertTrue(result["warning"])
+                        self.assertIn("error_type", result["cleanup_outcome"])
+                    else:
+                        self.assertNotIn("warning", result)
+                        self.assertNotIn("error_type", result["cleanup_outcome"])
+
+    def test_complete_reports_disabled_unavailable_rules_model_and_empty_without_inference(self):
+        cases = ((self.raw, DictationOptions(cleanup=False), True, "skipped", "disabled"),
+                 (self.raw, DictationOptions(prompt_snapshot_error="规则不可用",
+                                            prompt_snapshot_error_type="PromptStoreError"),
+                  True, "failed", "prompt_unavailable"),
+                 (self.raw, DictationOptions(), False, "failed", "model_unavailable"),
+                 ("", DictationOptions(), True, "skipped", "empty_transcript"))
+        for raw, options, ready, status, reason in cases:
+            with self.subTest(reason=reason):
+                self.models.cleanup_ready = ready
+                result = self.service._complete(raw, 1, 0.1, options)
+                self.assertEqual(result["cleanup_outcome"]["status"], status)
+                self.assertEqual(result["cleanup_outcome"]["reason"], reason)
+                self.assertFalse(result["cleanup_applied"])
+                self.assertEqual(result["text"], raw)
+                if reason == "prompt_unavailable":
+                    self.assertEqual(result["cleanup_outcome"]["error_type"], "PromptStoreError")
+        self.generator.assert_not_called()
+
+    def test_prompt_capture_failure_keeps_error_type_and_explicit_retry_recaptures(self):
+        with patch.object(self.service.prompts, "resolve", side_effect=PromptStoreError("规则读取失败")):
+            options = self.service.capture_prompt(DictationOptions())
+        result = self.service._complete(self.raw, 1, 0.1, options)
+        self.assertEqual(result["cleanup_outcome"], {"status": "failed", "reason": "prompt_unavailable",
+                                                    "error_type": "PromptStoreError"})
+        self.generator.assert_not_called()
+        result = self.service.reprocess(self.raw, options, self.service.prompts.active_version_id)
+        self.assertEqual(result["cleanup_outcome"], {"status": "applied", "reason": "changed"})
+        self.assertTrue(result["cleanup_applied"])
+        self.assertNotIn("warning", result)
+        self.generator.assert_called_once()
 
     def complete(self, route):
         if route == "history":

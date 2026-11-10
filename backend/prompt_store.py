@@ -6,7 +6,7 @@ selection. Invalid files are preserved before a recoverable copy is repaired.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -317,8 +317,14 @@ class PromptStore:
                     version = PromptVersion.from_dict(candidate)
                 else:
                     version = PromptVersion.from_dict(value)
-                if version.id in known and version != known[version.id]:
-                    raise PromptValidationError("导入版本标识冲突，未修改已有规则。")
+                if version.id in known:
+                    prior = known[version.id]
+                    # Packaged descriptions may change without changing the
+                    # imported rule. Keep the saved note and avoid a write for
+                    # this no-op; every other field must still match exactly.
+                    # from_dict above has already revalidated the payload hash.
+                    if replace(version, note=prior.note) != prior:
+                        raise PromptValidationError("导入版本标识冲突，未修改已有规则。")
                 if version.id not in known:
                     additions.append(version); known[version.id] = version
             if additions:

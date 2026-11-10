@@ -42,6 +42,14 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
     }
     private var selectedRevision: DictationRevision? { revisions.first { $0.id == selectedRevisionID } }
 
+    /// A result notification opens the exact saved version it refers to, even
+    /// if an older comparison sheet is already retained by the main window.
+    func selectRevision(id: UUID) {
+        guard let index = revisions.firstIndex(where: { $0.id == id }) else { return }
+        selectedRevisionID = id; resultPicker.selectItem(at: index)
+        populateText(); refreshControls()
+    }
+
     private func build() {
         guard let content = window?.contentView else { return }
         let root = NSStackView(); root.orientation = .vertical; root.alignment = .leading; root.spacing = 16
@@ -156,10 +164,11 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
         if let requestError, !requestError.isEmpty { statusLabel.stringValue = requestError; statusLabel.textColor = .systemRed }
         else {
             statusLabel.textColor = Palette.muted
+            let outcome = selectedRevision?.cleanupOutcome?.attentionMessage
             statusLabel.stringValue = entry == nil ? "这条历史记录已被删除。"
                 : busy ? "关闭后仍会完成并保存。"
                 : blockedByOtherEntry ? "另一条历史正在整理。"
-                : selectedRevision == nil ? "原输出保留，新结果另存为版本。" : "新版本已保存，原输出保留。"
+                : selectedRevision == nil ? "原输出保留，新结果另存为版本。" : (outcome.map { $0 + "。" } ?? "") + "新版本已保存，原输出保留。"
         }
     }
     func present(asSheetOf parent: NSWindow) {

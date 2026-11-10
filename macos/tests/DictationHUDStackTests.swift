@@ -201,6 +201,12 @@ enum DictationHUDStackTests {
         var completeState = states[0]; completeState.processingComplete = true
         cards[0].update(completeState, show: false)
         try require(field(cards[0], "title", NSTextField.self)?.stringValue == "已整理", "Final result kept an in-progress label")
+        for outcome in ["unchanged", "suspected_insufficient", "failed", "skipped", "future_status"] {
+            completeState.processingCompletionTitle = DictationCleanupOutcome(status: outcome).completionTitle
+            cards[0].update(completeState, show: false)
+            try require(field(cards[0], "title", NSTextField.self)?.stringValue == completeState.processingCompletionTitle,
+                        "Completion implied cleanup success for \(outcome)")
+        }
         let surface = field(cards[0], "surface", NSView.self)!
         try require(field(surface, "progress", DictationHUDProgress.self)?.target == 1, "Final result did not target full internal fill")
         var recordAgain = states[3]; recordAgain.processingProgress = 0.7
@@ -236,6 +242,42 @@ enum DictationHUDStackTests {
         try require(surface.bounds.width >= 180 && surface.bounds.width <= 360, "Delivery width is not bounded independently")
         for rect in deliveryRects { try require(deliveryContent.bounds.contains(rect), "Delivery action escaped resized card") }
         for (left, right) in zip(deliveryRects, deliveryRects.dropFirst()) { try require(left.maxX <= right.minX, "Copy and permission actions overlap") }
+
+        // Attention and retry reuse the same nonactivating production panel.
+        // Keep the warning readable after copying, lock duplicate taps, and
+        // never time out an actionable failure while the user reads its text.
+        let retryCard = DictationHUD()
+        defer { retryCard.hide() }
+        var retries = 0, views = 0
+        retryCard.onRetryCleanup = { retries += 1 }
+        retryCard.onViewResult = { views += 1 }
+        retryCard.onCopy = { retryCard.showDelivery(message: "改动较少，请检查 · 已复制", needsPermission: false, show: false) }
+        retryCard.showDelivery(message: "改动较少，请检查", needsPermission: false, show: false)
+        let retry = field(retryCard, "retryButton", NSButton.self)!
+        let view = field(retryCard, "viewButton", NSButton.self)!
+        let retryCopy = field(retryCard, "copyButton", NSButton.self)!
+        try require(!retry.isHidden && retry.isEnabled && !view.isHidden, "Attention lost its explicit retry/view actions")
+        try require(field(retryCard, "deliveryHide", DispatchWorkItem.self) == nil, "Attention expired before an explicit decision")
+        retryCopy.performClick(nil)
+        try require(field(retryCard, "deliveryMessage", NSTextField.self)?.stringValue == "改动较少，请检查 · 已复制", "Copy erased the attention state")
+        retry.performClick(nil); retry.performClick(nil)
+        try require(retries == 1 && !retry.isEnabled, "Repeated tap queued duplicate edits")
+        retryCard.showDelivery(message: "正在重新整理", needsPermission: false, show: false, retrying: true)
+        try require(!retry.isEnabled && !view.isEnabled && !retryCopy.isEnabled && field(retryCard, "deliveryHide", DispatchWorkItem.self) == nil,
+                    "In-flight retry retained enabled actions or an expiry")
+        retryCard.showDelivery(message: "重新整理未完成", needsPermission: false, show: false)
+        retry.performClick(nil)
+        try require(retries == 2, "Failed retry could not be attempted again")
+        retryCard.showDelivery(message: "原文未改 · 新版本已保存", needsPermission: false, show: false)
+        view.performClick(nil)
+        try require(views == 1 && retry.isEnabled, "Unchanged revision lost view or retry")
+        let retryPanel = field(retryCard, "panel", NSPanel.self)!
+        retryPanel.contentView!.layoutSubtreeIfNeeded()
+        let retryRow = field(retryCard, "deliveryRow", NSStackView.self)!
+        let retryRects = retryRow.arrangedSubviews.filter { !$0.isHidden }.map { $0.convert($0.bounds, to: retryPanel.contentView!) }
+        for rect in retryRects { try require(retryPanel.contentView!.bounds.contains(rect), "Retry action escaped the actual HUD") }
+        for (left, right) in zip(retryRects, retryRects.dropFirst()) { try require(left.maxX <= right.minX + 0.5, "Retry actions overlap") }
+        try require(retryCard.frame.width <= 360 && !retryPanel.canBecomeKey && !retryPanel.canBecomeMain, "Retry widened the HUD or stole input focus")
 
         // Exercise the actual asynchronous expiry with hidden production HUDs.
         // Finished reminders must expire without touching another recording,
@@ -324,6 +366,23 @@ enum DictationHUDStackTests {
         if let option = CommandLine.arguments.firstIndex(of: "--output"), CommandLine.arguments.count > option + 1 {
             let destination = URL(fileURLWithPath: CommandLine.arguments[option + 1], isDirectory: true)
             try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            for (name, message, retrying) in [
+                ("cleanup-failed", "整理未完成，已保留原文", false),
+                ("cleanup-unchanged", "原文未改", false),
+                ("cleanup-check", "改动较少，请检查", false),
+                ("cleanup-retrying", "正在重新整理", true),
+                ("cleanup-revision", "新版本已保存", false)
+            ] {
+                retryCard.onViewResult = name == "cleanup-revision" ? { views += 1 } : nil
+                retryCard.onRetryCleanup = name == "cleanup-revision" ? nil : { retries += 1 }
+                retryCard.showDelivery(message: message, needsPermission: false, show: false, retrying: retrying)
+                let content = retryPanel.contentView!
+                content.layoutSubtreeIfNeeded()
+                if let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                    content.cacheDisplay(in: content.bounds, to: bitmap)
+                    try bitmap.representation(using: .png, properties: [:])?.write(to: destination.appendingPathComponent(name + ".png"))
+                }
+            }
             for index in 0..<3 {
                 let source = layerDirectory.appendingPathComponent("layer-\(index).png")
                 try Data(contentsOf: source).write(to: destination.appendingPathComponent("background-layer-\(index).png"))

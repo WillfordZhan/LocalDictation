@@ -32,11 +32,24 @@ extension DictationEntry {
     // Report that observable result without claiming either semantic success
     // or a skipped model call; cleanupApplied records the invocation outcome.
     var cleanupResultDescription: String {
+        if let outcome = cleanupOutcome, let message = outcome.attentionMessage {
+            return outcome.status == "unchanged" ? "已调用 · 原文未改" : message
+        }
+        if let outcome = cleanupOutcome {
+            switch outcome.status {
+            case "applied": return "已调用 · 文本已修改"
+            case "skipped": return "未应用整理"
+            default: return "整理状态未确认"
+            }
+        }
         if cleanupApplied { return rawText == text ? "已调用 · 文本未变" : "已调用 · 文本已修改" }
         return warning?.isEmpty == false ? "整理未完成，已保留原文" : "未应用整理"
     }
     var cleanupResultTitle: String {
-        cleanupApplied ? (rawText == text ? "模型输出（文本未变）" : "整理结果") : "最终输出（未整理）"
+        if cleanupOutcome?.status == "suspected_insufficient" { return "整理结果（请检查）" }
+        if cleanupOutcome?.status == "failed" { return "原文（整理未完成）" }
+        if let outcome = cleanupOutcome, !["applied", "unchanged", "skipped"].contains(outcome.status) { return "最终输出" }
+        return cleanupApplied ? (rawText == text ? "模型输出（文本未变）" : "整理结果") : "最终输出（未整理）"
     }
 }
 
@@ -60,6 +73,7 @@ struct DictationUIState {
     var processingStage: String?
     var processingProgress: Double?
     var processingComplete = false
+    var processingCompletionTitle: String? = nil
     var recognizedSeconds: Double?
     var cleanupEnabled = true
     // nil means no usable backend report yet, rather than an assumed local mode.
@@ -548,7 +562,7 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
                      busy: reprocessingBusy && ownsRequest, blockedByOtherEntry: reprocessingBusy && !ownsRequest,
                      error: errors.isEmpty ? nil : errors.joined(separator: "\n"))
     }
-    func showReprocessing(entryID: UUID, show: Bool = true) {
+    func showReprocessing(entryID: UUID, revisionID: UUID? = nil, show: Bool = true) {
         guard let entry = store.entries.first(where: { $0.id == entryID }) else { return }
         if reprocessingSheet?.entryID != entryID {
             reprocessingSheet = HistoryReprocessingWindowController(entry: entry, catalog: reprocessingCatalog)
@@ -556,6 +570,7 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         reprocessingSheet?.onRun = onReprocessEntry
         reprocessingSheet?.onCopy = onCopyText
         refreshReprocessingSheet()
+        if let revisionID { reprocessingSheet?.selectRevision(id: revisionID) }
         if reprocessingCatalog == nil { onReloadPrompts?() }
         if show, let window { reprocessingSheet?.present(asSheetOf: window) }
     }
@@ -1506,6 +1521,9 @@ private final class DictationDisplayLinkTarget: NSObject {
 final class DictationHUD {
     var onFinish: (() -> Void)?; var onCancel: (() -> Void)?; var onAccessibility: (() -> Void)?
     var onCopy: (() -> Void)?
+    var onRetryCleanup: (() -> Void)?
+    var onViewResult: (() -> Void)?
+    private(set) var dismissalGeneration: UInt64 = 0
     private let panel: NonactivatingHUDPanel
     private let surface = DictationHUDSurface(fill: NSColor(calibratedWhite: 0.055, alpha: 0.98), radius: 17,
                                              border: NSColor(white: 1, alpha: 0.32))
@@ -1520,6 +1538,8 @@ final class DictationHUD {
     private var recordingRow: NSView!; private var deliveryRow: NSStackView!
     private var permissionButton: ActionButton!
     private var copyButton: ActionButton!
+    private var retryButton: ActionButton!
+    private var viewButton: ActionButton!
     private var deliveryHide: DispatchWorkItem?
     private var deliveryGeneration: UInt64 = 0
     private var displayLink: CADisplayLink?
@@ -1618,11 +1638,26 @@ final class DictationHUD {
         copyButton.toolTip = "复制此段文字"; copyButton.setAccessibilityLabel("复制此段文字")
         copyButton.isBordered = false; copyButton.contentTintColor = permissionButton.contentTintColor
         copyButton.refusesFirstResponder = true; copyButton.isHidden = true
+        retryButton = ActionButton("重新整理") { [weak self] in
+            guard let self, self.retryButton.isEnabled else { return }
+            self.retryButton.isEnabled = false; self.onRetryCleanup?()
+        }
+        retryButton.toolTip = "只重新整理已保存的原文，不会再次自动填入"
+        retryButton.setAccessibilityLabel("重新整理原文")
+        viewButton = ActionButton("查看") { [weak self] in self?.onViewResult?() }
+        viewButton.setAccessibilityLabel("查看整理版本")
+        for button in [retryButton!, viewButton!] {
+            button.isBordered = false; button.contentTintColor = permissionButton.contentTintColor
+            button.refusesFirstResponder = true; button.isHidden = true
+            button.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        }
+        retryButton.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        viewButton.widthAnchor.constraint(equalToConstant: 32).isActive = true
         for button in [copyButton!, permissionButton!] {
             button.widthAnchor.constraint(equalToConstant: 32).isActive = true
             button.heightAnchor.constraint(equalToConstant: 24).isActive = true
         }
-        deliveryRow = horizontal([deliveryMessage, copyButton, permissionButton, dismiss], spacing: 8)
+        deliveryRow = horizontal([deliveryMessage, retryButton, viewButton, copyButton, permissionButton, dismiss], spacing: 8)
         deliveryRow.isHidden = true
         surface.addSubview(deliveryRow)
         NSLayoutConstraint.activate([
@@ -1639,9 +1674,12 @@ final class DictationHUD {
     }
     func update(_ state: DictationUIState, show: Bool = true) {
         guard state.recording || state.processing else { hide(); return }
+        // Legacy recording reuses one panel; an earlier retry must not replace
+        // that new activity when its asynchronous response arrives.
+        if !deliveryRow.isHidden { dismissalGeneration &+= 1 }
         invalidateDeliveryHide()
         recordingRow.isHidden = false; deliveryRow.isHidden = true
-        title.stringValue = state.processingComplete && !state.recording ? "已整理" : "正在整理"; title.isHidden = state.recording
+        title.stringValue = state.processingComplete && !state.recording ? state.processingCompletionTitle ?? "已整理" : "正在整理"; title.isHidden = state.recording
         activity.isHidden = !state.recording
         if state.recording {
             cancelProcessingPosition.isActive = false; cancelRecordingPosition.isActive = true
@@ -1674,7 +1712,7 @@ final class DictationHUD {
     }
     /// Delivery feedback remains at the input location, without activating our
     /// app. A new recording invalidates the delayed hide of an older delivery.
-    func showDelivery(message: String, needsPermission: Bool, show: Bool = true) {
+    func showDelivery(message: String, needsPermission: Bool, show: Bool = true, retrying: Bool = false) {
         let alreadyVisible = panel.isVisible
         invalidateDeliveryHide()
         stopAnimation(); activity.reset(); surface.resetProgress()
@@ -1682,18 +1720,24 @@ final class DictationHUD {
         deliveryMessage.stringValue = message; deliveryMessage.toolTip = message
         permissionButton.isHidden = !needsPermission
         copyButton.isHidden = onCopy == nil
+        copyButton.isEnabled = !retrying
+        retryButton.isHidden = onRetryCleanup == nil; retryButton.isEnabled = !retrying
+        viewButton.isHidden = onViewResult == nil; viewButton.isEnabled = !retrying
         if !sessionCaption.stringValue.isEmpty { copyButton.setAccessibilityLabel("复制第 " + sessionCaption.stringValue + " 段文字") }
         let textWidth = (message as NSString).size(withAttributes: [.font: deliveryMessage.font!]).width
         let actionsWidth: CGFloat = 24 + (copyButton.isHidden ? 0 : 40) + (permissionButton.isHidden ? 0 : 40)
+            + (retryButton.isHidden ? 0 : 72) + (viewButton.isHidden ? 0 : 40)
         // Rare delivery actions size their own card; they do not widen every
         // recording and processing card for the rest of the session.
         setPreferredPanelWidth(min(360, max(180, ceil(textWidth + actionsWidth + 24))))
         if show { showPanel() }
         if show && alreadyVisible { DictationMotion.reveal(deliveryRow, duration: 0.1) }
-        // Completed results remain available in history. Copy/permission
-        // actions get a little more reading time, but never leave a completed
-        // card covering the input field indefinitely.
-        let lifetime: TimeInterval = needsPermission || onCopy != nil ? 5 : 3.5
+        // Results requiring a decision stay until dismissed or successfully
+        // retried. Their actions must not disappear while the user reads the
+        // inserted text. Ordinary copy/permission reminders still expire.
+        // An in-flight retry keeps the same card and cannot enqueue a duplicate.
+        guard !retrying, onRetryCleanup == nil else { return }
+        let lifetime: TimeInterval = needsPermission || onCopy != nil || onViewResult != nil ? 5 : 3.5
         let generation = deliveryGeneration
         let pending = DispatchWorkItem { [weak self] in
             guard let self, self.deliveryGeneration == generation, self.recordingRow.isHidden else { return }
@@ -1805,6 +1849,7 @@ final class DictationHUD {
         animationTimestamp = 0
     }
     func hide() {
+        dismissalGeneration &+= 1
         let wasVisible = panel.isVisible
         positionAnimation?.cancel(); positionAnimation = nil
         invalidateDeliveryHide(); stopAnimation(); activity.reset(); previewTimestamp = nil

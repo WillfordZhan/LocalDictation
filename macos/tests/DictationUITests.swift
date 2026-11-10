@@ -646,6 +646,15 @@ enum DictationUIChecks {
             store.delete(id: entry.id)
         }
 
+        for (status, expected) in [("unchanged", "已调用 · 原文未改"), ("suspected_insufficient", "改动较少，请检查"),
+                                   ("failed", "整理未完成，已保留原文"), ("skipped", "未应用整理"), ("future_status", "整理状态未确认")] {
+            let entry = store.add(rawText: "保留原文", text: "保留原文", asrSeconds: 0.2, cleanupSeconds: 0,
+                totalSeconds: 0.2, audioSeconds: 2, cleanupApplied: status != "failed", warning: "diagnostic fixture",
+                cleanupOutcome: DictationCleanupOutcome(status: status))
+            try require(entry.cleanupResultDescription == expected, "Explicit cleanup outcome was ignored or guessed")
+            store.delete(id: entry.id)
+        }
+
         try click("个人词典", in: root)
         store.updatePreferences { $0.vocabulary = ["BOM", "SalesPart", "一个用于验证长词条布局的名称"] }
         for width in [CGFloat(1000), CGFloat(1800)] {

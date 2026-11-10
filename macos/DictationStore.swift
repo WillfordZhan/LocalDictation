@@ -125,6 +125,39 @@ struct DictationStreamingMetrics: Codable, Equatable {
     }
 }
 
+/// Backend outcome describes the edit, independently of model loading and paste
+/// delivery. Unknown future statuses remain readable without inventing failure.
+struct DictationCleanupOutcome: Codable, Equatable {
+    let status: String
+    var reason: String? = nil
+    var errorType: String? = nil
+    enum CodingKeys: String, CodingKey { case status, reason, errorType = "error_type" }
+    var attentionMessage: String? {
+        switch status {
+        case "unchanged": return "原文未改"
+        case "suspected_insufficient": return "改动较少，请检查"
+        case "failed": return "整理未完成，已保留原文"
+        default: return nil
+        }
+    }
+    var completionTitle: String {
+        switch status {
+        case "applied": return "已整理"
+        case "unchanged": return "原文未改"
+        case "suspected_insufficient": return "请检查"
+        case "failed": return "未完成"
+        case "skipped": return "已转写"
+        default: return "已完成"
+        }
+    }
+    static func legacy(raw: String, text: String, applied: Bool, requested: Bool? = nil) -> Self? {
+        if applied { return Self(status: raw == text ? "unchanged" : "applied") }
+        if requested == false { return Self(status: "skipped") }
+        if requested == true { return Self(status: "failed", reason: "legacy_cleanup_not_applied") }
+        return nil
+    }
+}
+
 /// Alternate edits belong to one recording. They do not replace its original
 /// output or count as another dictation in the daily activity totals.
 struct DictationRevision: Codable, Identifiable {
@@ -133,6 +166,7 @@ struct DictationRevision: Codable, Identifiable {
     let text: String
     let cleanupSeconds: Double
     let cleanupProfile: DictationCleanupProfile
+    var cleanupOutcome: DictationCleanupOutcome? = nil
 }
 
 struct DictationEntry: Codable, Identifiable {
@@ -152,6 +186,7 @@ struct DictationEntry: Codable, Identifiable {
     var asrModel: String? = nil
     var streamingMetrics: DictationStreamingMetrics? = nil
     var revisions: [DictationRevision]? = nil
+    var cleanupOutcome: DictationCleanupOutcome? = nil
 }
 
 /// Daily totals contain no transcript, audio, entry identifiers, or vocabulary.
@@ -560,12 +595,14 @@ final class DictationStore {
     func add(rawText: String, text: String, asrSeconds: Double, cleanupSeconds: Double,
              totalSeconds: Double, audioSeconds: Double?, cleanupApplied: Bool,
              warning: String?, createdAt: Date = Date(), cleanupProfile: DictationCleanupProfile? = nil,
-             asrModel: String? = nil, streamingMetrics: DictationStreamingMetrics? = nil) -> DictationEntry {
+             asrModel: String? = nil, streamingMetrics: DictationStreamingMetrics? = nil,
+             cleanupOutcome: DictationCleanupOutcome? = nil) -> DictationEntry {
         let entry = DictationEntry(id: UUID(), createdAt: createdAt, rawText: rawText, text: text,
                                   asrSeconds: asrSeconds, cleanupSeconds: cleanupSeconds,
                                   totalSeconds: totalSeconds, audioSeconds: audioSeconds,
                                   cleanupApplied: cleanupApplied, warning: warning,
-                                  cleanupProfile: cleanupProfile, asrModel: asrModel, streamingMetrics: streamingMetrics)
+                                  cleanupProfile: cleanupProfile, asrModel: asrModel, streamingMetrics: streamingMetrics,
+                                  cleanupOutcome: cleanupOutcome)
         entries.insert(entry, at: 0)
         sortHistory()
         hasUnsavedHistory = true
@@ -586,14 +623,14 @@ final class DictationStore {
 
     @discardableResult
     func addRevision(entryID: UUID, text: String, cleanupSeconds: Double,
-                     cleanupProfile: DictationCleanupProfile) -> DictationRevision? {
+                     cleanupProfile: DictationCleanupProfile, cleanupOutcome: DictationCleanupOutcome? = nil) -> DictationRevision? {
         // Deleting the parent while a request is running is authoritative.
         // A late reply must never resurrect it or create a replacement entry.
         guard let index = entries.firstIndex(where: { $0.id == entryID }),
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               cleanupSeconds.isFinite, cleanupSeconds >= 0 else { return nil }
         let revision = DictationRevision(id: UUID(), createdAt: Date(), text: text,
-            cleanupSeconds: cleanupSeconds, cleanupProfile: cleanupProfile)
+            cleanupSeconds: cleanupSeconds, cleanupProfile: cleanupProfile, cleanupOutcome: cleanupOutcome)
         entries[index].revisions = (entries[index].revisions ?? []) + [revision]
         hasUnsavedHistory = true
         _ = persistHistory()

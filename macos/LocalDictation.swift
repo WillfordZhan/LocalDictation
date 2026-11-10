@@ -18,6 +18,15 @@ struct DictationResult: Decodable {
     let cleanup_profile: DictationCleanupProfile?
     let asr_model: String?
     let streaming_metrics: DictationStreamingMetrics?
+    var cleanup_outcome: DictationCleanupOutcome? = nil
+    func cleanupOutcome(requested: Bool, promptWarning: String? = nil) -> DictationCleanupOutcome? {
+        // A broken prompt catalog forces ASR-only in the frozen request. That
+        // fallback is distinct from a user deliberately turning cleanup off.
+        if let promptWarning, !promptWarning.isEmpty {
+            return DictationCleanupOutcome(status: "failed", reason: "prompt_unavailable")
+        }
+        return cleanup_outcome ?? .legacy(raw: raw_text, text: text, applied: cleanup_applied, requested: requested)
+    }
 }
 
 private struct DictationRequestOptions {
@@ -220,6 +229,7 @@ private struct DeliveryResult {
 private final class TextInserter {
     var onPasteDispatched: ((String, FocusTarget, UUID) -> Void)?
     private let board: NSPasteboard
+    private let writeClipboard: (String) -> Bool
     private let permissionCheck: () -> String?
     private var captureIssue: String?
     private var captureTransient = false
@@ -234,6 +244,7 @@ private final class TextInserter {
     var clipboardChangeCount: Int { board.changeCount }
 
     init(board: NSPasteboard = .general,
+         writeClipboard: ((String) -> Bool)? = nil,
          permissionCheck: @escaping () -> String? = TextInserter.systemPermissionIssue,
          targetReader: (() -> FocusTarget?)? = nil,
          pasteKeySender: @escaping (pid_t) -> Bool = TextInserter.postPasteKey,
@@ -242,6 +253,9 @@ private final class TextInserter {
              DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action)
          }) {
         self.board = board
+        self.writeClipboard = writeClipboard ?? { text in
+            board.clearContents(); return board.writeObjects([text as NSString])
+        }
         self.permissionCheck = permissionCheck
         self.targetReader = targetReader
         self.pasteKeySender = pasteKeySender
@@ -388,8 +402,7 @@ private final class TextInserter {
         // Copy is useful even when macOS denies event posting or the user moves
         // their caret. Keep the recognized text on the clipboard so recovery is
         // a single Cmd-V in the destination; never require a trip to our window.
-        board.clearContents()
-        guard board.writeObjects([text as NSString]) else {
+        guard writeClipboard(text) else {
             return DeliveryResult(message: "无法写入剪贴板；文字已保留在结果窗口。", hudMessage: "复制失败 · 文字已保留")
         }
         let ownedCount = board.changeCount
@@ -513,6 +526,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
     private var reprocessGeneration: UUID?
     private var reprocessEntryID: UUID?
     private var reprocessError: String?
+    private var reprocessHUD: DictationHUD?
+    private var reprocessHUDGeneration: UInt64 = 0
     private var recordedAudioSeconds: Double?
     private var lastFocusCheck = Date.distantPast
     private let focusCheckQueue = DispatchQueue(label: "local-dictation.focus-check", qos: .userInitiated)
@@ -1058,6 +1073,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             state.processing = !state.recording
             state.canCancel = true; state.processingStage = "正在整理"
             state.processingComplete = job.result != nil
+            state.processingCompletionTitle = job.result?.cleanupOutcome(requested: job.preferences.cleanupEnabled, promptWarning: job.promptWarning)?.completionTitle
             state.processingProgress = state.recording ? nil : job.result != nil ? 1
                 : job.progress.advance(now: ProcessInfo.processInfo.systemUptime)
             state.recognizedSeconds = job.recognizedSeconds
@@ -1089,18 +1105,32 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         deliveryHUDOrder.removeAll { $0 == id }; restackStreamingHUDs()
     }
 
-    private func retainDeliveryHUD(_ job: StreamingUtterance, message: String, permission: Bool = false, text: String? = nil) {
+    private func retainDeliveryHUD(_ job: StreamingUtterance, message: String, permission: Bool = false,
+                                   text: String? = nil, attention: String? = nil) {
         deliveryHUDs[job.id] = job.hud
         if !deliveryHUDOrder.contains(job.id) { deliveryHUDOrder.append(job.id) }
+        configureResultHUD(job.hud, entryID: job.savedEntryID, message: message, permission: permission, text: text, attention: attention)
+        restackStreamingHUDs()
+    }
+
+    private func configureResultHUD(_ panel: DictationHUD, entryID: UUID?, message: String,
+                                    permission: Bool = false, text: String? = nil, attention: String? = nil) {
+        panel.onCopy = nil; panel.onRetryCleanup = nil; panel.onViewResult = nil
         if let text, !text.isEmpty {
-            job.hud.onCopy = { [weak self, weak panel = job.hud] in
-                guard let self else { return }
+            panel.onCopy = { [weak self, weak panel] in
+                guard let self, let panel else { return }
                 let copied = self.inserter.insert(text, target: nil, changed: false, automatic: false)
-                if !self.suppressStreamingPresentation { panel?.showDelivery(message: copied.hudMessage, needsPermission: false) }
+                panel.showDelivery(message: attention.map { $0 + " · " + copied.hudMessage } ?? copied.hudMessage,
+                    needsPermission: false, show: !self.suppressStreamingPresentation)
             }
         }
-        if !suppressStreamingPresentation { job.hud.showDelivery(message: message, needsPermission: permission) }
-        restackStreamingHUDs()
+        if attention != nil, let entryID,
+           store.entries.first(where: { $0.id == entryID })?.rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            panel.onRetryCleanup = { [weak self, weak panel] in
+                guard let self, let panel else { return }; self.retryCleanup(entryID: entryID, panel: panel)
+            }
+        }
+        panel.showDelivery(message: message, needsPermission: permission, show: !suppressStreamingPresentation)
     }
 
     private func cancelStreamingJob(_ id: UUID) {
@@ -1140,11 +1170,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             // Stable ASR after transport failure is explicitly marked partial.
             let entry = store.add(rawText: job.partialText, text: job.partialText, asrSeconds: 0,
                 cleanupSeconds: 0, totalSeconds: 0, audioSeconds: job.recognizedSeconds,
-                cleanupApplied: false, warning: "未完成口述，仅保存已识别部分。" + message)
+                cleanupApplied: false, warning: "未完成口述，仅保存已识别部分。" + message,
+                cleanupOutcome: DictationCleanupOutcome(status: "skipped", reason: "incomplete_asr"))
             lastEntryID = entry.id
+            job.savedEntryID = entry.id
         }
         try? FileManager.default.removeItem(at: job.audioURL)
-        retainDeliveryHUD(job, message: job.result != nil ? "结果已保留 · 点复制" : job.partialText.isEmpty ? "本段未完成 · 请重新口述" : "本段未完成 · 已保留识别部分", text: job.result?.text ?? job.partialText)
+        let notice = job.result != nil ? "结果已保留 · 自动填入未完成"
+            : job.partialText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "本段处理未完成 · 请重新口述" : "处理未完成 · 已保留部分文字"
+        retainDeliveryHUD(job, message: notice, text: job.result?.text ?? job.partialText, attention: notice)
         detailText = message
         refreshStreamingPresentation(); restackStreamingHUDs(); drainStreamingResults()
         if refresh { refreshHealth() }
@@ -1160,7 +1194,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             cleanupSeconds: result.cleanup_seconds, totalSeconds: result.total_seconds,
             audioSeconds: result.audio_seconds ?? job.audioSeconds, cleanupApplied: result.cleanup_applied,
             warning: warning.isEmpty ? nil : warning, cleanupProfile: result.cleanup_profile,
-            asrModel: result.asr_model, streamingMetrics: metrics)
+            asrModel: result.asr_model, streamingMetrics: metrics,
+            cleanupOutcome: result.cleanupOutcome(requested: job.preferences.cleanupEnabled, promptWarning: job.promptWarning))
         job.savedEntryID = entry.id; lastEntryID = entry.id
     }
 
@@ -1211,7 +1246,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             : inserter.insert(text, target: target, changed: false, automatic: job.preferences.autoInsertEnabled,
                               entryID: job.savedEntryID, expectedClipboardChangeCount: clipboardCount)
         detailText = String(format: "第 %d 段 · 停止到结果 %.2f 秒 · 识别计算 %.2f 秒 · 整理 %.2f 秒", job.number, elapsed, result.asr_seconds, result.cleanup_seconds) + "\n" + delivery.message
-        if delivery.showHUD { retainDeliveryHUD(job, message: delivery.hudMessage, permission: delivery.needsPermission, text: text) }
+        let attention = text.isEmpty ? nil : result.cleanupOutcome(requested: job.preferences.cleanupEnabled, promptWarning: job.promptWarning)?.attentionMessage
+        if delivery.showHUD || attention != nil {
+            let message = attention.map { $0 + (delivery.showHUD ? " · " + delivery.hudMessage : "") } ?? delivery.hudMessage
+            retainDeliveryHUD(job, message: message, permission: delivery.needsPermission, text: text, attention: attention)
+        }
         else { job.hud.hide() }
         try? FileManager.default.removeItem(at: job.audioURL)
         refreshStreamingPresentation(); restackStreamingHUDs()
@@ -1317,6 +1356,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         sessionID = nil
         activePreferences = nil
         activePromptVersionID = nil
+        let outcome = result.cleanupOutcome(requested: preferences.cleanupEnabled, promptWarning: activePromptWarning)
         let cleanupWarning = [result.warning, activePromptWarning].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")
         activePromptWarning = nil
         let elapsed = Date().timeIntervalSince(processingStartedAt ?? Date())
@@ -1327,7 +1367,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
                 cleanupSeconds: result.cleanup_seconds, totalSeconds: result.total_seconds,
                 audioSeconds: result.audio_seconds ?? recordedAudioSeconds,
                 cleanupApplied: result.cleanup_applied, warning: cleanupWarning.isEmpty ? nil : cleanupWarning,
-                cleanupProfile: result.cleanup_profile, asrModel: result.asr_model)
+                cleanupProfile: result.cleanup_profile, asrModel: result.asr_model,
+                cleanupOutcome: outcome)
             lastEntryID = entry.id
             savedEntryID = entry.id
         }
@@ -1335,8 +1376,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             ? DeliveryResult(message: "未识别到文字，请重试口述。", hudMessage: "未识别到文字")
             : inserter.insert(text, target: target, changed: targetChanged, automatic: preferences.autoInsertEnabled, entryID: savedEntryID)
         detailText = metrics + "\n" + delivery.message
-        setPhase(text.isEmpty ? .failed : .completed, text.isEmpty ? "未识别到文字" : "\(result.cleanup_applied ? "已整理" : "已转写") · \(delivery.message)")
-        if delivery.showHUD { hud?.showDelivery(message: delivery.hudMessage, needsPermission: delivery.needsPermission) }
+        let attention = text.isEmpty ? nil : outcome?.attentionMessage
+        setPhase(text.isEmpty ? .failed : .completed, text.isEmpty ? "未识别到文字" : "\(outcome?.completionTitle ?? "已完成") · \(delivery.message)")
+        if delivery.showHUD || attention != nil {
+            if hud == nil { hud = DictationHUD(); hud?.onAccessibility = { [weak self] in self?.requestAccessibility() } }
+            let message = attention.map { $0 + (delivery.showHUD ? " · " + delivery.hudMessage : "") } ?? delivery.hudMessage
+            configureResultHUD(hud!, entryID: savedEntryID, message: message, permission: delivery.needsPermission, text: text, attention: attention)
+        }
         else { hud?.hide() }
         windowController?.reloadStore()
     }
@@ -1412,6 +1458,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         // poll health until the service is ready. Never resubmit these bytes.
         serviceCanRecord = false
         fail(message)
+        if hud == nil { hud = DictationHUD() }
+        configureResultHUD(hud!, entryID: nil, message: "本段处理未完成 · 请重新口述", attention: nil)
         refreshHealth()
     }
 
@@ -1996,7 +2044,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         updateUI()
     }
 
-    static func verifyHistoryReprocessing() {
+    static func verifyHistoryReprocessing() throws {
         let board = NSPasteboard(name: NSPasteboard.Name("local.dictation.history-reprocess.\(UUID())"))
         defer { board.releaseGlobally() }
         board.setString("unchanged clipboard", forType: .string)
@@ -2037,6 +2085,92 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             expectedVersionID: "chosen", expectedHash: "chosen-hash")
         precondition(controller.store.entries.isEmpty && controller.reprocessError != nil)
         precondition(board.string(forType: .string) == "unchanged clipboard")
+        // Exercise the actual completion HUD -> text-only HTTP -> revision
+        // path. A named pasteboard and URLProtocol make insertion/model access
+        // impossible, including when retries return unchanged or fail again.
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [NativeFailureURLProtocol.self]
+        let transport = URLSession(configuration: config)
+        defer { transport.invalidateAndCancel() }
+        let retrying = AppDelegate(serviceSession: transport,
+            inserter: TextInserter(board: board, permissionCheck: { nil },
+                pasteKeySender: { _ in preconditionFailure("HUD retry must not auto-paste") }))
+        retrying.supportsReprocess = true; retrying.serviceCanRecord = true; retrying.cleanupBackend = .local
+        let version = CleanupPromptVersion(id: "chosen", name: "测试", note: "", created_at: "fixture", model_id: "fixture",
+            system_prompt: "fixture", user_prefix: "", examples: [], content_sha256: "chosen-hash", origin: "user")
+        retrying.promptCatalog = CleanupPromptCatalog(active_version_id: "chosen", versions: [version],
+            current_model: CleanupPromptModel(id: "fixture", kind: "local", ready: true), asr_model: "fixture")
+        retrying.promptCatalogCurrent = true
+        let source = retrying.store.add(rawText: "嗯，保留原文。", text: "嗯，保留原文。", asrSeconds: 1,
+            cleanupSeconds: 0, totalSeconds: 1, audioSeconds: 8, cleanupApplied: false, warning: "整理未完成",
+            cleanupOutcome: DictationCleanupOutcome(status: "failed", reason: "invalid_model_output"))
+        let panel = DictationHUD()
+        defer { panel.hide() }
+        retrying.configureResultHUD(panel, entryID: source.id, message: "整理未完成，已保留原文",
+            text: source.text, attention: "整理未完成，已保留原文")
+        func field<T>(_ value: Any, _ name: String, _: T.Type) -> T? {
+            Mirror(reflecting: value).children.first { $0.label == name }?.value as? T
+        }
+        let retryButton = field(panel, "retryButton", NSButton.self)!
+        let status = field(panel, "deliveryMessage", NSTextField.self)!
+        let attemptsBefore = retrying.store.usageSummary().dictationCount
+        for outcome in ["unchanged", "suspected_insufficient", "failed", "applied"] {
+            let reply: [String: Any] = ["raw_text": source.rawText, "text": outcome == "unchanged" ? source.rawText : "保留原文。",
+                "cleanup_seconds": 0.1, "cleanup_applied": outcome != "failed",
+                "cleanup_profile": ["version_id": "chosen", "name": "测试", "content_sha256": "chosen-hash", "model_id": "fixture"],
+                "cleanup_outcome": ["status": outcome, "reason": "fixture"]]
+            NativeFailureURLProtocol.configureCleanup(try JSONSerialization.data(withJSONObject: reply))
+            let revisionsBefore = retrying.store.entries[0].revisions?.count ?? 0
+            retryButton.performClick(nil); retryButton.performClick(nil)
+            precondition(retrying.reprocessGeneration != nil && !retryButton.isEnabled, "Retry failed to start for \(outcome): \(status.stringValue)")
+            precondition(status.stringValue == "正在重新整理")
+            let deadline = Date().addingTimeInterval(2)
+            while retrying.reprocessGeneration != nil && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+            precondition(retrying.reprocessGeneration == nil)
+            precondition(NativeFailureURLProtocol.recordedPaths() == ["/cleanup/reprocess"])
+            precondition(NativeFailureURLProtocol.recordedPromptHeaders() == ["chosen"])
+            let saved = retrying.store.entries[0]
+            precondition(saved.rawText == source.rawText && saved.text == source.text && saved.cleanupOutcome == source.cleanupOutcome)
+            precondition(retrying.store.usageSummary().dictationCount == attemptsBefore)
+            precondition(board.string(forType: .string) == "unchanged clipboard")
+            if outcome == "failed" {
+                precondition((saved.revisions?.count ?? 0) == revisionsBefore && status.stringValue.contains("重新整理未完成") && retryButton.isEnabled)
+            } else {
+                precondition(saved.revisions?.count == revisionsBefore + 1 && saved.revisions?.last?.cleanupOutcome?.status == outcome)
+                precondition(panel.onViewResult != nil && panel.onCopy != nil)
+                if outcome == "applied" { precondition(panel.onRetryCleanup == nil && status.stringValue == "新版本已保存") }
+                else { precondition(status.stringValue.contains(DictationCleanupOutcome(status: outcome).attentionMessage!) && retryButton.isEnabled) }
+            }
+        }
+        panel.onCopy?()
+        precondition(board.string(forType: .string) == "保留原文。", "New version only reaches clipboard through explicit Copy")
+        for reuseForRecording in [false, true] {
+            retrying.configureResultHUD(panel, entryID: source.id, message: "原文未改", text: source.text, attention: "原文未改")
+            let beforeDismissedRetry = retrying.store.entries[0].revisions?.count ?? 0
+            retryButton.performClick(nil)
+            precondition(retrying.reprocessGeneration != nil)
+            if reuseForRecording {
+                var recordingState = DictationUIState(); recordingState.recording = true
+                panel.update(recordingState, show: false)
+            } else { panel.hide() }
+            let dismissedDeadline = Date().addingTimeInterval(2)
+            while retrying.reprocessGeneration != nil && Date() < dismissedDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+            precondition(retrying.store.entries[0].revisions?.count == beforeDismissedRetry + 1 && retrying.reprocessHUD == nil)
+            precondition(!panel.isVisible && status.stringValue == "正在重新整理", "Dismissed retry unexpectedly re-presented its completion")
+            if reuseForRecording { precondition(field(panel, "recordingRow", NSView.self)?.isHidden == false) }
+        }
+        var failedWrites = 0
+        let copyFailure = AppDelegate(inserter: TextInserter(board: board, writeClipboard: { _ in failedWrites += 1; return false },
+            permissionCheck: { nil }, pasteKeySender: { _ in preconditionFailure("Failed copy must not paste") }))
+        let copyFailurePanel = DictationHUD()
+        defer { copyFailurePanel.hide() }
+        copyFailure.configureResultHUD(copyFailurePanel, entryID: nil, message: "原文未改", text: "copy-failure", attention: "原文未改")
+        let beforeCopyFailure = board.string(forType: .string)
+        copyFailurePanel.onCopy?()
+        precondition(failedWrites == 1 && board.string(forType: .string) == beforeCopyFailure)
+        precondition(field(copyFailurePanel, "deliveryMessage", NSTextField.self)?.stringValue == "原文未改 · 复制失败 · 文字已保留",
+                     "Attention copy replaced clipboard failure with a false success")
+        print("PASS cleanup HUD retry: real one text-only request per click, duplicate lock, failed retry retained, outcome-aware revisions, explicit copy only, original ASR/output and usage unchanged")
         print("PASS history reprocessing integration: immutable originals, explicit version/hash, persistent revision only, no extra usage, deleted/duplicate/error isolation, recording remains available, no clipboard or paste side effect")
     }
 
@@ -2064,13 +2198,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
                 client: client)
             job.stoppedAt = Date(); return job
         }
-        func result(_ text: String) throws -> Data {
-            try JSONSerialization.data(withJSONObject: ["raw_text": "raw-" + text, "text": text,
+        func result(_ text: String, outcome: String? = nil) throws -> Data {
+            var object: [String: Any] = ["raw_text": outcome == "unchanged" ? text : "raw-" + text, "text": text,
                 "asr_seconds": 2.0, "cleanup_seconds": 1.0, "total_seconds": 3.0,
-                "audio_seconds": 50.0, "cleanup_applied": true, "asr_model": "fixture-asr",
+                "audio_seconds": 50.0, "cleanup_applied": !["failed", "skipped"].contains(outcome ?? ""), "asr_model": "fixture-asr",
                 "streaming_metrics": ["processed_audio_before_stop_seconds": 30.0,
                     "asr_before_stop_seconds": 1.2, "asr_after_stop_seconds": 0.8,
-                    "stop_to_result_seconds": 1.8, "asr_calls": 2]])
+                    "stop_to_result_seconds": 1.8, "asr_calls": 2]]
+            if let outcome { object["cleanup_outcome"] = ["status": outcome, "reason": "fixture"] }
+            return try JSONSerialization.data(withJSONObject: object)
         }
         let response = HTTPURLResponse(url: serviceBase, statusCode: 200, httpVersion: nil, headerFields: nil)!
         func awaitReadyResults(_ controller: AppDelegate) throws {
@@ -2222,6 +2358,30 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
                         automatic.streamingJobs.isEmpty && !automatic.deliveryInFlight && automatic.preparingDeliveryID == nil,
                         "输入框恢复期间取消或失败后仍粘贴、改写剪贴板或锁住队列。")
         }
+        // A successful paste is a delivery fact, not a cleanup-quality fact.
+        // Keep actionable outcome cards even after Cmd-V dispatch, without
+        // delaying the next segment or changing the original ASR in history.
+        for outcome in ["unchanged", "suspected_insufficient", "failed", "skipped", "future_status", "applied"] {
+            let next = autoJob(1)
+            automatic.streamingJobs = [next]; automatic.phase = .processing
+            currentTarget = FocusTarget(pid: -1, element: element, selection: Selection(location: 0, length: 0))
+            let pasteCount = pasted.count
+            automatic.receiveStreamingResult(id: next.id, data: try result("outcome-" + outcome, outcome: outcome), response: response, error: nil)
+            try awaitDelivery()
+            try require(pasted.count == pasteCount + 1, "Cleanup feedback blocked the normal one-time insertion")
+            let attention = DictationCleanupOutcome(status: outcome).attentionMessage
+            let panel = automatic.deliveryHUDs[next.id]
+            try require((panel != nil) == (attention != nil), "Paste success hid a cleanup issue or created a false warning for \(outcome)")
+            try require(automatic.store.entries.first?.cleanupOutcome?.status == outcome, "History lost cleanup outcome")
+            if let panel, let attention {
+                try require(panel.onRetryCleanup != nil, "Attention has no text-only retry action")
+                panel.onCopy?()
+                let message = Mirror(reflecting: panel).children.first { $0.label == "deliveryMessage" }?.value as? NSTextField
+                try require(message?.stringValue == attention + " · 已复制 · 按 ⌘V 粘贴", "Copy erased cleanup attention")
+                try require(pasted.count == pasteCount + 1, "Explicit Copy unexpectedly pasted a second time")
+                automatic.removeDeliveryHUD(next.id)
+            }
+        }
         automatic.invalidateHealthCallbacks()
         automatic.deliveryHUDs.removeAll(); automatic.deliveryHUDOrder.removeAll()
         let waiting = job(7), complete = job(8)
@@ -2236,6 +2396,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
                     "全局故障丢失了已完成但等待交付的原文、整理结果或来源。")
         try require(board.string(forType: .string) == boardBeforeFault && controller.streamingJobs.isEmpty,
                     "服务故障后仍自动修改剪贴板或遗留会话。")
+        for partial in ["", "已识别的一部分"] {
+            let interrupted = job(1); interrupted.partialText = partial
+            controller.streamingJobs = [interrupted]
+            let clipboardBefore = board.string(forType: .string)
+            controller.failStreamingJob(interrupted.id, message: "fixture transport failure", refresh: false)
+            let panel = controller.deliveryHUDs[interrupted.id]!
+            try require((panel.onRetryCleanup != nil) == !partial.isEmpty, "Empty ASR offered text retry, or partial ASR lost its retry")
+            try require(board.string(forType: .string) == clipboardBefore, "An incomplete ASR result silently changed the clipboard")
+            if !partial.isEmpty {
+                try require(interrupted.savedEntryID == controller.store.entries.first?.id &&
+                            controller.store.entries.first?.rawText == partial &&
+                            controller.store.entries.first?.cleanupOutcome?.reason == "incomplete_asr",
+                            "Partial result retry lost its source history association")
+            }
+            controller.removeDeliveryHUD(interrupted.id)
+        }
         controller.invalidateHealthCallbacks()
         for panel in controller.deliveryHUDs.values { panel.hide() }
         controller.deliveryHUDs.removeAll(); controller.deliveryHUDOrder.removeAll()
@@ -2451,7 +2627,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
     }
 
     static func verifyPromptSnapshots() throws {
-        let controller = AppDelegate()
+        let board = NSPasteboard(name: NSPasteboard.Name("local.dictation.prompt-snapshot.\(UUID())"))
+        defer { board.releaseGlobally() }
+        let target = FocusTarget(pid: -1, element: AXUIElementCreateApplication(-1), selection: Selection(location: 0, length: 0))
+        var pastes = 0
+        let controller = AppDelegate(inserter: TextInserter(board: board, permissionCheck: { nil }, targetReader: { target },
+            pasteKeySender: { _ in pastes += 1; return true }, foregroundPID: { -1 }))
         let model = CleanupPromptModel(id: "fixture-cleanup", kind: "local", ready: true)
         func catalog(_ id: String?, error: String? = nil) -> CleanupPromptCatalog {
             CleanupPromptCatalog(active_version_id: id, versions: [], current_model: model,
@@ -2480,9 +2661,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         controller.captureRecordingConfiguration()
         controller.receivePromptCatalog(.success(catalog("version-b")), generation: controller.promptGeneration)
         precondition(controller.activePreferences?.cleanupEnabled == false && controller.activePromptVersionID == nil && controller.activePromptWarning != nil)
-        controller.activePromptWarning = nil
+        let damagedReply = Data("""
+        {"raw_text":"保留原文","text":"保留原文","asr_seconds":0.2,"cleanup_seconds":0,"total_seconds":0.2,"cleanup_applied":false,
+         "cleanup_outcome":{"status":"skipped","reason":"disabled"}}
+        """.utf8)
+        let damagedID = UUID(); controller.sessionID = damagedID; controller.phase = .processing; controller.target = target
+        var damagedPreferences = controller.activePreferences!; damagedPreferences.autoInsertEnabled = true
+        let damagedResponse = HTTPURLResponse(url: serviceBase, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        controller.receiveDictationReply(id: damagedID, preferences: damagedPreferences, data: damagedReply, response: damagedResponse, error: nil)
+        precondition(pastes == 1 && controller.store.entries.first?.cleanupOutcome?.reason == "prompt_unavailable")
+        precondition(controller.hud?.onRetryCleanup != nil, "A forced ASR-only fallback was hidden after paste dispatch")
+        let warning = controller.hud.flatMap { Mirror(reflecting: $0).children.first { $0.label == "deliveryMessage" }?.value as? NSTextField }
+        precondition(warning?.stringValue == "整理未完成，已保留原文")
+        let userDisabled = try JSONDecoder().decode(DictationResult.self, from: damagedReply)
+        precondition(userDisabled.cleanupOutcome(requested: false)?.status == "skipped" &&
+                     userDisabled.cleanupOutcome(requested: false)?.attentionMessage == nil,
+                     "Intentional cleanup disable became a failure warning")
 
-        // Receive the actual wire contract without invoking insertion or IO.
+        // Receive the actual wire contract without invoking system insertion.
         let id = UUID(); controller.sessionID = id; controller.phase = .processing
         var preferences = DictationPreferences(); preferences.autoInsertEnabled = false
         let body = Data("""
@@ -2532,7 +2728,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             try require(!controller.serviceCanRecord && !controller.displayState.canStart, "服务 busy 时仍允许录音。")
             try require(controller.sessionID == nil && controller.request == nil, "失败请求未失效。")
             try require(controller.store.entries.count == 1 && controller.store.entries[0].text == "已保留的测试结果", "上次结果被改动。")
-            try require(controller.hud == nil && controller.recorder == nil, "故障模拟不应创建录音界面。")
+            try require(controller.recorder == nil && controller.hud?.isVisible == false && controller.hud?.onRetryCleanup == nil,
+                        "故障提示不应启动录音、抢焦点或在没有正文时提供整理重试。")
+            let feedback = controller.hud.flatMap { Mirror(reflecting: $0).children.first { $0.label == "deliveryMessage" }?.value as? NSTextField }
+            try require(feedback?.stringValue == "本段处理未完成 · 请重新口述", "上传失败没有给出准确的可恢复提示。")
             // Execute the scheduled retry itself to avoid a real four-second
             // delay; its generation and health callback guards remain active.
             controller.healthRetry?.perform()
@@ -2653,8 +2852,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         windowController?.updatePrompts(catalog: promptCatalog, busy: promptBusy, error: promptError)
     }
 
-    private func reprocessHistory(entryID: UUID, versionID: String) {
+    private func retryCleanup(entryID: UUID, panel: DictationHUD) {
+        guard reprocessGeneration == nil else {
+            if reprocessHUD !== panel { panel.showDelivery(message: "另一段正在重新整理，请稍后再试", needsPermission: false, show: !suppressStreamingPresentation) }
+            return
+        }
+        guard let versionID = promptCatalog?.active_version_id, promptCatalogCurrent else {
+            panel.showDelivery(message: "润色规则尚未就绪，请稍后重试", needsPermission: false, show: !suppressStreamingPresentation)
+            loadPrompts(); return
+        }
+        reprocessHistory(entryID: entryID, versionID: versionID, feedbackHUD: panel)
+    }
+
+    private func reprocessHistory(entryID: UUID, versionID: String, feedbackHUD: DictationHUD? = nil) {
         guard reprocessGeneration == nil else { return }
+        reprocessHUD = feedbackHUD
+        reprocessHUDGeneration = feedbackHUD?.dismissalGeneration ?? 0
         reprocessEntryID = entryID; reprocessError = nil
         guard supportsReprocess, cleanupBackend == .local else {
             reprocessError = "当前服务尚不支持本地历史重新整理，请更新并检查服务。"
@@ -2687,13 +2900,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         reprocessTask = nil; reprocessGeneration = nil
         switch result {
         case .success(let value):
-            guard value.cleanup_applied, let profile = value.cleanup_profile,
+            guard value.cleanup_applied, !["failed", "skipped"].contains(value.cleanup_outcome?.status ?? ""), let profile = value.cleanup_profile,
                   profile.versionID == expectedVersionID, profile.contentSHA256 == expectedHash else {
                 reprocessError = "返回的润色规则不匹配，未保存本次结果。"
                 updateReprocessUI(); updateUI(); return
             }
+            let outcome = value.cleanup_outcome ?? .legacy(raw: value.raw_text, text: value.text, applied: value.cleanup_applied)
             if store.addRevision(entryID: entryID, text: value.text, cleanupSeconds: value.cleanup_seconds,
-                                 cleanupProfile: profile) == nil {
+                                 cleanupProfile: profile, cleanupOutcome: outcome) == nil {
                 reprocessError = "原记录已删除或结果无效，未保存本次结果。"
             } else { reprocessError = nil }
         case .failure(let error): reprocessError = error.localizedDescription
@@ -2706,6 +2920,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
     private func updateReprocessUI() {
         windowController?.updateReprocessing(entryID: reprocessEntryID,
             busy: reprocessGeneration != nil, error: reprocessError)
+        guard let panel = reprocessHUD, let entryID = reprocessEntryID else { return }
+        // A dismissed or reused card no longer owns this asynchronous result.
+        // Persist the revision, but never bring a closed notification back.
+        guard panel.dismissalGeneration == reprocessHUDGeneration else { reprocessHUD = nil; return }
+        if reprocessGeneration != nil {
+            panel.showDelivery(message: "正在重新整理", needsPermission: false, show: !suppressStreamingPresentation, retrying: true)
+        } else if let error = reprocessError {
+            // Keep the original result and retry callback. A failed retry must
+            // not overwrite the clipboard or imply the previous text was fixed.
+            panel.showDelivery(message: "重新整理未完成 · " + error, needsPermission: false, show: !suppressStreamingPresentation)
+        } else if let revision = store.entries.first(where: { $0.id == entryID })?.revisions?.last {
+            let saved = store.hasUnsavedHistory ? "新结果尚未保存，请复制" : "新版本已保存"
+            let attention = revision.cleanupOutcome?.attentionMessage
+            let message = attention.map { $0 + " · " + saved } ?? saved
+            configureResultHUD(panel, entryID: entryID, message: message, text: revision.text, attention: attention)
+            panel.onViewResult = { [weak self] in
+                guard let self else { return }
+                self.showResults(); self.windowController?.showPage(.history)
+                self.windowController?.showReprocessing(entryID: entryID, revisionID: revision.id)
+            }
+            panel.showDelivery(message: message, needsPermission: false, show: !suppressStreamingPresentation)
+        }
     }
 
     private func configureCorrectionLearning() {
@@ -2907,9 +3143,14 @@ private final class NativeFailureURLProtocol: URLProtocol {
     private static var failure: Failure = .transport
     private static var paths: [String] = []
     private static var promptHeaders: [String] = []
+    private static var cleanupReply: Data?
+    static func configureCleanup(_ data: Data) {
+        lock.lock(); defer { lock.unlock() }
+        cleanupReply = data; paths = []; promptHeaders = []
+    }
     static func configure(_ failure: Failure) {
         lock.lock(); defer { lock.unlock() }
-        self.failure = failure; paths = []; promptHeaders = []
+        self.failure = failure; paths = []; promptHeaders = []; cleanupReply = nil
     }
     static func recordedPaths() -> [String] {
         lock.lock(); defer { lock.unlock() }; return paths
@@ -2923,8 +3164,9 @@ private final class NativeFailureURLProtocol: URLProtocol {
         guard let url = request.url else { return }
         Self.lock.lock()
         Self.paths.append(url.path)
-        if url.path == "/dictate" { Self.promptHeaders.append(request.value(forHTTPHeaderField: "X-Cleanup-Prompt-Version") ?? "") }
+        if url.path == "/dictate" || url.path == "/cleanup/reprocess" { Self.promptHeaders.append(request.value(forHTTPHeaderField: "X-Cleanup-Prompt-Version") ?? "") }
         let failure = Self.failure
+        let cleanupReply = Self.cleanupReply
         let healthCount = Self.paths.filter { $0 == "/health" }.count
         Self.lock.unlock()
         if url.path == "/dictate", failure == .transport {
@@ -2932,7 +3174,9 @@ private final class NativeFailureURLProtocol: URLProtocol {
         }
         let status: Int
         let body: Data
-        if url.path == "/health" {
+        if url.path == "/cleanup/reprocess", let cleanupReply {
+            status = 200; body = cleanupReply
+        } else if url.path == "/health" {
             status = 200
             body = Data("""
             {"service":"local-dictation","status":"ready","ready":true,"asr_ready":true,"cleanup_ready":true,"busy":\(healthCount == 1 ? "true" : "false"),"message":"fixture","supports_options":true}
@@ -3167,7 +3411,7 @@ private func selfTest() throws {
     try AppDelegate.verifyPromptSnapshots()
     try AppDelegate.verifyUploadFailureRecovery()
     try AppDelegate.verifyStreamingQueue()
-    AppDelegate.verifyHistoryReprocessing()
+    try AppDelegate.verifyHistoryReprocessing()
     print("本地口述自检通过：Fn 元数据状态机、组合键校验、选项快照、版本能力、整理方式文案、焦点变化、权限拒绝、恢复预算、迟到回调。未录音、未监听按键、未请求权限、未发送按键、未启动后端。")
 }
 
