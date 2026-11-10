@@ -2,7 +2,7 @@
 
 在 Mac 上按快捷键说话，结束后把整理好的文字填入当前输入框。音频识别与默认文字整理都在本机运行。
 
-Mac 源码版本：**0.5.9 测试版**；当前 Mac 公开下载为 **0.5.8**。首发支持 **Apple Silicon Mac / macOS 14 或更新版本**。Windows x64 首个预览版使用 WPF、CPU Whisper 和 Qwen；[Windows 下载](https://github.com/WillfordZhan/LocalDictation/releases/tag/v0.6.0-windows-preview.1)与[安装说明](windows/README.md)独立提供。Windows 自动纠错学习、热力图和 GPU 加速尚未移植。
+Mac 源码版本：**0.5.11 测试版**；当前 Mac 公开下载为 **0.5.8**。首发支持 **Apple Silicon Mac / macOS 14 或更新版本**。Windows x64 首个预览版使用 WPF、CPU Whisper 和 Qwen；[Windows 下载](https://github.com/WillfordZhan/LocalDictation/releases/tag/v0.6.0-windows-preview.1)与[安装说明](windows/README.md)独立提供。Windows 自动纠错学习、热力图和 GPU 加速尚未移植。
 
 ## 使用
 
@@ -18,6 +18,7 @@ Mac 源码版本：**0.5.9 测试版**；当前 Mac 公开下载为 **0.5.8**。
 - **边说边识别**：Qwen3-ASR 中文识别，停录后使用全文进行一次整理，保留跨段改口上下文。
 - **后台口述**：关闭主窗口后仍可通过快捷键录音；多段分别显示状态并依次填入。
 - **波形选择**：设置中可切换“灵动 / 柔和”，保持声音起落的及时响应；录音与整理浮窗使用统一的紧凑宽度。
+- **本地模型切换**：在“模型与配置”中选择 Qwen3.5 4B（默认）或 9B，检查并应用。首次只下载所选档位，已下载文件直接复用；两档不会同时加载。切换须等待口述与整理完成，模型选择在重启后保留。
 - **更快整理**：复用固定规则与示例的计算结果；首次请求仍需建立缓存，长段仍需逐字生成。
 - **自然表达**：Prompt 版本可以查看、编辑、试用和切换，历史记录保留当次模型与规则信息。
 - **历史重新整理**：选择原 ASR 记录及另一版 Prompt，保存新结果并与原输出比较，不覆盖原记录。

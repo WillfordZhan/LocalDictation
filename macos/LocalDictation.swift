@@ -1474,6 +1474,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         state.accessibilityAllowed = permission.accessibility && permission.postEvent
         state.automaticInsertionPermissionDetails = "辅助功能：\(permission.accessibility ? "已允许" : "未生效") · 粘贴按键：\(permission.postEvent ? "已允许" : "未生效")"
         windowController?.updateState(state)
+        setupController?.refreshConfigurationAvailability()
         updateHUD()
     }
 
@@ -1590,6 +1591,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
     }
 
     private func recordBackendLifecycle(event: String, pid: pid_t?, reason: String?, code: Int32?) {
+        // Fixture children must not appear as real backend launches in the
+        // user's diagnostics; native self-tests and previews are isolated.
+        guard !CommandLine.arguments.contains("--self-test"), !CommandLine.arguments.contains("--render-preview") else { return }
         // Process identity and exit metadata only: no audio, transcript,
         // clipboard data, environment, or exception payload enters this log.
         var record: [String: Any] = ["time": ISO8601DateFormatter().string(from: Date()),
@@ -1737,6 +1741,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         process.arguments = [script.path]
         process.currentDirectoryURL = runtime
         var environment = ProcessInfo.processInfo.environment
+        // The app's model picker owns the saved runtime selection. A shell or
+        // login environment must not silently override it on the next launch.
+        // Direct CLI launches may still use start.sh's explicit override.
+        environment.removeValue(forKey: "LOCAL_DICTATION_CLEANUP_MODEL")
         environment["LOCAL_DICTATION_WORK_DIR"] = runtime.path
         if let python = bundledPython {
             environment["LOCAL_DICTATION_PYTHON"] = python.path
@@ -2246,7 +2254,31 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             script: controller.runtimeDirectory.appendingPathComponent("backend/start.sh"), available: true, log: nil)
         precondition(controller.ownedBackend == nil)
         controller.terminating = true; controller.cancelPendingBackendLaunch(); controller.invalidateHealthCallbacks()
-        print("PASS setup guards: recording, external service, owned child exit, stale launch exclusion")
+
+        let runtime = FileManager.default.temporaryDirectory.appendingPathComponent("dictation-model-launch-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: runtime) }
+        let selection = runtime.appendingPathComponent("cleanup-model")
+        try "cleanup-9b\n".write(to: selection, atomically: true, encoding: .utf8)
+        let script = runtime.appendingPathComponent("start.sh")
+        try "#!/bin/bash\nexec /bin/sleep 10\n".write(to: script, atomically: true, encoding: .utf8)
+        let previousOverride = ProcessInfo.processInfo.environment["LOCAL_DICTATION_CLEANUP_MODEL"]
+        setenv("LOCAL_DICTATION_CLEANUP_MODEL", "cleanup", 1)
+        defer {
+            if let previousOverride { setenv("LOCAL_DICTATION_CLEANUP_MODEL", previousOverride, 1) }
+            else { unsetenv("LOCAL_DICTATION_CLEANUP_MODEL") }
+        }
+        let launcher = AppDelegate(serviceSession: session)
+        let launchID = UUID(); launcher.backendLaunching = true; launcher.backendLaunchID = launchID
+        launcher.completeBackendLaunch(id: launchID, runtime: runtime, script: script, available: true, log: nil)
+        guard let launched = launcher.ownedBackend else { preconditionFailure("Fixture backend did not launch") }
+        launcher.terminating = true; launcher.invalidateHealthCallbacks()
+        launched.terminationHandler = nil
+        defer { if launched.isRunning { launched.terminate(); launched.waitUntilExit() } }
+        precondition(launched.environment?["LOCAL_DICTATION_CLEANUP_MODEL"] == nil)
+        let retainedSelection = try String(contentsOf: selection, encoding: .utf8)
+        precondition(retainedSelection == "cleanup-9b\n")
+        print("PASS setup guards: recording, external service, owned child exit, stale launch exclusion, GUI model selection cannot be overridden by inherited environment")
     }
 
     static func verifyPromptSnapshots() throws {

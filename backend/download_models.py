@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 
-from model_artifacts import (artifact_path, file_matches, inspect_model,
+from model_artifacts import (CLEANUP_MODEL_IDS, artifact_path, file_matches, inspect_model,
                              selected_models, write_receipt)
 
 
@@ -166,8 +166,12 @@ def prepare_model(models_dir, model, events, fetch_file=hf_fetch):
     return {**identity, "path": str(destination), "revision": model["revision"], "reused": False}
 
 
-def download_models(models_dir, asr_backend="qwen", events=None, *, manifest=None, fetch_file=hf_fetch):
+def download_models(models_dir, asr_backend="qwen", events=None, *, cleanup_model="cleanup",
+                    manifest=None, fetch_file=hf_fetch):
     events = events or Events()
+    # Resolve first so an invalid selection cannot create staging directories or
+    # fetch another tier. Optional models already on disk remain untouched.
+    selected = selected_models(asr_backend, manifest, cleanup_model)
     models_dir = Path(models_dir)
     if models_dir.is_symlink(): raise ValueError("模型安装目录不能是符号链接。")
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -178,7 +182,7 @@ def download_models(models_dir, asr_backend="qwen", events=None, *, manifest=Non
         except BlockingIOError as exc:
             raise OSError("已有模型下载正在进行，请等待或取消后重试。") from exc
         result = [prepare_model(models_dir, model, events, fetch_file)
-                  for model in selected_models(asr_backend, manifest)]
+                  for model in selected]
     events.emit("complete", models=result, ready=True, message="所选语音识别与整理模型已就绪，可离线使用。")
     return result
 
@@ -187,13 +191,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--models-dir", type=Path, required=True)
     parser.add_argument("--asr-backend", choices=("whisper", "qwen"), default="qwen")
+    parser.add_argument("--cleanup-model", choices=CLEANUP_MODEL_IDS, default="cleanup")
     parser.add_argument("--json-events", action="store_true", help="stdout 仅输出安装事件 JSONL")
     args = parser.parse_args(argv)
     events = Events(args.json_events)
     def cancelled(signum, frame): raise DownloadCancelled()
     previous = {number: signal.signal(number, cancelled) for number in (signal.SIGINT, signal.SIGTERM)}
     try:
-        download_models(args.models_dir, args.asr_backend, events)
+        download_models(args.models_dir, args.asr_backend, events, cleanup_model=args.cleanup_model)
         return 0
     except DownloadCancelled:
         events.emit("cancelled", retryable=True, message="下载已取消，已完成的文件保留，重试时会跳过这些文件。")

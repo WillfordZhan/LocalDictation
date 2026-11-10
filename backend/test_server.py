@@ -933,15 +933,38 @@ class ASRBackendTests(unittest.TestCase):
         self.assertNotEqual(calls[0][1],threading.get_ident())
 
     def test_cli_selects_model_path_and_defaults_to_whisper(self):
-        for arguments, expected in (([],"whisper"),(["--asr-backend","qwen"],"qwen")):
-            with self.subTest(backend=expected):
+        from model_artifacts import load_manifest
+        catalog = load_manifest()
+        for arguments, expected, cleanup in (([], "whisper", "cleanup"),
+                (["--asr-backend", "qwen"], "qwen", "cleanup"),
+                (["--asr-backend", "qwen", "--cleanup-model", "cleanup-9b"], "qwen", "cleanup-9b")):
+            with self.subTest(backend=expected, cleanup=cleanup):
                 with patch.object(sys,"argv",["server.py","--models-dir","/fixtures",*arguments]), \
                      patch("server.LocalModels") as models, patch("server.DictationService"), \
                      patch("server.ThreadingHTTPServer"), patch("server.logging.basicConfig"):
                     server_module.main()
                 name="Qwen3-ASR-1.7B-8bit" if expected=="qwen" else "whisper-large-v3-turbo"
                 models.assert_called_once_with(Path("/fixtures")/name,
-                    Path("/fixtures/Qwen3-4B-Instruct-2507-4bit"),asr_backend=expected)
+                    Path("/fixtures")/catalog[cleanup]["directory"],asr_backend=expected)
+
+    def test_cli_rejects_asr_or_unknown_cleanup_before_loading_models(self):
+        for choice in ("qwen", "missing", ""):
+            with self.subTest(choice=choice), patch("sys.stderr", new=io.StringIO()), \
+                 patch("server.LocalModels") as models, self.assertRaises(SystemExit) as stopped:
+                server_module.main(["--cleanup-model", choice])
+            self.assertEqual(stopped.exception.code, 2)
+            models.assert_not_called()
+
+    def test_cli_missing_selected_cleanup_never_loads_default(self):
+        from model_artifacts import load_manifest
+        catalog = load_manifest()
+        catalog.pop("cleanup-9b", None)
+        with patch("model_artifacts.load_manifest", return_value=catalog), \
+             patch("sys.stderr", new=io.StringIO()), patch("server.LocalModels") as models, \
+             self.assertRaises(SystemExit) as stopped:
+            server_module.main(["--cleanup-model", "cleanup-9b"])
+        self.assertEqual(stopped.exception.code, 2)
+        models.assert_not_called()
 
 
 class ModelOptionsTests(unittest.TestCase):

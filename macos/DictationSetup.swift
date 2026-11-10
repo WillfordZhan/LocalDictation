@@ -17,6 +17,14 @@ struct InstallationReport: Decodable {
     let required_download_bytes: Int64?
     let download_block_reason: String?
     let asr_backend: String?
+    let cleanup_model: String?
+    let service_busy: Bool?
+}
+
+enum CleanupModelChoice: String, CaseIterable {
+    case standard = "cleanup"
+    case larger = "cleanup-9b"
+    var title: String { self == .standard ? "Qwen3.5 4B（默认）" : "Qwen3.5 9B" }
 }
 struct ModelDownloadEvent: Decodable {
     let schema: Int
@@ -89,6 +97,8 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     private let resources: URL
     private let message = NSTextField(wrappingLabelWithString: "检查这台 Mac 的运行环境与模型。")
     private let rows = NSStackView()
+    private let cleanupPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let cleanupCaption = NSTextField(labelWithString: "")
     private let progress = NSProgressIndicator()
     private let configure = NSButton(title: "一键配置", target: nil, action: nil)
     private let download = NSButton(title: "下载模型", target: nil, action: nil)
@@ -104,6 +114,9 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     private var report: InstallationReport?
     private enum CheckIntent { case check, prepare, verifyDownload }
     private var activeASR = "qwen"
+    private var appliedCleanup: CleanupModelChoice?
+    private var selectedCleanup: CleanupModelChoice
+    private var activeCleanup: CleanupModelChoice
     private var downloadLease = false
     private var shuttingDown = false
     private var fraction: Double?
@@ -114,6 +127,18 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
 
     init(runtime: URL, resources: URL) {
         self.runtime = runtime; self.resources = resources
+        let selection = runtime.appendingPathComponent("cleanup-model")
+        // The runtime file is the single source of truth shared with start.sh.
+        // An invalid saved choice remains unapplied until explicitly configured.
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: selection.path) {
+            // Never read a pipe/device or follow a link on the UI thread.
+            // Invalid entries stay recoverable through explicit configuration.
+            if attributes[.type] as? FileAttributeType == .typeRegular {
+                let stored = (try? String(contentsOf: selection, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+                appliedCleanup = stored.flatMap(CleanupModelChoice.init(rawValue:))
+            } else { appliedCleanup = nil }
+        } else { appliedCleanup = FileManager.default.fileExists(atPath: selection.path) ? nil : .standard }
+        selectedCleanup = appliedCleanup ?? .standard; activeCleanup = selectedCleanup
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 700),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "模型与配置"; window.isReleasedWhenClosed = false
@@ -141,6 +166,23 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
         message.identifier = NSUserInterfaceItemIdentifier("setup-message")
         stack.addArrangedSubview(title); stack.addArrangedSubview(message)
         message.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        let modelLabel = NSTextField(labelWithString: "文字润色模型")
+        modelLabel.font = .systemFont(ofSize: 14, weight: .semibold); modelLabel.textColor = Palette.ink
+        cleanupPicker.addItems(withTitles: CleanupModelChoice.allCases.map(\.title))
+        cleanupPicker.selectItem(at: CleanupModelChoice.allCases.firstIndex(of: selectedCleanup) ?? 0)
+        cleanupPicker.font = .systemFont(ofSize: 13)
+        cleanupPicker.identifier = NSUserInterfaceItemIdentifier("setup-cleanup-model")
+        cleanupPicker.target = self; cleanupPicker.action = #selector(selectCleanupModel)
+        cleanupPicker.setAccessibilityLabel("文字润色模型")
+        let modelRow = NSStackView(views: [modelLabel, NSView(), cleanupPicker]); modelRow.spacing = 16
+        let modelSection = NSStackView(views: [modelRow, cleanupCaption])
+        modelSection.orientation = .vertical; modelSection.alignment = .leading; modelSection.spacing = 6
+        cleanupCaption.font = .systemFont(ofSize: 12); cleanupCaption.textColor = Palette.muted
+        cleanupCaption.identifier = NSUserInterfaceItemIdentifier("setup-cleanup-caption")
+        stack.addArrangedSubview(modelSection)
+        modelSection.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        modelRow.widthAnchor.constraint(equalTo: modelSection.widthAnchor).isActive = true
+        updateCleanupCaption()
         rows.orientation = .vertical; rows.alignment = .leading; rows.spacing = 14
         rows.translatesAutoresizingMaskIntoConstraints = false
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
@@ -207,6 +249,26 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     @objc private func allowInsertion() { onAccessibility?() }
     @objc private func allowMonitoring() { onInputMonitoring?() }
     @objc private func checkOnly() { checkConfiguration(intent: .check) }
+    @objc private func selectCleanupModel() {
+        guard !busy, !shuttingDown, canConfigure(), CleanupModelChoice.allCases.indices.contains(cleanupPicker.indexOfSelectedItem) else {
+            cleanupPicker.selectItem(at: CleanupModelChoice.allCases.firstIndex(of: selectedCleanup) ?? 0); return
+        }
+        selectedCleanup = CleanupModelChoice.allCases[cleanupPicker.indexOfSelectedItem]
+        report = nil; updateCleanupCaption()
+        checkConfiguration(intent: .check)
+    }
+    private func updateCleanupCaption() {
+        cleanupCaption.stringValue = appliedCleanup == selectedCleanup
+            ? "当前配置 · \(selectedCleanup.title)"
+            : "完成一键配置后切换，当前模型继续使用。"
+    }
+    func refreshConfigurationAvailability() {
+        let available = !busy && !shuttingDown
+        cleanupPicker.isEnabled = available && canConfigure()
+        configure.isEnabled = available && canConfigure()
+        download.isEnabled = available && canConfigure() && report?.can_download == true && report?.blocked == false
+        check.isEnabled = available
+    }
     @objc private func prepareAll() {
         guard !busy, !shuttingDown else { return }
         guard canConfigure() else { message.stringValue = "本次口述结束后再配置，当前录音与结果会保留。"; return }
@@ -220,9 +282,7 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     private func setBusy(_ value: Bool, _ text: String) {
         busy = value; message.stringValue = text
         message.toolTip = text
-        configure.isEnabled = !value && !shuttingDown
-        download.isEnabled = !value && !shuttingDown && report?.can_download == true && report?.blocked == false
-        check.isEnabled = !value && !shuttingDown
+        refreshConfigurationAvailability()
         cancel.isHidden = !value; cancel.isEnabled = value
         fraction = nil; updateProgress()
     }
@@ -238,15 +298,15 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     }
     private func checkConfiguration(intent: CheckIntent) {
         guard (!busy || intent == .verifyDownload), !shuttingDown else { return }
-        if intent != .verifyDownload { cancelled = false }
+        if intent != .verifyDownload { cancelled = false; activeCleanup = selectedCleanup }
         guard FileManager.default.isExecutableFile(atPath: pythonURL.path) else {
             finishWork("安装包缺少内置运行环境，请重新下载完整应用。"); return
         }
         setBusy(true, "正在检查运行环境与模型…")
-        // Diagnose the stored selection rather than silently replacing an
-        // invalid value with a default. Downloads freeze the diagnosed choice.
+        // Check the pending dropdown choice without saving it. Download and
+        // final verification keep this same choice frozen until completion.
         run("diagnose.py", arguments: ["--installation", "--json", "--runtime-dir", runtime.path,
-                                       "--python-bin", pythonURL.path]) { [weak self] status, output, _, failure in
+                                       "--python-bin", pythonURL.path, "--cleanup-model", activeCleanup.rawValue]) { [weak self] status, output, _, failure in
             guard let self else { return }
             if self.shuttingDown { self.releaseDownload(); return }
             if self.cancelled { self.finishWork("已取消，可随时重新检查。"); return }
@@ -254,14 +314,22 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
                   report.schema == 1, report.checks.count <= 128 else {
                 self.finishWork(failure ?? "检查未完成（退出码 \(status)），请重新检查或重新安装完整应用。"); return
             }
+            guard report.cleanup_model == self.activeCleanup.rawValue else {
+                self.report = nil
+                self.finishWork("检查结果与所选润色模型不一致，请重新检查。"); return
+            }
             self.report = report
             if let selected = report.asr_backend, ["qwen", "whisper"].contains(selected) { self.activeASR = selected }
             self.render(report)
             switch intent {
             case .check:
-                self.finishWork(report.ready ? "运行环境与模型已就绪。" : report.can_download ? "检查完成，可继续配置模型。" : report.download_block_reason ?? "请先处理上方的运行环境问题。")
+                let readyMessage = self.activeCleanup == self.appliedCleanup ? "运行环境与模型已就绪。" : "所选模型已就绪，点击“一键配置”应用。"
+                self.finishWork(report.ready ? readyMessage : report.can_download ? "检查完成，可继续配置模型。" : report.download_block_reason ?? "请先处理上方的运行环境问题。")
             case .prepare:
-                if report.ready { self.finishPreparation() }
+                if report.ready {
+                    if self.activeCleanup != self.appliedCleanup { self.prepareServiceForConfiguration(download: false) }
+                    else { self.finishPreparation() }
+                }
                 else if report.blocked || !report.can_download { self.finishWork(report.download_block_reason ?? "请先处理上方的运行环境问题，再配置模型。") }
                 else { self.downloadModels() }
             case .verifyDownload:
@@ -294,6 +362,15 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
             let requirement = needed.addingReportingOverflow(512 * 1024 * 1024)
             if requirement.overflow || free < requirement.partialValue { finishWork("磁盘空间不足，请腾出空间后重试。"); return }
         }
+        prepareServiceForConfiguration(download: true)
+    }
+    /// A downloaded model still needs the same safe-stop lease before changing
+    /// start.sh's selection. Readiness never grants permission to stop recording
+    /// or replace a service owned by another application.
+    private func prepareServiceForConfiguration(download: Bool) {
+        // A ready installation can still have active backend work after a UI
+        // request timed out. Do not stop it merely because this window is idle.
+        guard canConfigure(), report?.service_busy != true else { finishWork(report?.download_block_reason ?? "本次口述结束后再配置模型。"); return }
         guard let prepareDownload else { finishWork("暂时无法安全配置模型，请重新打开应用后重试。"); return }
         setBusy(true, "正在准备模型配置，等待本地服务安全退出…")
         downloadLease = true; let token = UUID(); generation = token
@@ -303,7 +380,7 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
                 if self.shuttingDown { self.releaseDownload(); return }
                 if self.cancelled { self.finishWork("已取消，模型与记录保持不变。"); return }
                 guard allowed, self.canConfigure() else { self.finishWork("当前服务无法安全停止。请结束口述或关闭其他本地服务后重试。"); return }
-                self.startModelTask()
+                if download { self.startModelTask() } else { self.finishPreparation() }
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
@@ -314,7 +391,7 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
     private func startModelTask() {
         setBusy(true, "正在配置模型，完整文件会直接复用。关闭窗口后仍会继续。")
         run("download_models.py", arguments: ["--models-dir", runtime.appendingPathComponent("models").path,
-                                              "--asr-backend", activeASR, "--json-events"], events: { [weak self] event in
+                                              "--asr-backend", activeASR, "--cleanup-model", activeCleanup.rawValue, "--json-events"], events: { [weak self] event in
             guard let self, !self.cancelled else { return }
             if event.event == "start" { self.fraction = nil; self.updateProgress() }
             if event.event == "verified" || event.event == "complete" {
@@ -341,11 +418,16 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
         }
     }
     private func finishPreparation() {
-        guard !cancelled, !shuttingDown, canConfigure() else { finishWork("模型已就绪，本次口述结束后可再次完成配置。"); return }
+        guard !cancelled, !shuttingDown, canConfigure(), report?.service_busy != true else { finishWork("模型已就绪，本次口述结束后可再次完成配置。"); return }
+        guard activeCleanup == appliedCleanup || downloadLease else { finishWork("请结束口述后重新配置，当前模型保持不变。"); return }
         do {
             try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
             let selection = runtime.appendingPathComponent("asr-backend")
             if !FileManager.default.fileExists(atPath: selection.path) { try (activeASR + "\n").write(to: selection, atomically: true, encoding: .utf8) }
+            if activeCleanup != appliedCleanup || downloadLease {
+                try (activeCleanup.rawValue + "\n").write(to: runtime.appendingPathComponent("cleanup-model"), atomically: true, encoding: .utf8)
+                appliedCleanup = activeCleanup; updateCleanupCaption()
+            }
             finishWork("模型已就绪，正在启动本地服务。"); onReady?(); refreshPermissions()
         } catch { finishWork("无法保存配置：" + error.localizedDescription) }
     }

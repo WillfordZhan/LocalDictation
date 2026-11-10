@@ -15,6 +15,7 @@ import uuid
 
 MANIFEST_PATH = Path(__file__).with_name("model-manifest.json")
 RECEIPT_NAME = "local-dictation-source.json"
+CLEANUP_MODEL_IDS = ("cleanup", "cleanup-9b")
 
 
 def load_manifest(path=MANIFEST_PATH):
@@ -27,6 +28,8 @@ def load_manifest(path=MANIFEST_PATH):
             raise ValueError("模型清单存在重复标识或无效 revision。")
         if PurePosixPath(model["directory"]).name != model["directory"] or model["directory"] in ("", ".", ".."):
             raise ValueError("模型目录必须是单个目录名。")
+        if model.get("kind") not in ("asr", "cleanup"):
+            raise ValueError("模型类型必须是 asr 或 cleanup。")
         paths = set()
         for item in model["files"]:
             relative = PurePosixPath(item["path"])
@@ -38,14 +41,24 @@ def load_manifest(path=MANIFEST_PATH):
         if not paths:
             raise ValueError("模型文件清单为空。")
         found[model["id"]] = model
-    if set(found) != {"qwen", "whisper", "cleanup"}:
+    if not {"qwen", "whisper", "cleanup"}.issubset(found):
         raise ValueError("模型清单缺少必要的识别或整理模型。")
     return found
 
 
-def selected_models(asr_backend, manifest=None):
+def selected_models(asr_backend, manifest=None, cleanup_model="cleanup"):
+    """Resolve only the selected pair; an unavailable choice never changes tier."""
     models = load_manifest() if manifest is None else manifest
-    return [models[asr_backend], models["cleanup"]]
+    if asr_backend not in ("qwen", "whisper"):
+        raise ValueError("不支持的语音识别模型。")
+    if cleanup_model not in CLEANUP_MODEL_IDS:
+        raise ValueError("不支持的整理模型，仅支持 cleanup 或 cleanup-9b。")
+    asr, cleanup = models.get(asr_backend), models.get(cleanup_model)
+    if not isinstance(asr, dict) or asr.get("kind") != "asr":
+        raise ValueError("所选语音识别模型不在清单中或类型不正确。")
+    if not isinstance(cleanup, dict) or cleanup.get("kind") != "cleanup":
+        raise ValueError("所选整理模型不在清单中或类型不正确。")
+    return [asr, cleanup]
 
 
 def artifact_path(directory, relative):

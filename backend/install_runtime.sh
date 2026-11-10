@@ -31,6 +31,17 @@ if [[ -z "$ASR_BACKEND" && -f "$RUNTIME_DIR/asr-backend" ]]; then
 fi
 ASR_BACKEND="${ASR_BACKEND:-whisper}"
 case "$ASR_BACKEND" in whisper|qwen) ;; *) fail "不支持的语音模型：${ASR_BACKEND}（仅支持 whisper 或 qwen）。" ;; esac
+if [[ -e "$RUNTIME_DIR/cleanup-model" || -L "$RUNTIME_DIR/cleanup-model" ]]; then
+  [[ -f "$RUNTIME_DIR/cleanup-model" && ! -L "$RUNTIME_DIR/cleanup-model" ]] || fail "润色模型配置不是普通文件：$RUNTIME_DIR/cleanup-model"
+fi
+if [[ "${LOCAL_DICTATION_CLEANUP_MODEL+x}" == x ]]; then
+  CLEANUP_MODEL="$LOCAL_DICTATION_CLEANUP_MODEL"
+elif [[ -f "$RUNTIME_DIR/cleanup-model" ]]; then
+  CLEANUP_MODEL="$(cat "$RUNTIME_DIR/cleanup-model")"
+else
+  CLEANUP_MODEL=cleanup
+fi
+case "$CLEANUP_MODEL" in cleanup|cleanup-9b) ;; *) fail "不支持的润色模型：${CLEANUP_MODEL}（仅支持 cleanup 或 cleanup-9b）。" ;; esac
 LOCK_DIR="$RUNTIME_DIR/.install-lock"
 mkdir "$LOCK_DIR" 2>/dev/null || fail "已有安装进行中或留下锁：${LOCK_DIR}；请确认没有安装进程后再处理该空目录。"
 finish() {
@@ -67,7 +78,7 @@ trap 'exit 143' TERM
 
 echo "安装目标：$RUNTIME_DIR"
 echo "请确保 App 和后端已停止；本脚本不会停止任何进程，也不会下载文件。"
-echo "语音模型选择：${ASR_BACKEND}（全部成功后才保存）。"
+echo "模型选择：语音 ${ASR_BACKEND}，润色 ${CLEANUP_MODEL}（全部成功后才保存）。"
 
 copy_tree() {
   local name="$1" source="$2" stage source_device target_device
@@ -152,23 +163,32 @@ else
 fi
 validate_venv "$VENV_CANDIDATE"
 VALIDATION_PYTHON="$VENV_CANDIDATE/bin/python"
+# The same catalog drives first-run downloads and this copy-only installer.
+# Optional editor weights already on disk are retained, but never required.
+CLEANUP_DIRECTORY="$("$VALIDATION_PYTHON" -I -B - "$BACKEND_DIR" "$CLEANUP_MODEL" <<'PYNAME'
+import sys
+sys.path.insert(0, sys.argv[1])
+from model_artifacts import load_manifest
+print(load_manifest()[sys.argv[2]]["directory"])
+PYNAME
+)" || fail "润色模型清单无法读取。"
 
 validate_models() {
   local directory="$1"
-  LOCAL_DICTATION_EXPECTED_ASR_BACKEND="$ASR_BACKEND" "$VALIDATION_PYTHON" -I -B - "$directory" <<'PY' || fail "模型目录校验失败；保留已有文件，请检查后重试。"
+  LOCAL_DICTATION_EXPECTED_ASR_BACKEND="$ASR_BACKEND" LOCAL_DICTATION_EXPECTED_CLEANUP_MODEL="$CLEANUP_MODEL" "$VALIDATION_PYTHON" -I -B - "$directory" "$BACKEND_DIR" <<'PY' || fail "模型目录校验失败；保留已有文件，请检查后重试。"
 import json
 import os
 from pathlib import Path
 import sys
 
 root = Path(sys.argv[1])
-required = {
-    "Qwen3-4B-Instruct-2507-4bit": (
-        "model.safetensors", "config.json", "tokenizer.json", "tokenizer_config.json",
-    ),
-}
+sys.path.insert(0, sys.argv[2])
+from model_artifacts import load_manifest
+catalog = load_manifest()
+selected = [catalog[os.environ["LOCAL_DICTATION_EXPECTED_CLEANUP_MODEL"]]]
 if os.environ["LOCAL_DICTATION_EXPECTED_ASR_BACKEND"] == "whisper":
-    required["whisper-large-v3-turbo"] = ("weights.safetensors", "config.json")
+    selected.append(catalog["whisper"])
+required = {model["directory"]: tuple(item["path"] for item in model["files"]) for model in selected}
 for model, files in required.items():
     if (root / model).is_symlink():
         raise RuntimeError(f"模型目录仍是符号链接：{root / model}")
@@ -216,12 +236,12 @@ if [[ -e "$MODELS_DIR" || -L "$MODELS_DIR" ]]; then
   [[ -d "$MODELS_DIR" && ! -L "$MODELS_DIR" ]] || fail "已有模型路径不是普通目录：$MODELS_DIR"
   echo "复用已有模型目录。"
 else
-  # Copy only the selected ASR and common editor. Qwen is added from its
+  # Copy only the selected ASR and editor. Qwen is added from its
   # explicit source below; existing optional Whisper assets are never deleted.
   MODEL_STAGE="$(mktemp -d "$RUNTIME_DIR/.install-models.XXXXXX")"
   MODELS_CANDIDATE="$MODEL_STAGE/models"
   mkdir "$MODELS_CANDIDATE"
-  MODEL_NAMES=(Qwen3-4B-Instruct-2507-4bit)
+  MODEL_NAMES=("$CLEANUP_DIRECTORY")
   if [[ "$ASR_BACKEND" == whisper ]]; then MODEL_NAMES+=(whisper-large-v3-turbo); fi
   for name in "${MODEL_NAMES[@]}"; do
     copy_tree "$name" "$SOURCE_WORK/models/$name"
@@ -315,13 +335,15 @@ validate_venv "$VENV_DIR"
 VALIDATION_PYTHON="$VENV_DIR/bin/python"
 validate_models "$MODELS_DIR"
 if [[ "$ASR_BACKEND" == qwen ]]; then validate_qwen_model "$QWEN_TARGET"; fi
-# The backend choice is the commit point: failures before this keep the previous
-# choice and roll back any published directory. Atomic rename avoids partial text.
+# Publish both selections through the rollback journal as well. If the second
+# write fails, the earlier choice and all prepared directories are restored.
 printf '%s\n' "$ASR_BACKEND" > "$BACKEND_STAGE/asr-backend"
-mv "$BACKEND_STAGE/asr-backend" "$RUNTIME_DIR/asr-backend"
+printf '%s\n' "$CLEANUP_MODEL" > "$BACKEND_STAGE/cleanup-model"
+publish_tree "$BACKEND_STAGE/asr-backend" "$RUNTIME_DIR/asr-backend" asr-backend
+publish_tree "$BACKEND_STAGE/cleanup-model" "$RUNTIME_DIR/cleanup-model" cleanup-model
 INSTALL_COMPLETE=true
 
 echo "安装完成。Python、模型与后端位于：$RUNTIME_DIR"
-echo "语音模型已选择：${ASR_BACKEND}；原 Whisper 模型与其他用户数据保留。"
+echo "已选择语音 ${ASR_BACKEND}、润色 ${CLEANUP_DIRECTORY}；其他模型与用户数据保留。"
 echo "App 可使用 LOCAL_DICTATION_WORK_DIR=Runtime 目录启动 backend/start.sh。"
 echo "原工作区的 work/ 文件保持不变；本脚本没有启动服务。"

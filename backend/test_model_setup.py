@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -18,13 +19,16 @@ from model_artifacts import RECEIPT_NAME, inspect_model, load_manifest, selected
 
 def fixtures():
     manifest, payloads = {}, {}
-    for number, identifier in enumerate(("qwen", "whisper", "cleanup"), 1):
+    for number, identifier in enumerate(("qwen", "whisper", "cleanup", "cleanup-9b"), 1):
         files = []
-        for name in ("config.json", "weights.bin"):
+        names = ("config.json", "weights-00001-of-00002.safetensors", "weights-00002-of-00002.safetensors") \
+            if identifier == "cleanup-9b" else ("config.json", "weights.bin")
+        for name in names:
             body = (identifier + ":" + name).encode()
             payloads[identifier, name] = body
             files.append({"path": name, "size": len(body), "sha256": hashlib.sha256(body).hexdigest()})
         manifest[identifier] = {"id": identifier, "repo_id": "test/" + identifier,
+            "kind": "cleanup" if identifier.startswith("cleanup") else "asr",
             "revision": str(number) * 40, "directory": "test-" + identifier, "files": files}
     return manifest, payloads
 
@@ -54,17 +58,36 @@ class ModelSetupTests(unittest.TestCase):
         (stage / item["path"]).write_bytes(self.payloads[model["id"], item["path"]])
         progress(item["size"])
 
-    def run_download(self, asr="qwen", fetch=None):
+    def run_download(self, asr="qwen", fetch=None, cleanup_model="cleanup"):
         return downloader.download_models(self.models, asr, self.events,
-            manifest=self.manifest, fetch_file=fetch or self.fetch)
+            cleanup_model=cleanup_model, manifest=self.manifest, fetch_file=fetch or self.fetch)
 
     def test_official_inventory_is_pinned_and_complete(self):
         catalog = load_manifest()
         self.assertEqual([m["id"] for m in selected_models("qwen", catalog)], ["qwen", "cleanup"])
-        self.assertEqual({key: len(model["files"]) for key, model in catalog.items()},
-                         {"qwen": 10, "whisper": 3, "cleanup": 12})
+        self.assertEqual(set(catalog), {"qwen", "whisper", "cleanup", "cleanup-9b"})
+        self.assertEqual(len(catalog["qwen"]["files"]), 10)
+        self.assertEqual(len(catalog["whisper"]["files"]), 3)
         self.assertEqual(sum(i["size"] for i in catalog["qwen"]["files"]), 2467857511)
-        self.assertEqual(sum(i["size"] for i in catalog["cleanup"]["files"]), 2278970666)
+        for choice, name in (("cleanup", "Qwen3.5-4B-4bit"), ("cleanup-9b", "Qwen3.5-9B-4bit")):
+            model = selected_models("qwen", catalog, choice)[1]
+            self.assertEqual(model["directory"], name)
+            self.assertEqual(model["kind"], "cleanup")
+            self.assertTrue(any(item["path"].endswith(".safetensors") for item in model["files"]))
+
+    def test_selection_rejects_unknown_missing_or_wrong_kind_without_fallback(self):
+        for choice in ("qwen", "unknown", "", None):
+            with self.subTest(choice=choice), self.assertRaisesRegex(ValueError, "整理模型"):
+                selected_models("qwen", self.manifest, choice)
+        self.manifest["cleanup-9b"]["kind"] = "asr"
+        with self.assertRaisesRegex(ValueError, "类型"):
+            selected_models("qwen", self.manifest, "cleanup-9b")
+        del self.manifest["cleanup-9b"]
+        self.assertEqual(selected_models("qwen", self.manifest)[1]["id"], "cleanup")
+        with self.assertRaisesRegex(ValueError, "清单"):
+            self.run_download(cleanup_model="cleanup-9b")
+        self.assertFalse(self.models.exists())
+        self.assertFalse(self.calls)
 
     def test_default_only_fetches_qwen_and_cleanup_and_preserves_optional_assets(self):
         optional = self.models / "test-whisper"
@@ -89,6 +112,27 @@ class ModelSetupTests(unittest.TestCase):
         self.assertTrue(all(row["reused"] for row in result))
         self.assertFalse((self.models / "test-qwen").exists())
         self.assertTrue((self.models / "test-whisper" / RECEIPT_NAME).is_file())
+
+    def test_explicit_9b_only_fetches_selected_pair_and_keeps_4b(self):
+        other = self.models / self.manifest["cleanup"]["directory"]
+        populate(other, self.manifest["cleanup"], self.payloads, receipt=True)
+        before = {path.name: path.read_bytes() for path in other.iterdir()}
+        result = self.run_download(cleanup_model="cleanup-9b")
+        self.assertEqual([row["id"] for row in result], ["qwen", "cleanup-9b"])
+        self.assertEqual({row[0] for row in self.calls}, {"qwen", "cleanup-9b"})
+        self.assertEqual({path.name: path.read_bytes() for path in other.iterdir()}, before)
+        self.assertTrue(inspect_model(self.models / "test-cleanup-9b", self.manifest["cleanup-9b"])["ready"])
+
+    def test_download_cli_passes_selected_cleanup_and_rejects_other_models(self):
+        for arguments, expected in (([], "cleanup"), (["--cleanup-model", "cleanup-9b"], "cleanup-9b")):
+            with self.subTest(expected=expected), mock.patch.object(downloader, "download_models") as download:
+                self.assertEqual(downloader.main(["--models-dir", str(self.models), *arguments]), 0)
+                self.assertEqual(download.call_args.kwargs["cleanup_model"], expected)
+        with mock.patch.object(downloader, "download_models") as download, \
+             mock.patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit) as stopped:
+            downloader.main(["--models-dir", str(self.models), "--cleanup-model", "qwen"])
+        self.assertEqual(stopped.exception.code, 2)
+        download.assert_not_called()
 
     def test_failure_keeps_installed_model_and_retry_reuses_completed_staged_files(self):
         old = self.models / "test-qwen"
@@ -142,8 +186,8 @@ class ModelSetupTests(unittest.TestCase):
         def cancel_fetch(model, item, stage, progress, force_download=False):
             if item["path"] == "weights.bin": os.kill(os.getpid(), signal.SIGTERM)
             self.fetch(model, item, stage, progress, force_download)
-        with mock.patch.object(downloader, "download_models", side_effect=lambda directory, asr, events:
-            real_download(directory, asr, events, manifest=self.manifest, fetch_file=cancel_fetch)), redirect_stdout(self.output):
+        with mock.patch.object(downloader, "download_models", side_effect=lambda directory, asr, events, **kwargs:
+            real_download(directory, asr, events, manifest=self.manifest, fetch_file=cancel_fetch, **kwargs)), redirect_stdout(self.output):
             result = downloader.main(["--models-dir", str(self.models), "--json-events"])
         self.assertEqual(result, 130)
         self.assertEqual(json.loads(self.output.getvalue().splitlines()[-1])["event"], "cancelled")
@@ -224,6 +268,7 @@ class InstallationReportTests(unittest.TestCase):
         self.assertFalse(result["ready"]); self.assertFalse(result["blocked"])
         self.assertTrue(result["can_download"]); self.assertFalse(self.runtime.exists())
         self.assertEqual(result["asr_backend"], "qwen")
+        self.assertEqual(result["cleanup_model"], "cleanup")
         self.assertEqual([row["id"] for row in result["models"]], ["qwen", "cleanup"])
         expected = sum(i["size"] for m in selected_models("qwen", self.manifest) for i in m["files"])
         self.assertEqual(result["required_download_bytes"], expected)
@@ -256,6 +301,123 @@ class InstallationReportTests(unittest.TestCase):
         result = self.report(); ids = [row["id"] for row in result["checks"]]
         self.assertEqual(len(ids), len(set(ids)))
         self.assertTrue(result["blocked"])
+
+    def test_saved_cleanup_selection_only_checks_current_tier_and_missing_shards(self):
+        for model in self.manifest.values():
+            populate(self.runtime / "models" / model["directory"], model, self.payloads, receipt=True)
+        (self.runtime / "cleanup-model").write_text("cleanup-9b\n")
+        result = self.report()
+        self.assertEqual(result["cleanup_model"], "cleanup-9b")
+        self.assertEqual([row["id"] for row in result["models"]], ["qwen", "cleanup-9b"])
+        self.assertTrue(result["ready"])
+        missing = "weights-00002-of-00002.safetensors"
+        (self.runtime / "models/test-cleanup-9b" / missing).unlink()
+        result = self.report()
+        self.assertFalse(result["ready"])
+        self.assertTrue(result["can_download"])
+        self.assertEqual(result["models"][1]["invalid_files"], [missing])
+        self.assertEqual(result["models"][1]["id"], "cleanup-9b")
+        # A valid 4B installation cannot make the requested 9B look ready.
+        self.assertTrue(self.report(cleanup_model="cleanup")["ready"])
+
+    def test_invalid_or_unreadable_saved_cleanup_selection_is_explicitly_blocked(self):
+        self.runtime.mkdir()
+        selection = self.runtime / "cleanup-model"
+        for value in ("", "qwen", "unknown"):
+            with self.subTest(value=value):
+                selection.write_text(value)
+                result = self.report()
+                self.assertEqual(result["cleanup_model"], value)
+                self.assertTrue(result["blocked"])
+                self.assertFalse(result["can_download"])
+                self.assertEqual(next(row for row in result["checks"] if row["id"] == "cleanup_selection")["status"], "invalid")
+        selection.unlink(); selection.mkdir()
+        self.assertEqual(self.report()["cleanup_model"], "unreadable")
+
+    def test_diagnostic_cli_uses_explicit_cleanup_selection(self):
+        for args, expected in (([], None), (["--cleanup-model", "cleanup-9b"], "cleanup-9b")):
+            with self.subTest(expected=expected), mock.patch.object(diagnose, "installation_report", return_value={"checks": []}) as report:
+                diagnose.main(["--installation", "--runtime-dir", str(self.runtime), *args])
+                self.assertEqual(report.call_args.kwargs["cleanup_model"], expected)
+
+    def test_cleanup_selection_links_and_fifo_are_invalid_without_reading(self):
+        self.runtime.mkdir()
+        selection = self.runtime / "cleanup-model"
+        target = self.runtime / "selection-target"
+        for exists in (False, True):
+            with self.subTest(target_exists=exists):
+                if exists: target.write_text("cleanup-9b")
+                selection.symlink_to(target)
+                result = self.report()
+                self.assertEqual(result["cleanup_model"], "unreadable")
+                self.assertTrue(result["blocked"])
+                self.assertEqual(self.report(cleanup_model="cleanup")["cleanup_model"], "cleanup")
+                selection.unlink()
+        os.mkfifo(selection)
+        self.assertEqual(self.report()["cleanup_model"], "unreadable")
+
+
+class StartupSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="dictation-start-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.runtime = Path(self.temporary.name)
+        self.python = self.runtime / "python"
+        self.python.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        self.python.chmod(0o700)
+        self.environment = {key: value for key, value in os.environ.items()
+                            if not key.startswith("LOCAL_DICTATION_")}
+        self.environment.update(LOCAL_DICTATION_WORK_DIR=str(self.runtime), LOCAL_DICTATION_PYTHON=str(self.python))
+
+    def start(self):
+        return subprocess.run(["/bin/bash", str(Path(__file__).with_name("start.sh"))],
+                              env=self.environment, capture_output=True, text=True, timeout=5)
+
+    def test_missing_selection_defaults_and_saved_selection_survives_launcher(self):
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--cleanup-model\ncleanup\n", result.stdout)
+        (self.runtime / "cleanup-model").write_text("cleanup-9b\n")
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--cleanup-model\ncleanup-9b\n", result.stdout)
+        self.environment["LOCAL_DICTATION_CLEANUP_MODEL"] = "cleanup"
+        self.assertIn("--cleanup-model\ncleanup\n", self.start().stdout)
+
+    def test_invalid_saved_or_environment_selection_never_launches_other_tier(self):
+        selection = self.runtime / "cleanup-model"
+        for value in ("", "qwen", "unknown"):
+            with self.subTest(value=value):
+                selection.write_text(value)
+                result = self.start()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("整理模型", result.stderr)
+        selection.write_text("cleanup-9b")
+        self.environment["LOCAL_DICTATION_CLEANUP_MODEL"] = ""
+        self.assertNotEqual(self.start().returncode, 0)
+        self.environment.pop("LOCAL_DICTATION_CLEANUP_MODEL")
+        selection.unlink(); selection.mkdir()
+        self.assertIn("无法读取整理模型配置", self.start().stderr)
+
+    def test_link_and_fifo_selection_fail_without_starting_or_blocking(self):
+        selection = self.runtime / "cleanup-model"
+        target = self.runtime / "selection-target"
+        for exists in (False, True):
+            with self.subTest(target_exists=exists):
+                if exists: target.write_text("cleanup-9b")
+                selection.symlink_to(target)
+                result = self.start()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("普通文件", result.stderr)
+                selection.unlink()
+        os.mkfifo(selection)
+        result = self.start()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("普通文件", result.stderr)
+        self.environment["LOCAL_DICTATION_CLEANUP_MODEL"] = "cleanup"
+        self.assertEqual(self.start().returncode, 0)
 
 
 if __name__ == "__main__":

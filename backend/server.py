@@ -1051,17 +1051,25 @@ def make_handler(service):
     return Handler
 
 
-def main():
+def main(argv=None):
+    # The Windows service imports the shared HTTP implementation but owns its
+    # own artifact catalog. Resolve the Mac catalog only in this entry point.
+    from model_artifacts import CLEANUP_MODEL_IDS, selected_models
+
     root = Path(__file__).resolve().parents[3]
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--models-dir", type=Path, default=root / "work" / "models")
     parser.add_argument("--asr-backend", choices=("whisper", "qwen"), default="whisper")
-    args = parser.parse_args()
+    parser.add_argument("--cleanup-model", choices=CLEANUP_MODEL_IDS, default="cleanup")
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    asr_name = "Qwen3-ASR-1.7B-8bit" if args.asr_backend == "qwen" else "whisper-large-v3-turbo"
-    models = LocalModels(args.models_dir / asr_name,
-                         args.models_dir / "Qwen3-4B-Instruct-2507-4bit", asr_backend=args.asr_backend)
+    try:
+        asr, cleanup = selected_models(args.asr_backend, cleanup_model=args.cleanup_model)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        parser.error(str(exc))
+    models = LocalModels(args.models_dir / asr["directory"],
+                         args.models_dir / cleanup["directory"], asr_backend=args.asr_backend)
     service = DictationService(models)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(service))
     server.daemon_threads = True

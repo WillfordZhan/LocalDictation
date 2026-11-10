@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.request
 
-from model_artifacts import inspect_model, load_manifest, selected_models
+from model_artifacts import CLEANUP_MODEL_IDS, inspect_model, load_manifest, selected_models
 
 
 PACKAGE = Path(__file__).resolve().parent.parent
@@ -46,7 +46,7 @@ print(json.dumps({'version': platform.python_version(), 'machine': platform.mach
 
 
 def installation_report(runtime_dir=RUNTIME, python_bin=None, asr_backend=None, *, deep=False,
-                        backend_dir=None, manifest=None):
+                        backend_dir=None, manifest=None, cleanup_model=None):
     runtime_dir = Path(runtime_dir)
     backend_dir = Path(backend_dir) if backend_dir else Path(__file__).resolve().parent
     python_bin = Path(python_bin) if python_bin else runtime_dir / "local-dictation-venv/bin/python"
@@ -71,6 +71,18 @@ def installation_report(runtime_dir=RUNTIME, python_bin=None, asr_backend=None, 
     valid_selection = asr_backend in ("qwen", "whisper")
     check("asr_selection", "ok" if valid_selection else "invalid",
           "识别模型选择有效。" if valid_selection else "识别模型配置不可读取或不受支持。")
+    if cleanup_model is None:
+        selection = runtime_dir / "cleanup-model"
+        try:
+            if selection.is_symlink() or (selection.exists() and not selection.is_file()):
+                cleanup_model = "unreadable"
+            else:
+                cleanup_model = selection.read_text().strip() if selection.exists() else "cleanup"
+        except OSError:
+            cleanup_model = "unreadable"
+    valid_cleanup = cleanup_model in CLEANUP_MODEL_IDS
+    check("cleanup_selection", "ok" if valid_cleanup else "invalid",
+          "整理模型选择有效。" if valid_cleanup else "整理模型配置不可读取或不受支持。")
     if not python_bin.is_file() or not os.access(python_bin, os.X_OK):
         check("python", "missing", "Python 运行环境未就绪。", python_bin)
     else:
@@ -102,11 +114,11 @@ def installation_report(runtime_dir=RUNTIME, python_bin=None, asr_backend=None, 
     models = []
     try:
         catalog = load_manifest(backend_dir / "model-manifest.json") if manifest is None else manifest
-        if valid_selection:
-            for model in selected_models(asr_backend, catalog):
+        if valid_selection and valid_cleanup:
+            for model in selected_models(asr_backend, catalog, cleanup_model):
                 status = inspect_model(runtime_dir / "models" / model["directory"], model, deep=deep)
                 models.append(status)
-                title = "文字整理" if model["id"] == "cleanup" else "语音识别"
+                title = "文字整理" if model["kind"] == "cleanup" else "语音识别"
                 check("model_" + model["id"], status["status"], title + " · " + status["message"], status["path"])
     except (OSError, ValueError, KeyError, TypeError):
         check("model_manifest", "invalid", "模型校验清单不可读取或内容无效。")
@@ -119,7 +131,8 @@ def installation_report(runtime_dir=RUNTIME, python_bin=None, asr_backend=None, 
             "can_download": bool(not blocked and models and not ready and not busy),
             "download_block_reason": "语音服务正在处理录音，请完成后再配置模型。" if busy else None,
             "service_busy": busy, "checks": checks, "models": models,
-            "asr_backend": asr_backend, "runtime_dir": str(runtime_dir), "python_bin": str(python_bin),
+            "asr_backend": asr_backend, "cleanup_model": cleanup_model,
+            "runtime_dir": str(runtime_dir), "python_bin": str(python_bin),
             "required_download_bytes": sum(row["required_download_bytes"] for row in models) if models else None,
             "verification": "sha256" if deep else "receipt_and_stat", "health": health}
 
@@ -296,7 +309,7 @@ def print_human(report):
     print("未读取录音或转写内容，未调用模型，未修改或保存诊断文件。")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="只读检查本地口述进程、健康状态及最近崩溃报告。")
     parser.add_argument("--json", action="store_true", help="输出 JSON，便于复制诊断结果")
     parser.add_argument("--hours", type=float, default=24, help="崩溃报告的最近时间窗口，默认 24 小时")
@@ -304,10 +317,13 @@ def main():
     parser.add_argument("--runtime-dir", type=Path, default=RUNTIME)
     parser.add_argument("--python-bin", type=Path, help="待检查的内置 Python；默认兼容旧 Runtime venv")
     parser.add_argument("--asr-backend", choices=("qwen", "whisper"))
+    parser.add_argument("--cleanup-model", choices=CLEANUP_MODEL_IDS,
+                        help="检查指定整理模型；默认使用 Runtime 中的选择，未配置时使用 cleanup")
     parser.add_argument("--deep", action="store_true", help="对模型重算完整 SHA-256，不加载模型")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.installation:
-        report = installation_report(args.runtime_dir, args.python_bin, args.asr_backend, deep=args.deep)
+        report = installation_report(args.runtime_dir, args.python_bin, args.asr_backend,
+                                     deep=args.deep, cleanup_model=args.cleanup_model)
         if args.json:
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:

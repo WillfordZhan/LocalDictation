@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 
 /// Real native controls and child-process pipes, with a temporary fake Python
 /// executable. No production runtime, network, model or permission is touched.
@@ -50,9 +51,10 @@ enum DictationSetupChecks {
         let controller: DictationSetupWindowController
         let root: NSView
         let configure: NSButton, download: NSButton, check: NSButton, cancel: NSButton
+        let cleanup: NSPopUpButton
         let message: NSTextField, progress: NSProgressIndicator
         var prepared = 0, released = 0, ready = 0
-        init() throws {
+        init(savedCleanup: String? = nil, selectionKind: String? = nil) throws {
             directory = FileManager.default.temporaryDirectory.appendingPathComponent("dictation-setup-check-" + UUID().uuidString)
             runtime = directory.appendingPathComponent("Runtime"); resources = directory.appendingPathComponent("Resources")
             let bin = resources.appendingPathComponent("Python/bin")
@@ -84,12 +86,29 @@ enum DictationSetupChecks {
             """#
             try script.write(to: executable, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+            if let savedCleanup {
+                try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+                try (savedCleanup + "\n").write(to: runtime.appendingPathComponent("cleanup-model"), atomically: true, encoding: .utf8)
+            }
+            if let selectionKind {
+                try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+                let selection = runtime.appendingPathComponent("cleanup-model")
+                switch selectionKind {
+                case "symlink":
+                    let target = directory.appendingPathComponent("linked-selection")
+                    try "cleanup-9b\n".write(to: target, atomically: true, encoding: .utf8)
+                    try FileManager.default.createSymbolicLink(at: selection, withDestinationURL: target)
+                case "fifo": try require(mkfifo(selection.path, 0o600) == 0, "Could not create isolated FIFO fixture")
+                default: try FileManager.default.createDirectory(at: selection, withIntermediateDirectories: true)
+                }
+            }
             controller = DictationSetupWindowController(runtime: runtime, resources: resources)
             root = controller.window!.contentView!
             configure = try find("setup-configure", in: root)
             download = try find("setup-download", in: root)
             check = try find("setup-check", in: root)
             cancel = try find("setup-cancel", in: root)
+            cleanup = try find("setup-cleanup-model", in: root)
             message = try find("setup-message", in: root)
             progress = try find("setup-progress", in: root)
             controller.prepareDownload = { [weak self] done in self?.prepared += 1; done(true) }
@@ -99,12 +118,12 @@ enum DictationSetupChecks {
             try report(ready: true, filename: "ready.json")
             try mode("hold")
         }
-        func report(ready: Bool, filename: String = "report.json", long: Bool = false, blocked: String? = nil, asr: String? = nil) throws {
+        func report(ready: Bool, filename: String = "report.json", long: Bool = false, blocked: String? = nil, asr: String? = nil, cleanup: String = "cleanup", serviceBusy: Bool = false) throws {
             let row: [String: Any] = ["id": "model", "status": ready ? "ok" : "missing",
                 "message": long ? String(repeating: "模型校验与运行环境示例，完整文件会直接复用。", count: 8) : ready ? "本机运行环境与模型已就绪。" : "尚未下载语音识别与文字整理模型。"]
             var report: [String: Any] = ["schema": 1, "ready": ready, "blocked": false, "can_download": !ready && blocked == nil,
                 "checks": long ? (0..<12).map { index -> [String: Any] in var copy = row; copy["id"] = "row-\(index)"; return copy } : [row],
-                "required_download_bytes": ready ? 0 : 100]
+                "required_download_bytes": ready ? 0 : 100, "cleanup_model": cleanup, "service_busy": serviceBusy]
             if let blocked { report["download_block_reason"] = blocked }
             if let asr { report["asr_backend"] = asr }
             try JSONSerialization.data(withJSONObject: report).write(to: resources.appendingPathComponent(filename))
@@ -118,6 +137,15 @@ enum DictationSetupChecks {
         func calls(_ script: String) -> Int {
             ((try? String(contentsOf: resources.appendingPathComponent("invocations"), encoding: .utf8)) ?? "")
                 .split(separator: "\n").filter { $0.hasSuffix("/" + script + ".py") }.count
+        }
+        var savedCleanup: String? { try? String(contentsOf: runtime.appendingPathComponent("cleanup-model"), encoding: .utf8) }
+        func choose(_ choice: CleanupModelChoice) {
+            cleanup.selectItem(at: CleanupModelChoice.allCases.firstIndex(of: choice)!)
+            NSApp.sendAction(cleanup.action!, to: cleanup.target, from: cleanup)
+        }
+        func argument(_ name: String, script: String) throws -> String? {
+            let args = try String(contentsOf: resources.appendingPathComponent(script + ".py.args"), encoding: .utf8).split(separator: "\n").map(String.init)
+            return args.firstIndex(of: name).flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }
         }
         func releaseWorker() throws { try Data().write(to: resources.appendingPathComponent("release")) }
         func send(_ event: String) throws {
@@ -145,6 +173,9 @@ enum DictationSetupChecks {
         try errorsAndFinalVerification()
         try pendingCancellationAndSafety()
         try asrChoiceFreeze()
+        try cleanupModelDownloadsAndPersistence()
+        try readyCleanupSwitchAndSafety()
+        try cleanupSwitchFailures()
         try closeAndShutdown()
     }
     static func parserBounds() throws {
@@ -271,6 +302,116 @@ enum DictationSetupChecks {
         try wait("choice download cancelled") { f.check.isEnabled && f.released == 1 }
         let retained = try String(contentsOf: f.runtime.appendingPathComponent("asr-backend"), encoding: .utf8)
         try require(retained == "qwen\n", "Cancelled download rewrote the current ASR preference")
+    }
+    static func cleanupModelDownloadsAndPersistence() throws {
+        for choice in CleanupModelChoice.allCases {
+            let previous: CleanupModelChoice = choice == .standard ? .larger : .standard
+            let f = try Fixture(savedCleanup: previous.rawValue); defer { f.dispose() }
+            try f.report(ready: false, cleanup: choice.rawValue)
+            try f.report(ready: true, filename: "ready.json", cleanup: choice.rawValue)
+            try f.mode("success")
+            f.choose(choice)
+            try wait("selected model check") { f.check.isEnabled && f.message.stringValue.contains("检查完成") }
+            try require(f.savedCleanup == previous.rawValue + "\n" && f.prepared == 0 && f.ready == 0, "Choosing a model changed saved selection or stopped the service")
+            let checked = try f.argument("--cleanup-model", script: "diagnose")
+            try require(checked == choice.rawValue, "Check did not inspect selected cleanup model")
+            f.configure.performClick(nil)
+            try require(!f.cleanup.isEnabled, "Model picker stayed enabled during configuration")
+            try wait("selected model applied") { f.ready == 1 && f.released == 1 }
+            let downloaded = try f.argument("--cleanup-model", script: "download_models")
+            let verified = try f.argument("--cleanup-model", script: "diagnose")
+            try require(downloaded == choice.rawValue && verified == choice.rawValue && f.prepared == 1 && f.calls("download_models") == 1, "Download and verification did not share the selected model or safe-stop lease")
+            try require(f.savedCleanup == choice.rawValue + "\n" && f.cleanup.isEnabled, "Successful configuration did not persist selection or unlock picker")
+            // A new controller reads only the external runtime file, as it does
+            // after relaunch; no DictationPreferences or in-memory cache assists.
+            let reopened = DictationSetupWindowController(runtime: f.runtime, resources: f.resources)
+            defer { reopened.shutdown(); reopened.window?.close() }
+            let picker: NSPopUpButton = try find("setup-cleanup-model", in: reopened.window!.contentView!)
+            try require(picker.titleOfSelectedItem == choice.title, "Relaunched setup lost the saved cleanup model")
+            let recheck: NSButton = try find("setup-check", in: reopened.window!.contentView!)
+            recheck.performClick(nil)
+            try wait("reopened selected model checked") { recheck.isEnabled }
+            let restarted = try f.argument("--cleanup-model", script: "diagnose")
+            try require(restarted == choice.rawValue, "Relaunched setup diagnosed a different cleanup model")
+            if choice == .larger { try snapshot(reopened.window!.contentView!, name: "setup-9b-applied.png") }
+        }
+    }
+    static func readyCleanupSwitchAndSafety() throws {
+        let f = try Fixture(); defer { f.dispose() }
+        try require(f.cleanup.titleOfSelectedItem == CleanupModelChoice.standard.title && f.savedCleanup == nil, "Missing selection did not default to 4B without writing")
+        try f.report(ready: true, cleanup: "cleanup-9b")
+        f.choose(.larger)
+        try wait("ready 9B checked") { f.check.isEnabled && f.message.stringValue.contains("已就绪") }
+        try snapshot(f.root, name: "setup-9b-pending.png")
+        var answer: ((Bool) -> Void)?
+        f.controller.prepareDownload = { done in f.prepared += 1; answer = done }
+        f.configure.performClick(nil)
+        try wait("ready model lease requested") { answer != nil }
+        try require(f.savedCleanup == nil && f.ready == 0 && !f.cleanup.isEnabled && f.calls("download_models") == 0, "Ready model switched before service safely stopped")
+        f.choose(.standard)
+        try require(f.cleanup.titleOfSelectedItem == CleanupModelChoice.larger.title, "Busy model choice was not frozen")
+        answer?(true)
+        try wait("ready model switch") { f.ready == 1 && f.released == 1 }
+        try require(f.savedCleanup == "cleanup-9b\n" && f.calls("download_models") == 0, "Ready switch downloaded again or failed to persist")
+
+        let denied = try Fixture(savedCleanup: "cleanup"); defer { denied.dispose() }
+        try denied.report(ready: true, cleanup: "cleanup-9b")
+        denied.choose(.larger)
+        try wait("external switch checked") { denied.check.isEnabled }
+        denied.controller.prepareDownload = { done in denied.prepared += 1; done(false) }
+        denied.configure.performClick(nil)
+        try wait("external switch refused") { denied.released == 1 }
+        try require(denied.savedCleanup == "cleanup\n" && denied.ready == 0 && denied.prepared == 1, "External service guard did not protect ready-model selection")
+
+        let backendBusy = try Fixture(savedCleanup: "cleanup"); defer { backendBusy.dispose() }
+        try backendBusy.report(ready: true, cleanup: "cleanup-9b", serviceBusy: true)
+        backendBusy.choose(.larger); try wait("busy backend checked") { backendBusy.check.isEnabled }
+        backendBusy.configure.performClick(nil); try wait("ready busy backend refused") { backendBusy.check.isEnabled }
+        try require(backendBusy.savedCleanup == "cleanup\n" && backendBusy.prepared == 0 && backendBusy.ready == 0,
+            "Ready model bypassed active backend work and requested a stop")
+
+        let recording = try Fixture(savedCleanup: "cleanup"); defer { recording.dispose() }
+        recording.controller.canConfigure = { false }; recording.controller.refreshConfigurationAvailability()
+        recording.choose(.larger); recording.configure.performClick(nil)
+        try require(!recording.cleanup.isEnabled && recording.cleanup.titleOfSelectedItem == CleanupModelChoice.standard.title
+            && recording.savedCleanup == "cleanup\n" && recording.calls("diagnose") == 0 && recording.prepared == 0, "Recording permitted model change or configuration")
+    }
+    static func cleanupSwitchFailures() throws {
+        for kind in ["symlink", "fifo", "directory"] {
+            let started = Date()
+            let invalid = try Fixture(selectionKind: kind); defer { invalid.dispose() }
+            try require(Date().timeIntervalSince(started) < 2 && invalid.cleanup.titleOfSelectedItem == CleanupModelChoice.standard.title,
+                "Non-regular selection \(kind) was read or blocked the UI")
+            let caption: NSTextField = try find("setup-cleanup-caption", in: invalid.root)
+            try require(!caption.stringValue.contains("当前配置"), "Invalid selection was displayed as an applied configuration")
+            try require(FileManager.default.fileExists(atPath: invalid.runtime.appendingPathComponent("cleanup-model").path), "Checking invalid preference removed it")
+        }
+        for mode in ["error", "incomplete", "hold"] {
+            let f = try Fixture(savedCleanup: "cleanup"); defer { f.dispose() }
+            try f.report(ready: false, cleanup: "cleanup-9b"); try f.mode(mode)
+            f.choose(.larger); try wait("failing model checked") { f.check.isEnabled }
+            f.configure.performClick(nil)
+            if mode == "hold" {
+                try wait("download ready for cancel") { f.progress.doubleValue == 0.4 }
+                f.cancel.performClick(nil)
+            }
+            try wait("failed or cancelled selection") { f.check.isEnabled && f.released == 1 }
+            try require(f.savedCleanup == "cleanup\n" && f.ready == 0, "Failed or cancelled \(mode) changed saved cleanup model")
+        }
+        let mismatch = try Fixture(savedCleanup: "cleanup"); defer { mismatch.dispose() }
+        try mismatch.report(ready: true, cleanup: "cleanup")
+        mismatch.choose(.larger); try wait("wrong model report rejected") { mismatch.check.isEnabled }
+        try require(mismatch.message.stringValue.contains("不一致") && mismatch.savedCleanup == "cleanup\n" && mismatch.prepared == 0, "Report for another model was accepted")
+
+        let cancelled = try Fixture(savedCleanup: "cleanup"); defer { cancelled.dispose() }
+        try cancelled.report(ready: true, cleanup: "cleanup-9b")
+        cancelled.choose(.larger); try wait("ready cancellation checked") { cancelled.check.isEnabled }
+        var answer: ((Bool) -> Void)?
+        cancelled.controller.prepareDownload = { done in cancelled.prepared += 1; answer = done }
+        cancelled.configure.performClick(nil); try wait("ready cancellation lease") { answer != nil }
+        cancelled.cancel.performClick(nil); answer?(true)
+        try wait("ready switch cancellation settled") { cancelled.released == 1 }
+        try require(cancelled.savedCleanup == "cleanup\n" && cancelled.ready == 0 && cancelled.calls("download_models") == 0, "Cancelled ready-model switch changed selection")
     }
     static func closeAndShutdown() throws {
         let f = try Fixture(); defer { f.dispose() }
