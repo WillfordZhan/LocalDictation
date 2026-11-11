@@ -38,7 +38,7 @@ enum DictationAppIconStyle: String, Codable, CaseIterable {
     case dotFormation = "dot-formation"
     case softMist = "soft-mist"
     case darkGlow = "dark-glow"
-    static let manualChoices: [Self] = [.dotFormation, .softMist]
+    static let manualChoices: [Self] = [.dotFormation, .softMist, .darkGlow]
     var title: String {
         switch self { case .dotFormation: return "点阵成型"; case .softMist: return "柔雾显影"; case .darkGlow: return "暗色辉光" }
     }

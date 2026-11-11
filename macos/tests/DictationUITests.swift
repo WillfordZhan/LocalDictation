@@ -846,9 +846,20 @@ enum DictationUIChecks {
         try require(appliedChoice.state == .on, "applied choice did not update the radio state")
         try click("点阵成型", in: root)
         try require(requests.count == 1, "clicking the selected icon repeated an OS update")
+        try click("暗色辉光", in: root)
+        try require(requests.last == .darkGlow && store.preferences.appIconStyle == .dotFormation,
+                    "dark glow is missing or persists before the OS update succeeds")
+        _ = store.setAppIconStyle(.darkGlow, followsSystemAppearance: false)
+        controller.updateAppIconSelection(busy: false, error: nil, appliedStyle: .darkGlow)
+        let darkChoice = try button("暗色辉光", in: root)
+        try require(darkChoice.state == .on, "manual dark glow is not selected after applying")
+        controller.window?.setContentSize(NSSize(width: 1000, height: 700))
         controller.window?.contentView?.layoutSubtreeIfNeeded()
         let left = try button("点阵成型", in: root), right = try button("柔雾显影", in: root)
-        try require(abs(left.frame.width - 164) < 1 && abs(right.frame.width - 164) < 1,
+        try require(abs(left.frame.width - 164) < 1 && abs(right.frame.width - 164) < 1 && abs(darkChoice.frame.width - 164) < 1,
                     "icon cards unexpectedly stretched across the settings page")
+        let lastBounds = darkChoice.convert(darkChoice.bounds, to: root)
+        try require(lastBounds.minX > right.convert(right.bounds, to: root).maxX && lastBounds.maxX <= root.bounds.maxX,
+                    "third icon overlaps or escapes the minimum-width window")
     }
 }

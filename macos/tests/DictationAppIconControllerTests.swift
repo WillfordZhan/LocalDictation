@@ -110,6 +110,14 @@ enum AppIconChecks {
         startup.dark = false; startup.coordinator.systemAppearanceChanged()
         try require(startup.calls.count == 2, "system event changed manual mode")
 
+        let manualDark = CoordinatorFixture()
+        manualDark.coordinator.selectManual(.darkGlow); manualDark.complete()
+        try require(manualDark.calls == [.darkGlow] && manualDark.preferences.appIconStyle == .darkGlow && !manualDark.preferences.appIconFollowsSystemAppearance,
+                    "dark glow cannot be manually selected in light appearance")
+        manualDark.dark = true; manualDark.coordinator.systemAppearanceChanged()
+        manualDark.dark = false; manualDark.coordinator.systemAppearanceChanged()
+        try require(manualDark.calls == [.darkGlow], "appearance changes replaced manual dark glow")
+
         let themes = CoordinatorFixture(); themes.coordinator.restore()
         themes.dark = true; themes.coordinator.systemAppearanceChanged()
         themes.dark = false; themes.coordinator.systemAppearanceChanged(); themes.complete()

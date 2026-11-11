@@ -687,6 +687,10 @@ enum StoreChecks {
         store.updatePreferences { $0.appIconStyle = .dotFormation; $0.appIconFollowsSystemAppearance = false; $0.vocabulary = ["BOM"]; $0.cleanupEnabled = false }
         let reopened = DictationStore(directory: directory)
         try require(reopened.preferences.appIconStyle == .dotFormation && !reopened.preferences.appIconFollowsSystemAppearance, "icon selection did not survive a new process/store")
+        try require(reopened.setAppIconStyle(.darkGlow, followsSystemAppearance: false), "manual dark glow save failed")
+        let darkReopened = DictationStore(directory: directory)
+        try require(darkReopened.preferences.appIconStyle == .darkGlow && !darkReopened.preferences.appIconFollowsSystemAppearance,
+                    "manual dark glow reverted to the light icon after restart")
         let retainedHistory = try Data(contentsOf: directory.appendingPathComponent("history.json"))
         try require(retainedHistory == history, "icon selection rewrote history")
         var reloadNotifications = 0
