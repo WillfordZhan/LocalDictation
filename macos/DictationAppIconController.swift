@@ -39,7 +39,7 @@ final class DictationAppIconController {
                     .flatMap { NSImage(contentsOf: $0) }
             },
             customIcon: Self.customIconSnapshot,
-            setFileIcon: { image, url in NSWorkspace.shared.setIcon(image, forFile: url.path, options: []) },
+            setFileIcon: { image, url in Self.setFileIcon(image, at: url) },
             accessibilityTrusted: { AXIsProcessTrusted() },
             updateRunningIcon: { image in
                 NSApp.applicationIconImage = image
@@ -50,6 +50,21 @@ final class DictationAppIconController {
 
     init(applicationURL: URL, operations: Operations) {
         self.applicationURL = applicationURL; self.operations = operations
+    }
+
+    static func setFileIcon(_ image: NSImage?, at url: URL,
+                            updateModificationDate: (URL) throws -> Void = {
+                                try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: $0.path)
+                            }) -> Bool {
+        guard NSWorkspace.shared.setIcon(image, forFile: url.path, options: []) else { return false }
+        do {
+            // Finder sees custom metadata immediately, while a fixed Dock tile
+            // may keep the bundled icon after quit until the app directory's
+            // mtime changes. Touch only the root, never sealed bundle contents.
+            // Compensation uses this same path, including restoration to nil.
+            try updateModificationDate(url)
+            return true
+        } catch { return false }
     }
 
     static func customIconSnapshot(at url: URL) throws -> NSImage? {

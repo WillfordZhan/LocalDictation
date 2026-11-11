@@ -173,7 +173,7 @@ enum AppIconChecks {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LocalDictationIconMetadataCheck-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer {
-            _ = NSWorkspace.shared.setIcon(nil, forFile: directory.path, options: [])
+            _ = DictationAppIconController.setFileIcon(nil, at: directory)
             try? FileManager.default.removeItem(at: directory)
         }
         func colored(_ red: UInt8, _ green: UInt8, _ blue: UInt8) -> NSImage {
@@ -187,21 +187,25 @@ enum AppIconChecks {
         }
         let dark = colored(120, 40, 190), dots = colored(230, 140, 40)
         try require(try DictationAppIconController.customIconSnapshot(at: directory) == nil, "default folder unexpectedly has a custom icon")
-        try require(NSWorkspace.shared.setIcon(dark, forFile: directory.path, options: []), "native custom icon setup failed")
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: directory.path)
+        let beforeUpdate = Date()
+        try require(DictationAppIconController.setFileIcon(dark, at: directory), "native custom icon setup failed")
+        let modified = try FileManager.default.attributesOfItem(atPath: directory.path)[.modificationDate] as! Date
+        try require(modified >= beforeUpdate, "successful icon update did not refresh directory mtime")
         let original = try DictationAppIconController.customIconSnapshot(at: directory)
         try require(original != nil, "native snapshot lost custom metadata (URL customIcon may return nil)")
         let darkPixels = pixels(original!)
-        try require(NSWorkspace.shared.setIcon(dots, forFile: directory.path, options: []), "second native icon setup failed")
+        try require(DictationAppIconController.setFileIcon(dots, at: directory), "second native icon setup failed")
         let changed = try DictationAppIconController.customIconSnapshot(at: directory)
         try require(changed != nil && pixels(changed!) != darkPixels, "native snapshot returned a stale cached icon")
         try require(pixels(original!) == darkPixels, "snapshot changed lazily after the file changed")
-        try require(NSWorkspace.shared.setIcon(dark, forFile: directory.path, options: []), "native icon reset failed")
+        try require(DictationAppIconController.setFileIcon(dark, at: directory), "native icon reset failed")
         for hasCustom in [true, false] {
-            if !hasCustom { _ = NSWorkspace.shared.setIcon(nil, forFile: directory.path, options: []) }
+            if !hasCustom { _ = DictationAppIconController.setFileIcon(nil, at: directory) }
             var trustChecks = 0, dockUpdates = 0
             let controller = DictationAppIconController(applicationURL: directory, operations: .init(
                 loadImage: { _ in dots }, customIcon: DictationAppIconController.customIconSnapshot,
-                setFileIcon: { NSWorkspace.shared.setIcon($0, forFile: $1.path, options: []) },
+                setFileIcon: { DictationAppIconController.setFileIcon($0, at: $1) },
                 accessibilityTrusted: { trustChecks += 1; return trustChecks == 1 },
                 updateRunningIcon: { _ in dockUpdates += 1 }
             ))
@@ -213,6 +217,28 @@ enum AppIconChecks {
             if hasCustom { try require(restored != nil && pixels(restored!) == darkPixels, "D-to-B failure did not restore original D pixels") }
             else { try require(restored == nil, "default-C failure installed a custom icon instead of restoring nil") }
         }
+
+        try require(DictationAppIconController.setFileIcon(dark, at: directory), "mtime failure fixture setup failed")
+        var touches = 0, dockUpdates = 0
+        let controller = DictationAppIconController(applicationURL: directory, operations: .init(
+            loadImage: { _ in dots }, customIcon: DictationAppIconController.customIconSnapshot,
+            setFileIcon: { image, url in
+                DictationAppIconController.setFileIcon(image, at: url, updateModificationDate: { target in
+                    touches += 1
+                    if touches == 1 { throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError) }
+                    try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: target.path)
+                })
+            }, accessibilityTrusted: { true }, updateRunningIcon: { _ in dockUpdates += 1 }
+        ))
+        let beforeRollback = Date()
+        var result: Result<Void, Error>?
+        controller.apply(style: .dotFormation) { result = $0 }
+        try wait { result != nil }
+        let restored = try DictationAppIconController.customIconSnapshot(at: directory)
+        let rollbackDate = try FileManager.default.attributesOfItem(atPath: directory.path)[.modificationDate] as! Date
+        try require(!succeeded(result!) && touches == 2 && dockUpdates == 0 && restored != nil && pixels(restored!) == darkPixels,
+                    "mtime failure reported success or failed to restore the original icon")
+        try require(rollbackDate >= beforeRollback, "compensation did not refresh directory mtime")
     }
     static func imageRep(_ image: NSImage) -> NSBitmapImageRep { image.representations[0] as! NSBitmapImageRep }
     static func applicationAppearanceChecks() throws {
@@ -244,7 +270,7 @@ enum AppIconChecks {
             fputs("FAIL: \(error.localizedDescription)\n", stderr); exit(1)
         }
         print("PASS: resource/write failures, metadata rollback, AX guard, main-thread completion, serial writes; effective appearance coalescing, manual memory, startup restore, preference compensation and retry.")
-        print("PASS: native temporary-folder custom icon detection, non-lazy/correct cached snapshots, D-to-B rollback and default-to-nil rollback.")
+        print("PASS: native temporary-folder snapshots, D-to-B/default-to-nil rollback, directory mtime updates and compensation on mtime failure.")
         print("LIMIT: installed application, Dock and AX remain unmodified; native icon operations only use a temporary ordinary folder.")
     }
 }
