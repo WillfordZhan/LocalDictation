@@ -1,82 +1,294 @@
 import AppKit
 
-// Original “Voice to Text” mark. Audio, a conversion arrow, and a text field
-// remain distinct at Dock size; all glyphs use geometry rather than fonts.
-guard CommandLine.arguments.count == 2 else {
-  fputs("Usage: swift generate-icon.swift output.png|output.icns\n", stderr)
-  exit(1)
+// Original voice-to-text artwork. Coordinates run top-to-bottom.
+// Fixed seeds preserve the approved particle composition when assets are regenerated.
+func ink(_ hex: UInt32, _ alpha: CGFloat = 1) -> NSColor {
+  NSColor(
+    srgbRed: CGFloat((hex >> 16) & 255) / 255, green: CGFloat((hex >> 8) & 255) / 255,
+    blue: CGFloat(hex & 255) / 255, alpha: alpha)
 }
-let destination = URL(fileURLWithPath: CommandLine.arguments[1])
-
-func drawMaster() -> NSBitmapImageRep {
-  let size = 1024
-  let bitmap = NSBitmapImageRep(
-    bitmapDataPlanes: nil, pixelsWide: size, pixelsHigh: size, bitsPerSample: 8, samplesPerPixel: 4,
+func fill(_ path: NSBezierPath, _ color: NSColor) {
+  color.setFill()
+  path.fill()
+}
+func line(_ path: NSBezierPath, _ color: NSColor, _ width: CGFloat) {
+  path.lineWidth = width
+  path.lineCapStyle = .round
+  path.lineJoinStyle = .round
+  color.setStroke()
+  path.stroke()
+}
+func roundRect(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat, _ r: CGFloat) -> NSBezierPath
+{ NSBezierPath(roundedRect: NSRect(x: x, y: y, width: w, height: h), xRadius: r, yRadius: r) }
+func grad(
+  _ path: NSBezierPath, _ colors: [NSColor], _ a: NSPoint = NSPoint(x: 180, y: 180),
+  _ b: NSPoint = NSPoint(x: 845, y: 840)
+) {
+  NSGraphicsContext.saveGraphicsState()
+  path.addClip()
+  NSGradient(colors: colors)!.draw(
+    from: a, to: b, options: [.drawsBeforeStartingLocation, .drawsAfterEndingLocation])
+  NSGraphicsContext.restoreGraphicsState()
+}
+func tGlyph() -> NSBezierPath {
+  let p = roundRect(574, 572, 220, 50, 9)
+  p.append(roundRect(657, 592, 54, 202, 9))
+  return p
+}
+let tile = roundRect(80, 76, 864, 864, 202)
+func drawCanvas(_ drawing: () -> Void) -> NSBitmapImageRep {
+  let rep = NSBitmapImageRep(
+    bitmapDataPlanes: nil, pixelsWide: 1024, pixelsHigh: 1024, bitsPerSample: 8, samplesPerPixel: 4,
     hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
   NSGraphicsContext.saveGraphicsState()
-  NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
-  func color(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, _ a: CGFloat = 1) -> NSColor {
-    NSColor(srgbRed: r / 255, green: g / 255, blue: b / 255, alpha: a)
-  }
+  NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
   NSColor.clear.setFill()
   NSRect(x: 0, y: 0, width: 1024, height: 1024).fill()
-  let tile = NSBezierPath(
-    roundedRect: NSRect(x: 80, y: 84, width: 864, height: 864), xRadius: 202, yRadius: 202)
+  let flip = NSAffineTransform()
+  flip.translateX(by: 0, yBy: 1024)
+  flip.scaleX(by: 1, yBy: -1)
+  flip.concat()
   NSGraphicsContext.saveGraphicsState()
   let shadow = NSShadow()
-  shadow.shadowColor = color(8, 24, 25, 0.25)
+  shadow.shadowColor = ink(0x18352F, 0.15)
   shadow.shadowBlurRadius = 24
-  shadow.shadowOffset = NSSize(width: 0, height: -15)
+  shadow.shadowOffset = NSSize(width: 0, height: -14)
   shadow.set()
-  color(21, 40, 42).setFill()
-  tile.fill()
+  fill(tile, ink(0xE8E9E1))
   NSGraphicsContext.restoreGraphicsState()
-  NSGradient(starting: color(45, 69, 71), ending: color(20, 36, 39))!.draw(in: tile, angle: -70)
-  tile.lineWidth = 2
-  color(230, 245, 235, 0.35).setStroke()
-  tile.stroke()
-  let ivory = color(250, 245, 224)
-  let apricot = color(248, 168, 100)
-  func capsule(_ x: CGFloat, _ y: CGFloat, _ width: CGFloat, _ height: CGFloat, _ fill: NSColor) {
-    fill.setFill()
-    NSBezierPath(
-      roundedRect: NSRect(x: x, y: y, width: width, height: height),
-      xRadius: min(width, height) / 2, yRadius: min(width, height) / 2
-    ).fill()
+  NSGraphicsContext.saveGraphicsState()
+  tile.addClip()
+  drawing()
+  NSGraphicsContext.restoreGraphicsState()
+  line(tile, ink(0xFFFFFF, 0.22), 1.5)
+  NSGraphicsContext.restoreGraphicsState()
+  return rep
+}
+
+// Deterministic sample field: every section of the waveform contributes points.
+struct Sample {
+  let x: CGFloat
+  let y: CGFloat
+  let nx: CGFloat
+  let ny: CGFloat
+}
+var seed: UInt64 = 13011
+func rnd() -> CGFloat {
+  seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+  return CGFloat((seed >> 33) & 0x7FFF_FFFF) / CGFloat(0x7FFF_FFFF)
+}
+func gauss() -> CGFloat { sqrt(-2 * log(max(rnd(), 0.00001))) * cos(2 * CGFloat.pi * rnd()) }
+func dot(_ x: CGFloat, _ y: CGFloat, _ r: CGFloat, _ c: NSColor) {
+  fill(NSBezierPath(ovalIn: NSRect(x: x - r, y: y - r, width: r * 2, height: r * 2)), c)
+}
+func blend(_ a: NSColor, _ b: NSColor, _ f: CGFloat) -> NSColor {
+  a.blended(withFraction: min(1, max(0, f)), of: b)!
+}
+func waveSamples() -> [Sample] {
+  let segments: [[CGFloat]] = [
+    [218, 370, 245, 370, 241, 310, 264, 310], [264, 310, 290, 310, 297, 438, 324, 438],
+    [324, 438, 352, 438, 357, 258, 386, 258], [386, 258, 413, 258, 417, 414, 447, 414],
+    [447, 414, 474, 414, 480, 378, 507, 378],
+  ]
+  var pts: [Sample] = []
+  for c in segments {
+    for i in 0..<70 {
+      let t = CGFloat(i) / 69
+      let u = 1 - t
+      let x = u * u * u * c[0] + 3 * u * u * t * c[2] + 3 * u * t * t * c[4] + t * t * t * c[6]
+      let y = u * u * u * c[1] + 3 * u * u * t * c[3] + 3 * u * t * t * c[5] + t * t * t * c[7]
+      let dx = 3 * u * u * (c[2] - c[0]) + 6 * u * t * (c[4] - c[2]) + 3 * t * t * (c[6] - c[4])
+      let dy = 3 * u * u * (c[3] - c[1]) + 6 * u * t * (c[5] - c[3]) + 3 * t * t * (c[7] - c[5])
+      let n = max(1, sqrt(dx * dx + dy * dy))
+      pts.append(Sample(x: x, y: y, nx: -dy / n, ny: dx / n))
+    }
   }
-  // Unequal heights communicate audio at a glance; the centered quiet ends keep
-  // enough air around the short conversion connector.
-  capsule(207, 441, 45, 154, ivory)
-  capsule(285, 352, 45, 332, ivory)
-  capsule(363, 401, 45, 234, ivory)
-  // A compact arrow uses a single filled contour rather than thin strokes.
-  let arrow = NSBezierPath()
-  arrow.move(to: NSPoint(x: 437, y: 535))
-  arrow.line(to: NSPoint(x: 477, y: 535))
-  arrow.line(to: NSPoint(x: 477, y: 562))
-  arrow.line(to: NSPoint(x: 527, y: 518))
-  arrow.line(to: NSPoint(x: 477, y: 474))
-  arrow.line(to: NSPoint(x: 477, y: 501))
-  arrow.line(to: NSPoint(x: 437, y: 501))
-  arrow.close()
-  apricot.setFill()
-  arrow.fill()
-  // Outlined text-entry frame. The T is a geometric glyph, with a substantial
-  // cap and stem so it remains visible when the complete icon is downsampled.
-  let field = NSBezierPath(
-    roundedRect: NSRect(x: 569, y: 388, width: 266, height: 260), xRadius: 45, yRadius: 45)
-  field.lineWidth = 34
-  ivory.setStroke()
-  field.stroke()
-  capsule(637, 559, 130, 32, ivory)
-  capsule(685, 445, 34, 138, ivory)
+  return pts
+}
+let samples = waveSamples()
+func sampleWave() -> Sample { samples[Int(rnd() * CGFloat(samples.count - 1))] }
+func diffuseGlow(_ center: NSPoint, _ radius: CGFloat, _ color: NSColor) {
+  NSGradient(starting: color, ending: color.withAlphaComponent(0))!.draw(
+    fromCenter: center, radius: 0, toCenter: center, radius: radius, options: [])
+}
+
+// Uniform arc-length sampling keeps each grain distinct along peaks and troughs.
+func spacedWave(_ distance: CGFloat) -> [Sample] {
+  var result: [Sample] = []
+  var carry: CGFloat = 0
+  var previous = samples[0]
+  result.append(previous)
+  for p in samples.dropFirst() {
+    carry += hypot(p.x - previous.x, p.y - previous.y)
+    if carry >= distance {
+      result.append(p)
+      carry = 0
+    }
+    previous = p
+  }
+  return result
+}
+
+func smoothStep(_ value: CGFloat) -> CGFloat {
+  let t = min(1, max(0, value))
+  return t * t * (3 - 2 * t)
+}
+func strokedWaveMask() -> CGPath {
+  let p = CGMutablePath()
+  p.move(to: CGPoint(x: 218, y: 370))
+  p.addCurve(
+    to: CGPoint(x: 264, y: 310), control1: CGPoint(x: 245, y: 370),
+    control2: CGPoint(x: 241, y: 310))
+  p.addCurve(
+    to: CGPoint(x: 324, y: 438), control1: CGPoint(x: 290, y: 310),
+    control2: CGPoint(x: 297, y: 438))
+  p.addCurve(
+    to: CGPoint(x: 386, y: 258), control1: CGPoint(x: 352, y: 438),
+    control2: CGPoint(x: 357, y: 258))
+  p.addCurve(
+    to: CGPoint(x: 447, y: 414), control1: CGPoint(x: 413, y: 258),
+    control2: CGPoint(x: 417, y: 414))
+  p.addCurve(
+    to: CGPoint(x: 507, y: 378), control1: CGPoint(x: 474, y: 414),
+    control2: CGPoint(x: 480, y: 378))
+  return p.copy(strokingWithWidth: 32, lineCap: .round, lineJoin: .round, miterLimit: 10)
+}
+func particulateWave(_ color: NSColor, _ ordered: Bool) {
+  // Screen-horizontal material change: the left half remains smooth and opaque.
+  NSGraphicsContext.saveGraphicsState()
+  let ctx = NSGraphicsContext.current!.cgContext
+  ctx.addPath(strokedWaveMask())
+  ctx.clip()
+  let stops: [CGFloat] = [0, 0.14, 0.47, 0.76, 1]
+  let colors = [
+    color, color.withAlphaComponent(0.98), color.withAlphaComponent(0.68),
+    color.withAlphaComponent(0.15), color.withAlphaComponent(0),
+  ]
+  stops.withUnsafeBufferPointer { positions in
+    NSGradient(colors: colors, atLocations: positions.baseAddress, colorSpace: .sRGB)!.draw(
+      from: NSPoint(x: 343, y: 350), to: NSPoint(x: 511, y: 350),
+      options: [.drawsBeforeStartingLocation, .drawsAfterEndingLocation])
+  }
   NSGraphicsContext.restoreGraphicsState()
-  return bitmap
+  // Irregular grains replace the material toward the right; no rows of dots on the left.
+  let grainTrack = spacedWave(5)
+  for _ in 0..<360 {
+    let p = grainTrack[Int(rnd() * CGFloat(grainTrack.count - 1))]
+    let amount = smoothStep((p.x - 340) / 155)
+    if amount < 0.015 || rnd() > 0.14 + 0.86 * amount { continue }
+    let normal = (rnd() - 0.5) * (30 + 20 * amount)
+    let tangent = gauss() * (ordered ? 2.0 : 4.0) * amount
+    let r = 2.5 + rnd() * 1.6 + amount * 0.3
+    dot(
+      p.x + p.nx * normal - p.ny * tangent, p.y + p.ny * normal + p.nx * tangent, r,
+      color.withAlphaComponent(amount * (0.55 + rnd() * 0.35)))
+  }
+  for _ in 0..<160 {
+    let p = sampleWave()
+    let amount = smoothStep((p.x - 352) / 150)
+    if amount < 0.02 { continue }
+    let n = gauss() * 25
+    dot(
+      p.x + p.nx * n + gauss() * 5, p.y + p.ny * n + gauss() * 5, 2.1 + rnd() * 2.4,
+      color.withAlphaComponent(amount * (0.12 + rnd() * 0.28)))
+  }
+}
+func quietTransfer(_ count: Int, _ a: NSColor, _ b: NSColor, _ ordered: Bool) {
+  // All parts of the source dissolve. Arriving samples concentrate on the leading cap,
+  // leaving the right end and lower stem visually complete rather than dusty.
+  for _ in 0..<count {
+    let s = sampleWave()
+    let t = 0.12 + 0.83 * rnd()
+    let e = NSPoint(x: 575 + rnd() * 90, y: 580 + rnd() * 42)
+    let spread = (ordered ? 18.0 : 28.0) * sin(t * CGFloat.pi)
+    var x = s.x * (1 - t) + e.x * t + gauss() * spread
+    var y = s.y * (1 - t) + e.y * t + gauss() * spread
+    if ordered && t > 0.7 {
+      let f = (t - 0.7) / 0.3
+      x = x * (1 - f) + (x / 11).rounded() * 11 * f
+      y = y * (1 - f) + (y / 11).rounded() * 11 * f
+    }
+    let r: CGFloat = ordered ? 2.2 + rnd() * 2.6 : 1.6 + rnd() * 2.1
+    let departure = smoothStep((x - 325) / 85)
+    dot(x, y, r, blend(a, b, t).withAlphaComponent(departure * (0.17 + rnd() * 0.25)))
+  }
+}
+func assembledType(_ color: NSColor, _ ordered: Bool) {
+  // The incoming left edge condenses gradually; the right cap and lower stem are solid.
+  grad(
+    tGlyph(),
+    [
+      color.withAlphaComponent(0.02), color.withAlphaComponent(0.30),
+      color.withAlphaComponent(0.78), color,
+    ], NSPoint(x: 573, y: 590), NSPoint(x: 649, y: 590))
+  if ordered {
+    for col in 0..<8 {
+      for row in 0..<6 {
+        let x: CGFloat = 561 + CGFloat(col) * 10.5
+        let y: CGFloat = 570 + CGFloat(row) * 10.5
+        let fade = CGFloat(col) / 7
+        if rnd() < 0.25 + fade * 0.65 {
+          dot(
+            x + (1 - fade) * (rnd() - 0.5) * 7, y + (1 - fade) * (rnd() - 0.5) * 7,
+            2.7 + fade * 0.9, color.withAlphaComponent(0.28 + fade * 0.64))
+        }
+      }
+    }
+  } else {
+    for _ in 0..<62 {
+      let x = 557 + rnd() * 90
+      let y = 570 + rnd() * 52
+      let fade = min(1, (x - 557) / 90)
+      dot(
+        x + gauss() * 4, y + gauss() * 4, 2.2 + rnd() * 2.1,
+        color.withAlphaComponent(0.24 + fade * 0.48))
+    }
+  }
+  for _ in 0..<13 {
+    dot(
+      577 + rnd() * 64, 552 + rnd() * 15, 2.0 + rnd() * 1.8,
+      color.withAlphaComponent(0.16 + rnd() * 0.22))
+  }
+  // A short incoming edge on the stem supports the transformation without surrounding it.
+  for _ in 0..<8 {
+    dot(
+      644 + rnd() * 10, 627 + rnd() * 48, 1.8 + rnd() * 1.9,
+      color.withAlphaComponent(0.20 + rnd() * 0.18))
+  }
+}
+
+enum IconStyle: String, CaseIterable {
+  case dotFormation = "AppIconDotFormation"
+  case softMist = "AppIconSoftMist"
+}
+
+func drawMaster(_ style: IconStyle) -> NSBitmapImageRep {
+  drawCanvas {
+    switch style {
+    case .dotFormation:
+      seed = 63142
+      grad(tile, [ink(0xE9EFE4), ink(0xEEECE9), ink(0xDFD9E5)])
+      quietTransfer(235, ink(0x3D8069), ink(0x7E5F95), true)
+      particulateWave(ink(0x245E4D), true)
+      assembledType(ink(0x6B537F), true)
+    case .softMist:
+      seed = 85422
+      grad(tile, [ink(0xB7CDC0), ink(0xDDE2D6), ink(0xC4B4D4)])
+      diffuseGlow(NSPoint(x: 350, y: 355), 310, ink(0xF5F7DA, 0.55))
+      diffuseGlow(NSPoint(x: 590, y: 555), 250, ink(0xFFFFFF, 0.24))
+      // Soft overlapping clouds distinguish this style from the discrete lattice.
+      diffuseGlow(NSPoint(x: 488, y: 453), 143, ink(0x4C8B76, 0.21))
+      diffuseGlow(NSPoint(x: 551, y: 519), 116, ink(0x836598, 0.19))
+      quietTransfer(168, ink(0x4F8C76), ink(0x7D6293), false)
+      particulateWave(ink(0x326A54), false)
+      assembledType(ink(0x674E7D), false)
+    }
+  }
 }
 
 func writePNG(_ master: NSBitmapImageRep, size: Int, to url: URL) throws {
   if size == 1024 {
-    try master.representation(using: .png, properties: [:])!.write(to: url)
+    try master.representation(using: .png, properties: [:])!.write(to: url, options: .atomic)
     return
   }
   let output = NSBitmapImageRep(
@@ -90,19 +302,15 @@ func writePNG(_ master: NSBitmapImageRep, size: Int, to url: URL) throws {
   image.addRepresentation(master)
   image.draw(in: NSRect(x: 0, y: 0, width: size, height: size))
   NSGraphicsContext.restoreGraphicsState()
-  try output.representation(using: .png, properties: [:])!.write(to: url)
+  try output.representation(using: .png, properties: [:])!.write(to: url, options: .atomic)
 }
 
-let master = drawMaster()
-switch destination.pathExtension.lowercased() {
-case "png":
-  try writePNG(master, size: 1024, to: destination)
-case "icns":
-  // Supply every macOS representation, including low-density 16px Finder icons.
+func writeICNS(_ master: NSBitmapImageRep, to destination: URL) throws {
   let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
   let iconset = temporary.appendingPathComponent("AppIcon.iconset")
   try FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
   defer { try? FileManager.default.removeItem(at: temporary) }
+  // Standard 1x/2x representations cover 16, 32, 64, 128, 256, 512 and 1024 physical pixels.
   for points in [16, 32, 128, 256, 512] {
     for scale in [1, 2] {
       let suffix = scale == 2 ? "@2x" : ""
@@ -116,8 +324,57 @@ case "icns":
   process.arguments = ["-c", "icns", "-o", destination.path, iconset.path]
   try process.run()
   process.waitUntilExit()
-  guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
-default:
-  fputs("Output must use .png or .icns\n", stderr)
+  guard process.terminationStatus == 0 else {
+    throw NSError(
+      domain: "LocalDictation.IconGenerator", code: Int(process.terminationStatus),
+      userInfo: [
+        NSLocalizedDescriptionKey: "iconutil failed to create \(destination.lastPathComponent)"
+      ])
+  }
+}
+
+func writeAll(to directory: URL) throws {
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  for style in IconStyle.allCases {
+    let master = drawMaster(style)
+    try writePNG(master, size: 1024, to: directory.appendingPathComponent(style.rawValue + ".png"))
+    try writeICNS(master, to: directory.appendingPathComponent(style.rawValue + ".icns"))
+  }
+  // Default assets are exact copies of C, rather than separately maintained drawings.
+  for ext in ["png", "icns"] {
+    let named = directory.appendingPathComponent(IconStyle.softMist.rawValue + "." + ext)
+    try Data(contentsOf: named).write(
+      to: directory.appendingPathComponent("AppIcon." + ext), options: .atomic)
+  }
+}
+
+func usage() -> Never {
+  fputs("Usage: swift generate-icon.swift --all [output-directory]\n", stderr)
+  fputs(
+    "       swift generate-icon.swift output.png|output.icns  (default: soft mist)\n", stderr)
+  exit(1)
+}
+
+let arguments = Array(CommandLine.arguments.dropFirst())
+do {
+  if arguments.first == "--all", arguments.count <= 2 {
+    let directory =
+      arguments.count == 2
+      ? URL(fileURLWithPath: arguments[1], isDirectory: true)
+      : URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+    try writeAll(to: directory)
+  } else if arguments.count == 1 {
+    // Keep the original single-file invocation for existing asset workflows.
+    let destination = URL(fileURLWithPath: arguments[0])
+    switch destination.pathExtension.lowercased() {
+    case "png": try writePNG(drawMaster(.softMist), size: 1024, to: destination)
+    case "icns": try writeICNS(drawMaster(.softMist), to: destination)
+    default: usage()
+    }
+  } else {
+    usage()
+  }
+} catch {
+  fputs("Icon generation failed: \(error.localizedDescription)\n", stderr)
   exit(1)
 }
