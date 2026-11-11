@@ -509,6 +509,7 @@ enum StoreChecks {
             .appendingPathComponent("dictation-store-checks-" + UUID().uuidString, isDirectory: true)
         try files.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? files.removeItem(at: root) }
+        try appIconChecks(root)
 
         let localDirectory = root.appendingPathComponent("local")
         let local = DictationStore(directory: localDirectory)
@@ -675,5 +676,51 @@ enum StoreChecks {
         try usageChecks(root)
         try permanentHistoryChecks(root)
         print("PASS: shortcut defaults/validation/persistence/isolated repair; permanent history and legacy policy migration; vocabulary limits; no age/count trimming; explicit delete/clear; corrupt-file preservation; private permissions; older settings; preview IO isolation; write failure memory retention; independent daily aggregates; counts/rates/estimated savings; unknown timing; DST/year-boundary streaks; restart without aggregate backfill; aggregate clear/corruption recovery; mirrored history recovery and safe flush.")
+    }
+
+    static func appIconChecks(_ root: URL) throws {
+        let directory = root.appendingPathComponent("app-icon-preferences")
+        let store = DictationStore(directory: directory)
+        _ = add(store, "切换图标不修改口述记录。")
+        let history = try Data(contentsOf: directory.appendingPathComponent("history.json"))
+        try require(store.preferences.appIconStyle == .softMist && store.preferences.appIconFollowsSystemAppearance, "new installations should follow the system with soft mist as the manual default")
+        store.updatePreferences { $0.appIconStyle = .dotFormation; $0.appIconFollowsSystemAppearance = false; $0.vocabulary = ["BOM"]; $0.cleanupEnabled = false }
+        let reopened = DictationStore(directory: directory)
+        try require(reopened.preferences.appIconStyle == .dotFormation && !reopened.preferences.appIconFollowsSystemAppearance, "icon selection did not survive a new process/store")
+        let retainedHistory = try Data(contentsOf: directory.appendingPathComponent("history.json"))
+        try require(retainedHistory == history, "icon selection rewrote history")
+        var reloadNotifications = 0
+        reopened.onChange = { reloadNotifications += 1 }
+        try require(reopened.setAppIconStyle(.softMist, followsSystemAppearance: true), "icon policy save failed")
+        try require(reopened.setAppearanceMode(.dark), "appearance mode save failed")
+        try require(reloadNotifications == 0, "appearance changes requested a page rebuild")
+        let policyReopened = DictationStore(directory: directory)
+        try require(policyReopened.preferences.appIconStyle == .softMist && policyReopened.preferences.appIconFollowsSystemAppearance && policyReopened.preferences.appearanceMode == .dark,
+                    "appearance policy did not survive restart")
+        let preferencesURL = directory.appendingPathComponent("preferences.json")
+        try FileManager.default.removeItem(at: preferencesURL)
+        try FileManager.default.createDirectory(at: preferencesURL, withIntermediateDirectories: false)
+        try require(!policyReopened.setAppIconStyle(.dotFormation, followsSystemAppearance: false), "blocked preference save reported success")
+        try require(!policyReopened.setAppearanceMode(.light) && policyReopened.preferences.appearanceMode == .dark,
+                    "failed appearance save adopted a memory-only choice")
+        try require(policyReopened.preferences.appIconStyle == .softMist && policyReopened.preferences.appIconFollowsSystemAppearance,
+                    "failed save adopted a memory-only selection")
+        let historyAfterPolicy = try Data(contentsOf: directory.appendingPathComponent("history.json"))
+        try require(historyAfterPolicy == history, "icon policy save changed history")
+        let encoded = try JSONEncoder().encode(reopened.preferences)
+        var fields = try JSONSerialization.jsonObject(with: encoded) as! [String: Any]
+        for icon in [nil, "future-icon", 37] as [Any?] {
+            if let icon { fields["appIconStyle"] = icon } else { fields.removeValue(forKey: "appIconStyle") }
+            let migrated = try JSONDecoder().decode(DictationPreferences.self, from: JSONSerialization.data(withJSONObject: fields))
+            try require(migrated.appIconStyle == .softMist && migrated.appIconFollowsSystemAppearance && migrated.vocabulary == ["BOM"] && !migrated.cleanupEnabled,
+                        "unknown or older icon settings discarded unrelated preferences")
+        }
+        for value in [nil, "future-appearance", 37] as [Any?] {
+            if let value { fields["appearanceMode"] = value; fields["appIconFollowsSystemAppearance"] = value }
+            else { fields.removeValue(forKey: "appearanceMode"); fields.removeValue(forKey: "appIconFollowsSystemAppearance") }
+            let migrated = try JSONDecoder().decode(DictationPreferences.self, from: JSONSerialization.data(withJSONObject: fields))
+            try require(migrated.appearanceMode == .system && migrated.appIconFollowsSystemAppearance && migrated.vocabulary == ["BOM"],
+                        "unknown appearance discarded other settings or failed to default safely")
+        }
     }
 }

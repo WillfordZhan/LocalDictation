@@ -13,6 +13,9 @@
 !/backend/
 !/packaging/
 !/windows/
+!/docs/
+/docs/*
+!/docs/app-icons.md
 /macos/*
 !/macos/*.swift
 !/macos/Info.plist
@@ -26,6 +29,12 @@
 /macos/assets/*
 !/macos/assets/AppIcon.icns
 !/macos/assets/AppIcon.png
+!/macos/assets/AppIconDotFormation.png
+!/macos/assets/AppIconDotFormation.icns
+!/macos/assets/AppIconSoftMist.png
+!/macos/assets/AppIconSoftMist.icns
+!/macos/assets/AppIconDarkGlow.png
+!/macos/assets/AppIconDarkGlow.icns
 !/macos/assets/README.md
 !/macos/assets/generate-icon.swift
 /macos/signing/*

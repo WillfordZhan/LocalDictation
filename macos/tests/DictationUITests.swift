@@ -454,8 +454,13 @@ enum DictationUIChecks {
     static func run() throws {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
+        let originalAppearance = app.appearance
+        app.appearance = NSAppearance(named: .aqua)
+        defer { app.appearance = originalAppearance }
         DictationMotion.reduceMotionOverride = false
         defer { DictationMotion.reduceMotionOverride = nil }
+        try appIconChecks()
+        try appearanceChecks()
         for foreground in [Palette.muted, Palette.blue, Palette.warning] {
             for background in [NSColor.white, Palette.sidebar, Palette.blueWash] {
                 let ratio = (luminance(background) + 0.05) / (luminance(foreground) + 0.05)
@@ -685,5 +690,165 @@ enum DictationUIChecks {
         try homeModelSelectionChecks()
         print("PASS: invisible AppKit controls; independent Fn readiness and permission callbacks; navigation scroll reset; sidebar navigation; dictionary edit/add/delete; cleanup and auto-insert switches; language popup; history selection/raw/copy/search/delete; empty home synchronization.")
         print("LIMIT: destructive clear/retention modal and shortcut capture were not invoked. Copy was intercepted before clipboard access. No AppDelegate, model, microphone, global key listener, or production preferences were used.")
+    }
+
+    static func appearanceChecks() throws {
+        let app = NSApplication.shared, originalAppearance = NSApplication.shared.appearance
+        defer { app.appearance = originalAppearance }
+        let store = DictationStore(memoryOnly: true)
+        store.add(rawText: "嗯，保留自然表达。", text: "保留自然表达。", asrSeconds: 0.2, cleanupSeconds: 0.4,
+                  totalSeconds: 0.6, audioSeconds: 3, cleanupApplied: true, warning: nil)
+        let controller = DictationWindowController(store: store, sessionStartedAt: Date())
+        let window = controller.window!, root = window.contentView!
+        defer { window.close() }
+        // Match the application wiring: generic preference changes rebuild; the
+        // dedicated appearance setter must not emit that generic notification.
+        store.onChange = { [weak controller] in controller?.reloadStore() }
+        func settle() {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.04))
+            window.layoutIfNeeded(); root.layoutSubtreeIfNeeded()
+        }
+        func apply(_ mode: DictationAppearanceMode) throws {
+            try require(store.setAppearanceMode(mode), "Memory-only appearance persistence failed")
+            switch mode {
+            case .system: app.appearance = nil
+            case .light: app.appearance = NSAppearance(named: .aqua)
+            case .dark: app.appearance = NSAppearance(named: .darkAqua)
+            }
+            controller.updateAppearanceSelection(error: nil); settle()
+        }
+        try require(window.appearance == nil, "Main window overrides the application theme")
+        controller.showPage(.settings)
+        let picker = descendants(root).compactMap { $0 as? NSSegmentedControl }.first { $0.identifier?.rawValue == "appearance-mode" }!
+        try require((0..<picker.segmentCount).map { picker.label(forSegment: $0) ?? "" } == ["跟随系统", "浅色", "深色"], "Appearance choices are missing or reordered")
+        var requests: [DictationAppearanceMode] = []
+        controller.onSelectAppearanceMode = { requests.append($0) }
+        picker.selectedSegment = 2; try sendAction(picker)
+        try require(requests == [.dark] && store.preferences.appearanceMode == .system, "UI persisted appearance before callback success")
+        controller.updateAppearanceSelection(error: "外观设置未能保存。")
+        try require(picker.selectedSegment == 0 && containsText("外观设置未能保存。", in: root), "Failed appearance save does not restore the current mode")
+        try apply(.dark)
+        try require(descendants(root).contains { $0 === picker } && picker.selectedSegment == 2,
+                    "Applying appearance rebuilt the settings controls")
+        try require(window.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua, "Window did not inherit dark application appearance")
+        try require(containsText("跟随应用外观", in: root), "Icon setting still claims to follow only the system")
+
+        let version = CleanupPromptVersion(id: "appearance-fixture", name: "自然表达", note: "保持人味",
+            created_at: "2026-11-11T09:00:00Z", model_id: "local-model", system_prompt: "保留原意，去掉冗余。",
+            user_prefix: "请整理：", examples: [], content_sha256: "fixture", origin: "user")
+        let catalog = CleanupPromptCatalog(active_version_id: version.id, versions: [version],
+            current_model: CleanupPromptModel(id: "local-model", kind: "local", ready: true), asr_model: "local-asr")
+        controller.updatePrompts(catalog: catalog, busy: false, error: nil)
+        controller.showPage(.prompts); settle()
+        let studio = descendants(root).compactMap { $0 as? PromptStudioView }.first!
+        let editor = descendants(studio).compactMap { $0 as? NSTextView }.first { $0.identifier?.rawValue == "prompt-editor" }!
+        let draft = "这是尚未保存的规则。保持自然表达，不要改成官话。"
+        editor.string = draft; studio.textDidChange(Notification(name: NSText.didChangeNotification, object: editor))
+        editor.setSelectedRange(NSRange(location: 3, length: 4))
+        window.makeFirstResponder(editor)
+        let responder = window.firstResponder
+        try apply(.light); try apply(.dark)
+        try require(descendants(root).contains { $0 === editor } && editor.string == draft && studio.hasUnsavedChanges,
+                    "Appearance switching discarded or recreated the unsaved prompt editor")
+        try require(editor.selectedRange() == NSRange(location: 3, length: 4) && window.firstResponder === responder,
+                    "Appearance switching moved the prompt selection or keyboard focus")
+
+        controller.showPage(.dictionary); settle()
+        let vocabulary = descendants(root).compactMap { $0 as? NSTextField }.first { $0.placeholderString?.contains("CodeGraph") == true }!
+        edit(vocabulary, text: "尚未添加的术语")
+        app.appearance = NSAppearance(named: .aqua); settle()
+        app.appearance = NSAppearance(named: .darkAqua); settle()
+        try require(descendants(root).contains { $0 === vocabulary } && vocabulary.stringValue == "尚未添加的术语",
+                    "A theme notification discarded the dictionary input")
+
+        controller.showPage(.history); settle()
+        let search = descendants(root).compactMap { $0 as? NSSearchField }.first!
+        edit(search, text: "自然表达"); settle()
+        let historyText = descendants(root).compactMap { $0 as? NSTextView }.first { $0.string == "保留自然表达。" }!
+        historyText.setSelectedRange(NSRange(location: 1, length: 3))
+        try apply(.light); try apply(.dark)
+        try require(descendants(root).contains { $0 === search } && search.stringValue == "自然表达",
+                    "Appearance switching reset the history query")
+        try require(descendants(root).contains { $0 === historyText } && historyText.selectedRange() == NSRange(location: 1, length: 3),
+                    "Appearance switching rebuilt the selected history record")
+
+        // Resolve semantic colors in each real appearance. Text contrast and
+        // concrete layer colors must change together, rather than snapshot light colors.
+        for name in [NSAppearance.Name.aqua, .darkAqua] {
+            let appearance = NSAppearance(named: name)!
+            var pairs: [(CGFloat, CGFloat)] = []
+            appearance.performAsCurrentDrawingAppearance {
+                for foreground in [Palette.ink, Palette.secondary, Palette.muted, Palette.blue, Palette.warning] {
+                    for background in [Palette.background, Palette.surface, Palette.sidebar, Palette.editorBackground] {
+                        pairs.append((luminance(foreground), luminance(background)))
+                    }
+                }
+            }
+            for (first, second) in pairs {
+                let ratio = (max(first, second) + 0.05) / (min(first, second) + 0.05)
+                try require(ratio >= 4.5, "Theme \(name.rawValue) text contrast below 4.5:1: \(ratio)")
+            }
+        }
+        let lightLayer = NSColor(cgColor: Palette.cgColor(Palette.editorBackground, for: NSAppearance(named: .aqua)!))!
+        let darkLayer = NSColor(cgColor: Palette.cgColor(Palette.editorBackground, for: NSAppearance(named: .darkAqua)!))!
+        try require(luminance(lightLayer) > 0.9 && luminance(darkLayer) < 0.05, "Layer colors do not resolve for their owning appearance")
+
+        if let index = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.arguments.indices.contains(index + 1) {
+            let directory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            window.setContentSize(NSSize(width: 1100, height: 900))
+            for (mode, tag) in [(DictationAppearanceMode.light, "light"), (.dark, "dark")] {
+                try apply(mode)
+                for page in DictationPage.allCases {
+                    controller.showPage(page); settle()
+                    // Capture the settled page, not a midpoint in sidebar selection fades.
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.20))
+                    try controller.renderPNG(to: directory.appendingPathComponent("appearance-\(tag)-\(page.rawValue).png"))
+                }
+            }
+        }
+        try require(!window.isVisible && store.storageDirectory == nil, "Appearance checks escaped their hidden, in-memory fixture")
+        print("PASS appearance: native inheritance, transactional picker, light/dark contrast, resolved layers, unchanged prompt draft/focus/history query/selection/dictionary input; five pages render in both themes.")
+    }
+
+    static func appIconChecks() throws {
+        let store = DictationStore(memoryOnly: true)
+        let controller = DictationWindowController(store: store, sessionStartedAt: Date())
+        let root = controller.window!.contentView!
+        defer { controller.window?.close() }
+        store.onChange = { [weak controller] in controller?.reloadStore() }
+        var requests: [DictationAppIconStyle] = []
+        var policies: [Bool] = []
+        controller.onSelectAppIcon = { requests.append($0) }
+        controller.onAppIconFollowsSystemAppearance = { policies.append($0) }
+        controller.showPage(.settings)
+        let defaultChoice = try button("柔雾显影", in: root)
+        try require(defaultChoice.state == .on && !defaultChoice.isEnabled, "system mode should retain and disable the manual choice")
+        try require(containsText("浅色用柔雾显影，深色用暗色辉光。", in: root), "effective application appearance mapping is missing")
+        let switches = descendants(root).compactMap { $0 as? NSSwitch }.filter { $0.identifier?.rawValue == "app-icon-follows-system" }
+        try require(switches.count == 1, "appearance switch missing")
+        switches[0].state = .off
+        _ = switches[0].sendAction(switches[0].action, to: switches[0].target)
+        try require(policies == [false] && store.preferences.appIconFollowsSystemAppearance, "appearance toggle persisted before OS success")
+        store.updatePreferences { $0.appIconFollowsSystemAppearance = false }
+        try click("点阵成型", in: root)
+        try require(requests == [.dotFormation] && store.preferences.appIconStyle == .softMist,
+                    "icon choice persisted before the application update succeeded")
+        controller.updateAppIconSelection(busy: true, error: nil)
+        let pendingChoice = try button("点阵成型", in: root)
+        try require(!pendingChoice.isEnabled, "concurrent icon changes were not blocked")
+        controller.updateAppIconSelection(busy: false, error: "图标暂时无法更新。")
+        try require(containsText("图标暂时无法更新。", in: root) && store.preferences.appIconStyle == .softMist,
+                    "failed icon application must retain the old choice and show a retryable error")
+        store.updatePreferences { $0.appIconStyle = .dotFormation }
+        controller.updateAppIconSelection(busy: false, error: nil, appliedStyle: .dotFormation)
+        let appliedChoice = try button("点阵成型", in: root)
+        try require(appliedChoice.state == .on, "applied choice did not update the radio state")
+        try click("点阵成型", in: root)
+        try require(requests.count == 1, "clicking the selected icon repeated an OS update")
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        let left = try button("点阵成型", in: root), right = try button("柔雾显影", in: root)
+        try require(abs(left.frame.width - 164) < 1 && abs(right.frame.width - 164) < 1,
+                    "icon cards unexpectedly stretched across the settings page")
     }
 }

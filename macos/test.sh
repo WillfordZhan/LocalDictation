@@ -3,6 +3,10 @@ set -euo pipefail
 TEST_SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEST_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/local-dictation-checks.XXXXXX")"
 trap 'rm -rf "$TEST_BUILD_DIR"' EXIT
+swiftc -swift-version 5 -parse-as-library "$TEST_SOURCE_DIR/DictationStore.swift" \
+  "$TEST_SOURCE_DIR/DictationAppIconController.swift" "$TEST_SOURCE_DIR/tests/DictationAppIconControllerTests.swift" \
+  -o "$TEST_BUILD_DIR/app-icon-checks"
+"$TEST_BUILD_DIR/app-icon-checks"
 swiftc -swift-version 5 -parse-as-library "$TEST_SOURCE_DIR/DictationProcessingProgress.swift" \
   "$TEST_SOURCE_DIR/tests/DictationProcessingProgressTests.swift" -o "$TEST_BUILD_DIR/progress-checks"
 "$TEST_BUILD_DIR/progress-checks"

@@ -57,12 +57,16 @@ struct CleanupPromptDraft: Encodable, Equatable {
 
 private final class PromptSurface: NSView {
     let color: NSColor
-    init(color: NSColor = .white) {
+    init(color: NSColor = Palette.surface) {
         self.color = color; super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var isFlipped: Bool { true }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
     override func draw(_ dirtyRect: NSRect) {
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 12, yRadius: 12)
         color.setFill(); path.fill()
@@ -77,7 +81,7 @@ private final class PromptActionButton: NSButton {
         self.title = title; invoke = action; bezelStyle = .rounded
         font = .systemFont(ofSize: 12, weight: primary ? .semibold : .regular)
         translatesAutoresizingMaskIntoConstraints = false
-        if primary { bezelColor = Palette.blue; contentTintColor = .white }
+        if primary { bezelColor = Palette.primaryFill; contentTintColor = .white }
         target = self; self.action = #selector(pressed)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -285,10 +289,11 @@ final class PromptStudioView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
         tabs.target = self; tabs.action = #selector(changeTab); tabs.identifier = NSUserInterfaceItemIdentifier("prompt-tabs")
         add(tabs, to: editing); add(tabHelp, to: editing)
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.drawsBackground = true
-        scroll.backgroundColor = NSColor(calibratedWhite: 0.99, alpha: 1); scroll.borderType = .bezelBorder
+        scroll.backgroundColor = Palette.editorBackground; scroll.borderType = .bezelBorder
         scroll.identifier = NSUserInterfaceItemIdentifier("prompt-editor-scroll")
         editor.isRichText = false; editor.isEditable = true; editor.isSelectable = true
         editor.font = .systemFont(ofSize: 13); editor.textColor = Palette.ink; editor.backgroundColor = scroll.backgroundColor
+        editor.insertionPointColor = Palette.ink
         editor.textContainerInset = NSSize(width: 10, height: 10); editor.isVerticallyResizable = true; editor.isHorizontallyResizable = false
         editor.autoresizingMask = [.width]; editor.textContainer?.widthTracksTextView = true
         editor.isAutomaticQuoteSubstitutionEnabled = false; editor.isAutomaticDashSubstitutionEnabled = false

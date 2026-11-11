@@ -154,7 +154,7 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "模型与配置"; window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 640, height: 640)
-        window.backgroundColor = .white; window.appearance = NSAppearance(named: .aqua)
+        window.backgroundColor = Palette.background
         super.init(window: window); window.delegate = self
         build(); window.center()
         motionObserver = NotificationCenter.default.addObserver(forName: DictationMotion.policyDidChange, object: nil, queue: .main) { [weak self] _ in self?.updateProgress() }
@@ -243,7 +243,7 @@ final class DictationSetupWindowController: NSWindowController, NSWindowDelegate
         for button in [configure, download, check, cancel, microphone, insertion, monitoring] {
             button.bezelStyle = .rounded; button.target = self; button.font = .systemFont(ofSize: 13)
         }
-        configure.bezelColor = Palette.blue; configure.contentTintColor = .white
+        configure.bezelColor = Palette.primaryFill; configure.contentTintColor = .white
         configure.action = #selector(prepareAll); download.action = #selector(prepareAll)
         check.action = #selector(checkOnly); cancel.action = #selector(cancelWork)
         microphone.action = #selector(allowMicrophone); insertion.action = #selector(allowInsertion)

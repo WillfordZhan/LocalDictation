@@ -68,6 +68,12 @@ final class SidebarNavigationButton: NSButton {
         if newWindow == nil { hover = false; updateBackground(duration: 0) }
         super.viewWillMove(toWindow: newWindow)
     }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // Animated blends are concrete colors. Discard that cached blend on a
+        // theme change and resolve the same navigation state in its new theme.
+        updateBackground(duration: 0)
+    }
     private func updateBackground(duration: TimeInterval) {
         let target = selected ? Palette.selection : hover ? Palette.hover : .clear
         let origin = backgroundColor
@@ -75,8 +81,11 @@ final class SidebarNavigationButton: NSButton {
         let seconds = DictationMotion.duration(duration)
         guard seconds > 0, !origin.isEqual(target) else { backgroundColor = target; needsDisplay = true; return }
         backgroundTransition = DictationMotionAnimation(duration: seconds, update: { [weak self] progress in
-            self?.backgroundColor = Self.blend(origin, target, progress: progress)
-            self?.needsDisplay = true
+            guard let self else { return }
+            self.effectiveAppearance.performAsCurrentDrawingAppearance {
+                self.backgroundColor = Self.blend(origin, target, progress: progress)
+            }
+            self.needsDisplay = true
         }, completion: { [weak self] in self?.backgroundTransition = nil })
         backgroundTransition?.start()
     }
@@ -134,7 +143,8 @@ private final class HeatmapDayHoverView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override func draw(_ dirtyRect: NSRect) {
         NSColor(calibratedWhite: 0.13, alpha: 0.98).setFill()
-        NSBezierPath(roundedRect: bounds, xRadius: 11, yRadius: 11).fill()
+        let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 11, yRadius: 11)
+        shape.fill(); NSColor.white.withAlphaComponent(0.12).setStroke(); shape.lineWidth = 1; shape.stroke()
         let title: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.white.withAlphaComponent(0.66)]
         (lines.first! as NSString).draw(at: NSPoint(x: 14, y: 13), withAttributes: title)
         let right = NSMutableParagraphStyle(); right.alignment = .right; right.lineBreakMode = .byTruncatingTail
@@ -261,12 +271,15 @@ final class DictationActivityHeatmap: NSView {
     }
     private func color(_ count: Int) -> NSColor {
         switch count {
-        case ...0: return NSColor(calibratedRed: 0.925, green: 0.938, blue: 0.958, alpha: 1)
-        case 1...100: return NSColor(calibratedRed: 0.85, green: 0.90, blue: 1, alpha: 1)
-        case 101...500: return NSColor(calibratedRed: 0.64, green: 0.77, blue: 0.99, alpha: 1)
-        case 501...1500: return NSColor(calibratedRed: 0.39, green: 0.60, blue: 0.96, alpha: 1)
-        default: return NSColor(calibratedRed: 0.19, green: 0.43, blue: 0.89, alpha: 1)
+        case ...0: return Palette.heatmapLevels[0]
+        case 1...100: return Palette.heatmapLevels[1]
+        case 101...500: return Palette.heatmapLevels[2]
+        case 501...1500: return Palette.heatmapLevels[3]
+        default: return Palette.heatmapLevels[4]
         }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance(); needsDisplay = true
     }
     func cell(at point: NSPoint) -> Cell? { cells.first { $0.rect.contains(point) } }
     override func updateTrackingAreas() {
@@ -369,8 +382,8 @@ final class DictationActivityHeatmap: NSView {
             let radius = min(4, tileSize * 0.22)
             let tile = NSBezierPath(roundedRect: cell.rect.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
             let future = !cell.enabled && cell.date > today
-            (cell.enabled ? color(cell.count) : NSColor(calibratedWhite: future ? 1 : 0.978, alpha: 1)).setFill(); tile.fill()
-            NSColor(calibratedRed: 0.69, green: 0.73, blue: 0.80, alpha: cell.enabled ? 0.16 : 0.20).setStroke()
+            (cell.enabled ? color(cell.count) : future ? Palette.surface : Palette.heatmapUnavailable).setFill(); tile.fill()
+            Palette.heatmapOutline.withAlphaComponent(cell.enabled ? 0.16 : 0.20).setStroke()
             tile.lineWidth = 0.5; tile.stroke()
             if !cell.enabled && !future {
                 // Hatching means no data was collected. It must not look like
@@ -381,7 +394,7 @@ final class DictationActivityHeatmap: NSView {
                     stripes.move(to: NSPoint(x: cell.rect.minX + offset, y: cell.rect.maxY))
                     stripes.line(to: NSPoint(x: cell.rect.minX + offset + tileSize, y: cell.rect.minY))
                 }
-                NSColor(calibratedRed: 0.81, green: 0.83, blue: 0.87, alpha: 0.45).setStroke()
+                Palette.heatmapHatch.withAlphaComponent(0.45).setStroke()
                 stripes.lineWidth = 0.6; stripes.stroke(); NSGraphicsContext.restoreGraphicsState()
             }
             if calendar.isDate(cell.date, inSameDayAs: today) || cell.date == hoveredDate {

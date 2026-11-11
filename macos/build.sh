@@ -14,6 +14,10 @@ swiftc -swift-version 5 -parse-as-library -O -target arm64-apple-macosx14.0 \
   "$APP_SOURCE_DIR"/*.swift -o "$APP_OUTPUT_DIR/Contents/MacOS/LocalDictation"
 cp "$APP_SOURCE_DIR/Info.plist" "$APP_OUTPUT_DIR/Contents/Info.plist"
 cp "$APP_SOURCE_DIR/assets/AppIcon.icns" "$APP_OUTPUT_DIR/Contents/Resources/AppIcon.icns"
+for name in AppIconDotFormation AppIconSoftMist AppIconDarkGlow; do
+  cp "$APP_SOURCE_DIR/assets/$name.icns" "$APP_OUTPUT_DIR/Contents/Resources/$name.icns"
+  cp "$APP_SOURCE_DIR/assets/$name.png" "$APP_OUTPUT_DIR/Contents/Resources/$name.png"
+done
 # Keep the app's redistribution terms with the executable; runtime dependency
 # notices are carried separately inside the validated Python bundle.
 cp "$APP_SOURCE_DIR/../LICENSE" "$APP_OUTPUT_DIR/Contents/Resources/LICENSE"

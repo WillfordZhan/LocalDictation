@@ -539,6 +539,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
     private let store = DictationStore(memoryOnly: CommandLine.arguments.contains("--render-preview") || CommandLine.arguments.contains("--self-test"))
     private var observer: NSObjectProtocol?
     private var windowController: DictationWindowController?
+    private lazy var appIconController = DictationAppIconController()
+    private lazy var appIconCoordinator = DictationAppIconCoordinator(store: store, controller: appIconController)
+    private var appAppearanceObservation: NSKeyValueObservation?
+    private var appearanceError: String?
     private var setupController: DictationSetupWindowController?
     private var configuringModels = false
     private var modelConfigurationActive = false
@@ -576,6 +580,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         }
         if let option = CommandLine.arguments.firstIndex(of: "--render-preview"), CommandLine.arguments.count > option + 1 {
             NSApp.setActivationPolicy(.prohibited)
+            // Preview appearance is transient: no user settings, icon metadata,
+            // backend or global system appearance is changed by this branch.
+            if let appearance = CommandLine.arguments.firstIndex(of: "--appearance"),
+               CommandLine.arguments.count > appearance + 1 {
+                NSApp.appearance = NSAppearance(named: CommandLine.arguments[appearance + 1] == "dark" ? .darkAqua : .aqua)
+            }
             renderPreview(to: URL(fileURLWithPath: CommandLine.arguments[option + 1]))
             NSApp.terminate(nil)
             return
@@ -583,6 +593,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         configureCorrectionLearning()
         readSavedModelSelection()
         NSApp.setActivationPolicy(.regular)
+        applyApplicationAppearance(store.preferences.appearanceMode)
+        appIconCoordinator.onChange = { [weak self] in self?.updateAppIconUI() }
+        appAppearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.appIconCoordinator.systemAppearanceChanged() }
+        }
+        appIconCoordinator.restore()
         createMenu()
         registerHotKey()
         observer = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
@@ -3149,6 +3165,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         controller.onSetup = { [weak self] in self?.showSetup() }
         controller.onSelectASRModel = { [weak self] id in self?.selectHomeModels(asr: id) }
         controller.onSelectCleanupModel = { [weak self] id in self?.selectHomeModels(cleanup: id) }
+        controller.onSelectAppearanceMode = { [weak self] mode in self?.selectApplicationAppearance(mode) }
+        controller.onSelectAppIcon = { [weak self] style in self?.appIconCoordinator.selectManual(style) }
+        controller.onAppIconFollowsSystemAppearance = { [weak self] follows in self?.appIconCoordinator.setFollowsSystem(follows) }
         controller.onMicrophone = { [weak self] in self?.requestMicrophone() }
         controller.onAccessibility = { [weak self] in self?.requestAccessibility() }
         controller.onShortcutCapture = { [weak self] capturing in
@@ -3170,9 +3189,36 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             self?.reprocessHistory(entryID: entryID, versionID: versionID)
         }
         windowController = controller
+        updateAppIconUI()
+        controller.updateAppearanceSelection(error: appearanceError)
         updatePromptUI()
         updateReprocessUI()
         controller.updateCorrectionLearning(status: correctionStatus)
+    }
+
+    private func applyApplicationAppearance(_ mode: DictationAppearanceMode) {
+        switch mode {
+        case .system: NSApp.appearance = nil
+        case .light: NSApp.appearance = NSAppearance(named: .aqua)
+        case .dark: NSApp.appearance = NSAppearance(named: .darkAqua)
+        }
+    }
+
+    private func selectApplicationAppearance(_ mode: DictationAppearanceMode) {
+        guard store.setAppearanceMode(mode) else {
+            appearanceError = "外观设置未能保存，请检查数据文件夹后重试。"
+            windowController?.updateAppearanceSelection(error: appearanceError)
+            return
+        }
+        appearanceError = nil
+        applyApplicationAppearance(mode)
+        windowController?.updateAppearanceSelection(error: nil)
+        appIconCoordinator.systemAppearanceChanged()
+    }
+
+    private func updateAppIconUI() {
+        windowController?.updateAppIconSelection(busy: appIconCoordinator.busy, error: appIconCoordinator.error,
+                                                 appliedStyle: appIconCoordinator.appliedStyle)
     }
 
     @objc private func showResults() {

@@ -130,28 +130,60 @@ enum DictationPage: String, CaseIterable {
 }
 
 enum Palette {
-    static let ink = NSColor(calibratedWhite: 0.10, alpha: 1)
-    static let secondary = NSColor(calibratedWhite: 0.32, alpha: 1)
-    // Explicit sRGB keeps small text readable on white and the light sidebar.
-    // Calibrated gray is substantially lighter after display-space conversion.
-    static let muted = NSColor(srgbRed: 0.44, green: 0.44, blue: 0.44, alpha: 1)
-    static let blue = NSColor(srgbRed: 0.16, green: 0.39, blue: 0.92, alpha: 1)
-    static let warning = NSColor(srgbRed: 0.64, green: 0.32, blue: 0.09, alpha: 1)
-    static let sidebar = NSColor(calibratedWhite: 0.965, alpha: 1)
-    static let selection = NSColor(calibratedWhite: 0.895, alpha: 1)
-    static let hover = NSColor(calibratedWhite: 0.935, alpha: 1)
-    static let border = NSColor(calibratedWhite: 0.93, alpha: 1)
-    static let blueWash = NSColor(calibratedRed: 0.94, green: 0.965, blue: 1, alpha: 1)
+    /// Keep semantic colors dynamic so appearance changes repaint the existing
+    /// view tree instead of discarding drafts, selection, focus, or scroll state.
+    static func adaptive(_ light: NSColor, _ dark: NSColor) -> NSColor {
+        NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+        }
+    }
+    static func rgb(_ hex: UInt32) -> NSColor {
+        NSColor(srgbRed: CGFloat((hex >> 16) & 255) / 255,
+                green: CGFloat((hex >> 8) & 255) / 255,
+                blue: CGFloat(hex & 255) / 255, alpha: 1)
+    }
+    static func adaptive(_ light: UInt32, _ dark: UInt32) -> NSColor { adaptive(rgb(light), rgb(dark)) }
+    /// CALayer stores a concrete CGColor. Resolve it again when its owning view's
+    /// effective appearance changes rather than caching a light-mode snapshot.
+    static func cgColor(_ color: NSColor, for appearance: NSAppearance) -> CGColor {
+        var resolved = NSColor.clear.cgColor
+        appearance.performAsCurrentDrawingAppearance { resolved = color.cgColor }
+        return resolved
+    }
+    static let background = adaptive(0xFFFFFF, 0x17191D)
+    static let surface = adaptive(0xFFFFFF, 0x23262B)
+    static let editorBackground = adaptive(0xFFFFFF, 0x1B1E22)
+    static let ink = adaptive(NSColor(calibratedWhite: 0.10, alpha: 1), rgb(0xF0F1F3))
+    static let secondary = adaptive(NSColor(calibratedWhite: 0.32, alpha: 1), rgb(0xC6C9D0))
+    static let muted = adaptive(0x707070, 0xA9AEB8)
+    static let blue = adaptive(0x2964EB, 0x8EB5FF)
+    // White text on primary controls needs a deeper blue than accent text.
+    static let primaryFill = adaptive(0x2964EB, 0x285FC5)
+    static let warning = adaptive(0xA35217, 0xE9B16B)
+    static let sidebar = adaptive(NSColor(calibratedWhite: 0.965, alpha: 1), rgb(0x1F2227))
+    static let selection = adaptive(NSColor(calibratedWhite: 0.895, alpha: 1), rgb(0x373C45))
+    static let hover = adaptive(NSColor(calibratedWhite: 0.935, alpha: 1), rgb(0x2C3139))
+    static let border = adaptive(NSColor(calibratedWhite: 0.93, alpha: 1), rgb(0x3A3F48))
+    static let blueWash = adaptive(NSColor(calibratedRed: 0.94, green: 0.965, blue: 1, alpha: 1), rgb(0x2B3C58))
+    static let heatmapLevels = [adaptive(0xEDF0F5, 0x30353D), adaptive(0xD9E6FF, 0x304768),
+                               adaptive(0xA3C4FC, 0x3C6098), adaptive(0x6399F5, 0x5887CC),
+                               adaptive(0x306EE3, 0x86B0F2)]
+    static let heatmapUnavailable = adaptive(0xFAFAFA, 0x292D33)
+    static let heatmapOutline = adaptive(0xB0BACC, 0x6D7789)
+    static let heatmapHatch = adaptive(0xCFD4DE, 0x626D7D)
 }
 
 private class SurfaceView: NSView {
     var fill: NSColor; var radius: CGFloat; var border: NSColor?
     override var isFlipped: Bool { true }
-    init(fill: NSColor = .white, radius: CGFloat = 0, border: NSColor? = nil) {
+    init(fill: NSColor = Palette.background, radius: CGFloat = 0, border: NSColor? = nil) {
         self.fill = fill; self.radius = radius; self.border = border
         super.init(frame: .zero); translatesAutoresizingMaskIntoConstraints = false
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance(); needsDisplay = true
+    }
     override func draw(_ dirtyRect: NSRect) {
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
         fill.setFill(); path.fill()
@@ -171,12 +203,82 @@ private final class ActionButton: NSButton {
         super.init(frame: .zero); self.title = title; invoke = action; bezelStyle = .rounded
         font = .systemFont(ofSize: 13, weight: primary ? .semibold : .regular)
         if let icon { image = NSImage(systemSymbolName: icon, accessibilityDescription: title); imagePosition = .imageLeading }
-        if primary { bezelColor = Palette.blue; contentTintColor = .white }
+        if primary { bezelColor = Palette.primaryFill; contentTintColor = .white }
         target = self; self.action = #selector(trigger); translatesAutoresizingMaskIntoConstraints = false
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     @objc private func trigger() { invoke?() }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// The same assets are previewed here and applied to Finder and Dock. A radio
+/// choice stays on the last applied icon until the filesystem update succeeds.
+private final class AppIconChoiceButton: NSButton {
+    override var isFlipped: Bool { true }
+    let style: DictationAppIconStyle
+    private let preview: NSImage?
+    private let invoke: () -> Void
+    private var hoverAmount: CGFloat = 0
+    private var hoverAnimation: DictationMotionAnimation?
+    private var hoverTracking: NSTrackingArea?
+    var allowsRetry = false
+    var selected: Bool = false {
+        didSet { state = selected ? .on : .off; setAccessibilityValue(selected ? 1 : 0); needsDisplay = true }
+    }
+    static func image(for style: DictationAppIconStyle) -> NSImage? {
+        Bundle.main.url(forResource: style.resourceName, withExtension: "png")
+            .flatMap { NSImage(contentsOf: $0) }
+            ?? Bundle.main.url(forResource: style.resourceName, withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
+    }
+    init(style: DictationAppIconStyle, action: @escaping () -> Void) {
+        self.style = style; preview = Self.image(for: style); invoke = action
+        super.init(frame: .zero)
+        title = style.title; isBordered = false; translatesAutoresizingMaskIntoConstraints = false
+        identifier = NSUserInterfaceItemIdentifier("app-icon-" + style.rawValue)
+        setAccessibilityRole(.radioButton); setAccessibilityLabel(style.title)
+        target = self; self.action = #selector(choose)
+        NSLayoutConstraint.activate([widthAnchor.constraint(equalToConstant: 164), heightAnchor.constraint(equalToConstant: 156)])
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    deinit { hoverAnimation?.cancel() }
+    @objc private func choose() { guard isEnabled, !selected || allowsRetry else { return }; invoke() }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(area); hoverTracking = area
+    }
+    override func mouseEntered(with event: NSEvent) { setHovered(true) }
+    override func mouseExited(with event: NSEvent) { setHovered(false) }
+    private func setHovered(_ hovered: Bool) {
+        hoverAnimation?.cancel()
+        let start = hoverAmount, end: CGFloat = hovered && isEnabled ? 1 : 0
+        let animation = DictationMotionAnimation(duration: DictationMotion.duration(0.12), update: { [weak self] progress in
+            self?.hoverAmount = start + (end - start) * progress; self?.needsDisplay = true
+        })
+        hoverAnimation = animation; animation.start()
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 14, yRadius: 14)
+        (selected ? Palette.blueWash : Palette.hover.withAlphaComponent(hoverAmount * 0.7)).setFill(); shape.fill()
+        (selected ? Palette.blue.withAlphaComponent(0.55) : Palette.ink.withAlphaComponent(0.08 + hoverAmount * 0.10)).setStroke()
+        shape.lineWidth = selected ? 1.5 : 1; shape.stroke()
+        let image = preview ?? NSImage(systemSymbolName: "waveform", accessibilityDescription: nil)
+        image?.draw(in: NSRect(x: (bounds.width - 100) / 2, y: 12, width: 100, height: 100),
+                    from: .zero, operation: .sourceOver, fraction: isEnabled ? 1 : 0.55, respectFlipped: true, hints: nil)
+        let paragraph = NSMutableParagraphStyle(); paragraph.alignment = .center
+        (title as NSString).draw(in: NSRect(x: 12, y: 123, width: bounds.width - 24, height: 20), withAttributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: selected ? .semibold : .medium),
+            .foregroundColor: selected ? Palette.blue : Palette.ink, .paragraphStyle: paragraph
+        ])
+        if selected {
+            let mark = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: nil)
+            let config = NSImage.SymbolConfiguration(paletteColors: [Palette.blue])
+            mark?.withSymbolConfiguration(config)?.draw(in: NSRect(x: bounds.width - 29, y: 13, width: 17, height: 17),
+                                                       from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        }
+    }
 }
 
 private final class HistoryRowButton: NSButton {
@@ -266,8 +368,8 @@ private func pin(_ child: NSView, in parent: NSView, inset: CGFloat = 0) {
     child.translatesAutoresizingMaskIntoConstraints = false; parent.addSubview(child)
     NSLayoutConstraint.activate([child.leadingAnchor.constraint(equalTo: parent.leadingAnchor, constant: inset), child.trailingAnchor.constraint(equalTo: parent.trailingAnchor, constant: -inset), child.topAnchor.constraint(equalTo: parent.topAnchor, constant: inset), child.bottomAnchor.constraint(equalTo: parent.bottomAnchor, constant: -inset)])
 }
-private func card(_ content: NSView, color: NSColor = .white, inset: CGFloat = 20) -> NSView {
-    let view = SurfaceView(fill: color, radius: 14, border: color == .white ? Palette.border : nil); pin(content, in: view, inset: inset); return view
+private func card(_ content: NSView, color: NSColor = Palette.surface, inset: CGFloat = 20) -> NSView {
+    let view = SurfaceView(fill: color, radius: 14, border: color == Palette.surface ? Palette.border : nil); pin(content, in: view, inset: inset); return view
 }
 private func clear(_ stack: NSStackView) {
     for child in stack.arrangedSubviews { stack.removeArrangedSubview(child); child.removeFromSuperview() }
@@ -275,7 +377,7 @@ private func clear(_ stack: NSStackView) {
 private func textView(_ string: String, height: CGFloat? = 180) -> NSScrollView {
     let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.drawsBackground = false
     let text = NSTextView(frame: .zero); text.isEditable = false; text.isSelectable = true; text.isRichText = false
-    text.drawsBackground = false; text.textColor = Palette.ink; text.font = .systemFont(ofSize: 14); text.textContainerInset = NSSize(width: 0, height: 6)
+    text.drawsBackground = false; text.textColor = Palette.ink; text.insertionPointColor = Palette.ink; text.font = .systemFont(ofSize: 14); text.textContainerInset = NSSize(width: 0, height: 6)
     text.isVerticallyResizable = true; text.isHorizontallyResizable = false; text.autoresizingMask = [.width]; text.textContainer?.widthTracksTextView = true; text.string = string
     scroll.documentView = text
     if let height { scroll.heightAnchor.constraint(equalToConstant: height).isActive = true }
@@ -293,6 +395,9 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     var onSetup: (() -> Void)?
     var onSelectASRModel: ((String) -> Void)?
     var onSelectCleanupModel: ((String) -> Void)?
+    var onSelectAppIcon: ((DictationAppIconStyle) -> Void)?
+    var onSelectAppearanceMode: ((DictationAppearanceMode) -> Void)?
+    var onAppIconFollowsSystemAppearance: ((Bool) -> Void)?
     var onShortcutCapture: ((Bool) -> Void)?
     var onApplyShortcut: ((DictationShortcut) -> String?)?
     var onInputMonitoring: (() -> Void)?
@@ -367,13 +472,23 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     private var homeModelConfigurationMessage: NSTextField?
     private var homeCleanupResult: NSTextField?
     private var cleanupSettingDetail: NSTextField?
+    private let sidebarAppIcon = NSImageView()
+    private weak var appearancePicker: ActionSegments?
+    private weak var appearanceFeedback: NSTextField?
+    private var appearanceError: String?
+    private var appIconChoices: [AppIconChoiceButton] = []
+    private var appIconFeedback: NSTextField?
+    private var appIconSystemSwitch: ActionSwitch?
+    private var appliedAppIconStyle: DictationAppIconStyle?
+    private var appIconBusy = false
+    private var appIconError: String?
 
     init(store: DictationStore, sessionStartedAt: Date) {
         self.store = store; self.sessionStartedAt = sessionStartedAt
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 820), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.acceptsMouseMovedEvents = true
         window.title = "本地口述"; window.titleVisibility = .hidden; window.titlebarAppearsTransparent = true; window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 1000, height: 700); window.appearance = NSAppearance(named: .aqua); window.backgroundColor = .white
+        window.minSize = NSSize(width: 1000, height: 700); window.backgroundColor = Palette.background
         super.init(window: window); window.delegate = self; buildShell(); renderPage(); window.center()
         calendarContext = DictationUsage.dayKey(for: Date()) + TimeZone.current.identifier
         for name in [Notification.Name.NSCalendarDayChanged, NSNotification.Name.NSSystemTimeZoneDidChange, NSApplication.didBecomeActiveNotification] {
@@ -408,7 +523,8 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
             menu.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -12),
             menu.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 26)
         ])
-        let icon = NSImageView(); icon.image = NSImage(named: NSImage.Name("AppIcon")) ?? NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "本地口述")
+        let icon = sidebarAppIcon
+        icon.image = AppIconChoiceButton.image(for: appliedAppIconStyle ?? store.preferences.appIconStyle) ?? NSImage(named: NSImage.Name("AppIcon")) ?? NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "本地口述")
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.widthAnchor.constraint(equalToConstant: 28).isActive = true; icon.heightAnchor.constraint(equalToConstant: 28).isActive = true
         let brand = horizontal([icon, label("本地口述", size: 19, weight: .semibold)], spacing: 10)
@@ -533,6 +649,7 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         onSelectCleanupModel?(id)
     }
     func reloadStore() {
+        sidebarAppIcon.image = AppIconChoiceButton.image(for: appliedAppIconStyle ?? store.preferences.appIconStyle) ?? sidebarAppIcon.image
         if page == .dictionary, vocabularyList != nil {
             // Auto-added words can arrive while a manual word is being typed.
             // Refresh the results in place so that editor and its focus survive.
@@ -543,6 +660,31 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
             vocabularyFeedback?.textColor = store.storageError == nil ? Palette.muted : .systemOrange
         } else { renderPage() }
         refreshReprocessingSheet()
+    }
+    func updateAppearanceSelection(error: String?) {
+        // Persistence succeeds before application appearance changes. Refresh only
+        // these controls, including a failed selection, without rebuilding editors.
+        appearanceError = error
+        appearancePicker?.selectedSegment = DictationAppearanceMode.allCases.firstIndex(of: store.preferences.appearanceMode) ?? 0
+        appearanceFeedback?.stringValue = error ?? ""
+        appearanceFeedback?.isHidden = error == nil
+    }
+    func updateAppIconSelection(busy: Bool, error: String?, appliedStyle: DictationAppIconStyle? = nil) {
+        appIconBusy = busy; appIconError = error
+        if let appliedStyle {
+            appliedAppIconStyle = appliedStyle
+            sidebarAppIcon.image = AppIconChoiceButton.image(for: appliedStyle) ?? sidebarAppIcon.image
+        }
+        appIconSystemSwitch?.state = store.preferences.appIconFollowsSystemAppearance ? .on : .off
+        appIconSystemSwitch?.isEnabled = !busy
+        for choice in appIconChoices {
+            choice.selected = choice.style == store.preferences.appIconStyle
+            choice.allowsRetry = error != nil
+            choice.isEnabled = !busy && !store.preferences.appIconFollowsSystemAppearance; choice.needsDisplay = true
+        }
+        appIconFeedback?.stringValue = busy ? "正在更新图标…" : error ?? ""
+        appIconFeedback?.textColor = error == nil ? Palette.muted : .systemOrange
+        appIconFeedback?.isHidden = !busy && error == nil
     }
     func updateReprocessing(entryID: UUID?, busy: Bool, error: String?) {
         reprocessingEntryID = entryID; reprocessingBusy = busy; reprocessingError = error
@@ -635,6 +777,7 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         homeShortcutNotice = nil; homeShortcutExplanation = nil; homeEnableFunctionKey = nil
         homeInsertionNotice = nil; homeAllowInsertion = nil
         homeProcessingDetail = nil; cleanupSettingDetail = nil
+        appIconChoices = []; appIconFeedback = nil; appIconSystemSwitch = nil
         homeASRProgress?.stopAnimation(nil); homeCleanupProgress?.stopAnimation(nil)
         homeASRStatus = nil; homeCleanupStatus = nil; homeASRPicker = nil; homeCleanupPicker = nil; homeCleanupResult = nil
         homeASRProgress = nil; homeCleanupProgress = nil; homeModelConfigurationMessage = nil
@@ -1143,7 +1286,9 @@ extension DictationWindowController {
         return horizontal([text, control], spacing: 24)
     }
     private func renderSettings() {
-        header("按你的习惯来。", subtitle: "设置会应用到下一次录音。正在处理的口述保持原来的设置。")
+        header("按你的习惯来。", subtitle: "外观即刻更新；录音设置从下一次口述生效。")
+        renderAppearanceSettings()
+        renderAppIconSettings()
         renderShortcutSettings()
         let preferences = store.preferences; let input = vertical(22)
         let cleanup = ActionSwitch(value: preferences.cleanupEnabled) { [weak self] value in self?.store.updatePreferences { $0.cleanupEnabled = value } }
@@ -1188,6 +1333,50 @@ extension DictationWindowController {
         fill(access, horizontal([label("本地服务", weight: .medium), ActionButton("检查服务", icon: "arrow.clockwise") { [weak self] in self?.onCheckService?() }]))
         fill(pageStack, card(access))
     }
+    private func renderAppearanceSettings() {
+        let modes = DictationAppearanceMode.allCases
+        let picker = ActionSegments(selected: modes.firstIndex(of: store.preferences.appearanceMode) ?? 0,
+                                    labels: modes.map { $0.title }) { [weak self] index in
+            guard modes.indices.contains(index) else { return }
+            self?.onSelectAppearanceMode?(modes[index])
+        }
+        picker.identifier = NSUserInterfaceItemIdentifier("appearance-mode")
+        picker.setAccessibilityLabel("界面外观")
+        picker.setContentHuggingPriority(.required, for: .horizontal)
+        appearancePicker = picker
+        let content = vertical(10)
+        fill(content, horizontal([label("外观", size: 15, weight: .semibold), NSView(), picker]))
+        let feedback = label("", size: 12, color: Palette.warning)
+        feedback.identifier = NSUserInterfaceItemIdentifier("appearance-feedback")
+        appearanceFeedback = feedback; fill(content, feedback)
+        fill(pageStack, card(content))
+        updateAppearanceSelection(error: appearanceError)
+    }
+
+    private func renderAppIconSettings() {
+        let content = vertical(12)
+        fill(content, label("应用图标", size: 15, weight: .semibold))
+        let follows = ActionSwitch(value: store.preferences.appIconFollowsSystemAppearance) { [weak self] follows in
+            self?.onAppIconFollowsSystemAppearance?(follows)
+        }
+        follows.identifier = NSUserInterfaceItemIdentifier("app-icon-follows-system")
+        follows.setAccessibilityLabel("图标跟随应用外观")
+        appIconSystemSwitch = follows
+        fill(content, settingRow("跟随应用外观", detail: "浅色用柔雾显影，深色用暗色辉光。", control: follows))
+        appIconChoices = DictationAppIconStyle.manualChoices.map { style in
+            let choice = AppIconChoiceButton(style: style) { [weak self] in self?.onSelectAppIcon?(style) }
+            choice.selected = style == store.preferences.appIconStyle
+            choice.isEnabled = !appIconBusy && !store.preferences.appIconFollowsSystemAppearance
+            return choice
+        }
+        fill(content, horizontal(appIconChoices.map { $0 as NSView } + [NSView()], spacing: 12))
+        let feedback = label("", size: 12, color: Palette.muted)
+        feedback.identifier = NSUserInterfaceItemIdentifier("app-icon-feedback")
+        appIconFeedback = feedback; fill(content, feedback)
+        fill(pageStack, card(content))
+        updateAppIconSelection(busy: appIconBusy, error: appIconError)
+    }
+
     private func renderShortcutSettings() {
         let content = vertical(12)
         fill(content, label("快捷键", size: 15, weight: .semibold))
@@ -1236,7 +1425,7 @@ extension DictationWindowController {
         alert.addButton(withTitle: "继续"); alert.addButton(withTitle: "取消"); return alert.runModal() == .alertFirstButtonReturn
     }
     func renderPNG(to url: URL) throws {
-        guard let view = window?.contentView else { return }; view.layoutSubtreeIfNeeded(); try renderView(view, to: url, background: .white)
+        guard let view = window?.contentView else { return }; view.layoutSubtreeIfNeeded(); try renderView(view, to: url, background: Palette.background)
     }
 }
 
@@ -1895,10 +2084,14 @@ final class DictationHUD {
 }
 
 private func renderView(_ view: NSView, to url: URL, background: NSColor) throws {
-    guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
-    view.cacheDisplay(in: view.bounds, to: bitmap)
-    let image = NSImage(size: view.bounds.size); image.lockFocus(); background.setFill(); view.bounds.fill()
-    if let cgImage = bitmap.cgImage { NSImage(cgImage: cgImage, size: view.bounds.size).draw(in: view.bounds, from: .zero, operation: .sourceOver, fraction: 1) }
-    image.unlockFocus()
-    if let tiff = image.tiffRepresentation, let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) { try png.write(to: url) }
+    var png: Data?
+    view.effectiveAppearance.performAsCurrentDrawingAppearance {
+        guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        let image = NSImage(size: view.bounds.size); image.lockFocus(); background.setFill(); view.bounds.fill()
+        if let cgImage = bitmap.cgImage { NSImage(cgImage: cgImage, size: view.bounds.size).draw(in: view.bounds, from: .zero, operation: .sourceOver, fraction: 1) }
+        image.unlockFocus()
+        if let tiff = image.tiffRepresentation { png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) }
+    }
+    if let png { try png.write(to: url) }
 }

@@ -31,7 +31,7 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
                               styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = "重新整理历史"; window.titleVisibility = .hidden; window.titlebarAppearsTransparent = true
         window.minSize = NSSize(width: 760, height: 510); window.isReleasedWhenClosed = false
-        window.appearance = NSAppearance(named: .aqua); window.backgroundColor = .white
+        window.backgroundColor = Palette.background
         super.init(window: window); window.delegate = self
         build(); update(entry: entry, catalog: catalog, busy: false, blockedByOtherEntry: false, error: nil)
     }
@@ -68,7 +68,7 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
         promptPicker.target = self; promptPicker.action = #selector(promptChanged)
         promptPicker.setAccessibilityLabel("本次使用的润色规则")
         runButton.target = self; runButton.action = #selector(runPressed); runButton.bezelStyle = .rounded
-        runButton.bezelColor = Palette.blue; runButton.contentTintColor = .white
+        runButton.bezelColor = Palette.primaryFill; runButton.contentTintColor = .white
         runButton.widthAnchor.constraint(equalToConstant: 100).isActive = true
         add(controls); add(modelLabel)
         sourcePicker.selectedSegment = 0; sourcePicker.target = self; sourcePicker.action = #selector(sourceChanged)
@@ -98,7 +98,7 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
         stack.addArrangedSubview(header); header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.borderType = .noBorder
-        scroll.drawsBackground = true; scroll.backgroundColor = NSColor(white: 0.975, alpha: 1)
+        scroll.drawsBackground = true; scroll.backgroundColor = Palette.editorBackground
         scroll.wantsLayer = true; scroll.layer?.cornerRadius = 10
         text.isEditable = false; text.isSelectable = true; text.isRichText = false
         text.font = .systemFont(ofSize: 14); text.textColor = Palette.ink
@@ -197,10 +197,12 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
         view.layoutSubtreeIfNeeded()
         guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
         view.cacheDisplay(in: view.bounds, to: bitmap)
-        // Hidden fixtures do not include NSWindow's white backing surface.
-        // Composite the actual content bitmap over that same background.
+        // Hidden fixtures omit the window backing surface. Resolve its dynamic
+        // color against this window so previews match the selected appearance.
         let image = NSImage(size: view.bounds.size); image.lockFocus()
-        NSColor.white.setFill(); view.bounds.fill()
+        view.effectiveAppearance.performAsCurrentDrawingAppearance {
+            Palette.background.setFill(); view.bounds.fill()
+        }
         if let cgImage = bitmap.cgImage { NSImage(cgImage: cgImage, size: view.bounds.size).draw(in: view.bounds) }
         image.unlockFocus()
         if let tiff = image.tiffRepresentation, let rendered = NSBitmapImageRep(data: tiff) {

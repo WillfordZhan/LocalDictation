@@ -123,6 +123,16 @@ enum HeatmapHoverChecks {
         map.needsLayout = true; map.layoutSubtreeIfNeeded()
         try require(card(in: root) === originalCard, "Unchanged layout reset visible statistics")
         try screenshot(root, name: "hover-today.png")
+        // A theme change must recolor the same map while keeping a hovered day's
+        // visible metrics and accessibility contents; no new mouse event is needed.
+        for (name, suffix) in [(NSAppearance.Name.darkAqua, "dark"), (.aqua, "light")] {
+            window.appearance = NSAppearance(named: name)
+            root.layer?.backgroundColor = Palette.cgColor(Palette.surface, for: window.effectiveAppearance)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.18))
+            try require(card(in: root) === originalCard, "Appearance change replaced a visible day tooltip")
+            try require(contents(in: root).contains("输出字数：1,000 字"), "Appearance change lost tooltip metrics")
+            try screenshot(root, name: "hover-theme-\(suffix).png")
+        }
         try leave(map)
         try require(card(in: root) == nil, "Mouse exit left statistics visible")
 

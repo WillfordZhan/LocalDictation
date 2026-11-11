@@ -257,9 +257,207 @@ func assembledType(_ color: NSColor, _ ordered: Bool) {
   }
 }
 
+// The dark artwork keeps its approved sampling and random stream independent of the
+// light styles, so regenerating one style cannot move another style's particles.
+struct DarkParticleRandom {
+  var s: UInt64 = 90117
+  mutating func u() -> CGFloat {
+    s = s &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+    return CGFloat((s >> 32) & 0xffff_ffff) / CGFloat(UInt32.max)
+  }
+  mutating func n() -> CGFloat {
+    let a = max(0.00001, u())
+    return sqrt(-2 * log(a)) * cos(2 * CGFloat.pi * u())
+  }
+}
+func darkDot(_ p: NSPoint, _ r: CGFloat, _ color: NSColor) {
+  fill(NSBezierPath(ovalIn: NSRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2)), color)
+}
+func darkMix(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat { a + (b - a) * t }
+func darkPointMix(_ a: NSPoint, _ b: NSPoint, _ t: CGFloat) -> NSPoint {
+  NSPoint(x: darkMix(a.x, b.x, t), y: darkMix(a.y, b.y, t))
+}
+func darkPigment(_ a: UInt32, _ b: UInt32, _ t: CGFloat, _ alpha: CGFloat) -> NSColor {
+  let ar = CGFloat((a >> 16) & 255)
+  let ag = CGFloat((a >> 8) & 255)
+  let ab = CGFloat(a & 255)
+  let br = CGFloat((b >> 16) & 255)
+  let bg = CGFloat((b >> 8) & 255)
+  let bb = CGFloat(b & 255)
+  return NSColor(
+    srgbRed: darkMix(ar, br, t) / 255, green: darkMix(ag, bg, t) / 255,
+    blue: darkMix(ab, bb, t) / 255, alpha: alpha)
+}
+func darkCurveSamples() -> [NSPoint] {
+  let controls: [(NSPoint, NSPoint, NSPoint, NSPoint)] = [
+    (.init(x: 218, y: 370), .init(x: 245, y: 370), .init(x: 241, y: 310), .init(x: 264, y: 310)),
+    (.init(x: 264, y: 310), .init(x: 290, y: 310), .init(x: 297, y: 438), .init(x: 324, y: 438)),
+    (.init(x: 324, y: 438), .init(x: 352, y: 438), .init(x: 357, y: 258), .init(x: 386, y: 258)),
+    (.init(x: 386, y: 258), .init(x: 413, y: 258), .init(x: 417, y: 414), .init(x: 447, y: 414)),
+    (.init(x: 447, y: 414), .init(x: 474, y: 414), .init(x: 480, y: 378), .init(x: 507, y: 378)),
+  ]
+  var out: [NSPoint] = []
+  for (a, b, c, d) in controls {
+    for i in 0..<80 {
+      let t = CGFloat(i) / 80
+      let v = 1 - t
+      out.append(
+        NSPoint(
+          x: v * v * v * a.x + 3 * v * v * t * b.x + 3 * v * t * t * c.x + t * t * t * d.x,
+          y: v * v * v * a.y + 3 * v * v * t * b.y + 3 * v * t * t * c.y + t * t * t * d.y))
+    }
+  }
+  return out
+}
+// Uniform arclength keeps the grain size and spacing independent of Bézier speed.
+func darkSignalTrack(_ spacing: CGFloat) -> [(NSPoint, NSPoint)] {
+  let raw = darkCurveSamples()
+  var out: [(NSPoint, NSPoint)] = []
+  var carried: CGFloat = 0
+  for i in 1..<raw.count {
+    let a = raw[i - 1]
+    let b = raw[i]
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    let len = hypot(dx, dy)
+    if len < 0.0001 { continue }
+    var remaining = len
+    var start = a
+    while carried + remaining >= spacing {
+      let distance = spacing - carried
+      let ratio = distance / remaining
+      let q = darkPointMix(start, b, ratio)
+      out.append((q, NSPoint(x: -dy / len, y: dx / len)))
+      start = q
+      remaining -= distance
+      carried = 0
+    }
+    carried += remaining
+  }
+  return out
+}
+func darkReceivingPoint(_ u: CGFloat) -> NSPoint {
+  if u < 0.77 { return NSPoint(x: 574 + u / 0.77 * 100, y: 576) }
+  return NSPoint(x: 659, y: 620 + (u - 0.77) / 0.23 * 42)
+}
+func darkContinuousToGrain(_ color: UInt32) {
+  let p = CGMutablePath()
+  p.move(to: CGPoint(x: 218, y: 370))
+  p.addCurve(
+    to: CGPoint(x: 264, y: 310), control1: CGPoint(x: 245, y: 370),
+    control2: CGPoint(x: 241, y: 310))
+  p.addCurve(
+    to: CGPoint(x: 324, y: 438), control1: CGPoint(x: 290, y: 310),
+    control2: CGPoint(x: 297, y: 438))
+  p.addCurve(
+    to: CGPoint(x: 386, y: 258), control1: CGPoint(x: 352, y: 438),
+    control2: CGPoint(x: 357, y: 258))
+  p.addCurve(
+    to: CGPoint(x: 447, y: 414), control1: CGPoint(x: 413, y: 258),
+    control2: CGPoint(x: 417, y: 414))
+  p.addCurve(
+    to: CGPoint(x: 507, y: 378), control1: CGPoint(x: 474, y: 414),
+    control2: CGPoint(x: 480, y: 378))
+  NSGraphicsContext.saveGraphicsState()
+  let c = NSGraphicsContext.current!.cgContext
+  c.addPath(p)
+  c.setLineWidth(32)
+  c.setLineCap(.round)
+  c.setLineJoin(.round)
+  c.replacePathWithStrokedPath()
+  c.clip()
+  let colors = (0...40).map { i -> NSColor in
+    let x = 218 + CGFloat(i) / 40 * 304
+    let t = min(1, max(0, (x - 350) / 157))
+    return ink(color, pow(1 - t, 1.1))
+  }
+  NSGradient(colors: colors)!.draw(
+    from: NSPoint(x: 218, y: 350), to: NSPoint(x: 522, y: 350),
+    options: [.drawsBeforeStartingLocation, .drawsAfterEndingLocation])
+  NSGraphicsContext.restoreGraphicsState()
+}
+func darkSolidifyingType(_ color: UInt32) {
+  let colors = (0...32).map { i -> NSColor in
+    let t = CGFloat(i) / 32
+    let a = 0.12 + 0.88 * (1 - pow(1 - t, 2))
+    return ink(color, a)
+  }
+  NSGraphicsContext.saveGraphicsState()
+  tGlyph().addClip()
+  NSGradient(colors: colors)!.draw(
+    from: NSPoint(x: 574, y: 600), to: NSPoint(x: 652, y: 600),
+    options: [.drawsBeforeStartingLocation, .drawsAfterEndingLocation])
+  NSGraphicsContext.restoreGraphicsState()
+}
+
+func drawDarkGlowArtwork() {
+
+  grad(
+    tile, [ink(0x153C37), ink(0x102C2B), ink(0x16292D)], NSPoint(x: 110, y: 130),
+    NSPoint(x: 860, y: 900))
+  let wave = darkCurveSamples().filter { $0.x >= 354 }
+  var rng = DarkParticleRandom(s: 66201)
+  // The broad middle field is retained, while the intact left half emits no stray grains.
+  for _ in 0..<220 {
+    let w = wave[min(wave.count - 1, Int(rng.u() * CGFloat(wave.count)))]
+    let t = rng.u() * 0.95
+    let goal = darkReceivingPoint(rng.u())
+    var p = darkPointMix(w, goal, t)
+    let spread = 15 + 31 * sin(CGFloat.pi * t)
+    p.x += rng.n() * spread
+    p.y += rng.n() * spread * 0.8
+    if p.x > 355 && p.x < 687 && p.y < 672 {
+      darkDot(p, 1.8 + rng.u() * 2.2, darkPigment(0xB3DAC0, 0xCABADA, t, 0.15 + rng.u() * 0.28))
+    }
+  }
+  for _ in 0..<115 {
+    let w = wave[min(wave.count - 1, Int(rng.u() * CGFloat(wave.count)))]
+    let k = min(1, max(0, (w.x - 350) / 157))
+    let sd = 12 + k * 17
+    let p = NSPoint(x: w.x + rng.n() * sd, y: w.y + rng.n() * sd)
+    if p.x > 354 { darkDot(p, 1.6 + rng.u() * 2.3, ink(0xC1DCBB, (0.16 + rng.u() * 0.25) * k)) }
+  }
+  darkContinuousToGrain(0xE1EFD7)
+  // Grain coverage rises across screen x; the left curve stays a clean single stroke.
+  let track = darkSignalTrack(11.3)
+  for (i, (p, n)) in track.enumerated() {
+    let k = min(1, max(0, (p.x - 350) / 157))
+    if k > 0 {
+      for lane in -1...1 {
+        if rng.u() < 0.18 + 0.82 * k {
+          let offset = CGFloat(lane) * 10.7 + rng.n() * 1.2
+          let along = lane == 0 ? CGFloat(0) : CGFloat(i % 2 == 0 ? 2.8 : -2.8)
+          let q = NSPoint(
+            x: p.x + n.x * offset - n.y * along + rng.n() * 0.8,
+            y: p.y + n.y * offset + n.x * along + rng.n() * 0.8)
+          darkDot(q, 2.6 + 2.3 * k + rng.u() * 0.6, ink(0xE1EFD7, 0.40 + 0.60 * k))
+        }
+      }
+    }
+  }
+  darkSolidifyingType(0xE7DFE8)
+  // Grain-to-mass overlap replaces punched notches, so the receiving edge is soft.
+  for _ in 0..<76 {
+    let x = 568 + rng.u() * 69
+    let p = NSPoint(x: x, y: 574 + rng.u() * 45)
+    let k = 1 - min(1, max(0, (x - 568) / 69))
+    darkDot(p, 1.9 + 1.9 * k, ink(0xE1D8E6, 0.28 + 0.62 * k))
+  }
+  for _ in 0..<30 {
+    let p = NSPoint(x: 556 + rng.u() * 63, y: 552 + rng.u() * 23)
+    darkDot(p, 1.7 + rng.u() * 1.5, ink(0xD5CDD9, 0.22 + rng.u() * 0.34))
+  }
+  for _ in 0..<11 {
+    let p = NSPoint(x: 649 + rng.u() * 8, y: 624 + rng.u() * 37)
+    darkDot(p, 1.6 + rng.u() * 1.6, ink(0xD9D0DE, 0.28 + rng.u() * 0.30))
+  }
+
+}
+
 enum IconStyle: String, CaseIterable {
   case dotFormation = "AppIconDotFormation"
   case softMist = "AppIconSoftMist"
+  case darkGlow = "AppIconDarkGlow"
 }
 
 func drawMaster(_ style: IconStyle) -> NSBitmapImageRep {
@@ -282,6 +480,8 @@ func drawMaster(_ style: IconStyle) -> NSBitmapImageRep {
       quietTransfer(168, ink(0x4F8C76), ink(0x7D6293), false)
       particulateWave(ink(0x326A54), false)
       assembledType(ink(0x674E7D), false)
+    case .darkGlow:
+      drawDarkGlowArtwork()
     }
   }
 }
@@ -340,7 +540,7 @@ func writeAll(to directory: URL) throws {
     try writePNG(master, size: 1024, to: directory.appendingPathComponent(style.rawValue + ".png"))
     try writeICNS(master, to: directory.appendingPathComponent(style.rawValue + ".icns"))
   }
-  // Default assets are exact copies of C, rather than separately maintained drawings.
+  // The static fallback is the approved light icon, C, copied without another rendering pass.
   for ext in ["png", "icns"] {
     let named = directory.appendingPathComponent(IconStyle.softMist.rawValue + "." + ext)
     try Data(contentsOf: named).write(

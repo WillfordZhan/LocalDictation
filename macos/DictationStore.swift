@@ -27,10 +27,36 @@ enum DictationWaveformStyle: String, Codable, CaseIterable {
     var title: String { self == .lively ? "灵动" : "柔和" }
 }
 
+enum DictationAppearanceMode: String, Codable, CaseIterable {
+    case system, light, dark
+    var title: String {
+        switch self { case .system: return "跟随系统"; case .light: return "浅色"; case .dark: return "深色" }
+    }
+}
+
+enum DictationAppIconStyle: String, Codable, CaseIterable {
+    case dotFormation = "dot-formation"
+    case softMist = "soft-mist"
+    case darkGlow = "dark-glow"
+    static let manualChoices: [Self] = [.dotFormation, .softMist]
+    var title: String {
+        switch self { case .dotFormation: return "点阵成型"; case .softMist: return "柔雾显影"; case .darkGlow: return "暗色辉光" }
+    }
+    var resourceName: String {
+        switch self { case .dotFormation: return "AppIconDotFormation"; case .softMist: return "AppIconSoftMist"; case .darkGlow: return "AppIconDarkGlow" }
+    }
+    static func resolved(manual: Self, followsSystem: Bool, dark: Bool) -> Self {
+        followsSystem ? (dark ? .darkGlow : .softMist) : manual
+    }
+}
+
 struct DictationPreferences: Codable {
     var cleanupEnabled = true
     var autoInsertEnabled = true
     var waveformStyle: DictationWaveformStyle = .lively
+    var appIconStyle: DictationAppIconStyle = .softMist
+    var appIconFollowsSystemAppearance = true
+    var appearanceMode: DictationAppearanceMode = .system
     var recognitionLanguage = "zh"
     // Kept in the settings schema for old installations; -1 means permanent.
     // Session-only and age-based deletion are no longer supported policies.
@@ -58,7 +84,7 @@ struct DictationPreferences: Codable {
     init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case cleanupEnabled, autoInsertEnabled, waveformStyle, recognitionLanguage, historyRetentionDays, vocabulary
+        case cleanupEnabled, autoInsertEnabled, waveformStyle, appIconStyle, appIconFollowsSystemAppearance, appearanceMode, recognitionLanguage, historyRetentionDays, vocabulary
         case automaticVocabularyLearning, learnedVocabulary
         case shortcutMode, shortcutKeyCode, shortcutModifiers, shortcutDisplay
     }
@@ -69,6 +95,11 @@ struct DictationPreferences: Codable {
         cleanupEnabled = try values.decodeIfPresent(Bool.self, forKey: .cleanupEnabled) ?? true
         autoInsertEnabled = try values.decodeIfPresent(Bool.self, forKey: .autoInsertEnabled) ?? true
         waveformStyle = (try? values.decodeIfPresent(DictationWaveformStyle.self, forKey: .waveformStyle)) ?? .lively
+        // A missing or newer icon choice never invalidates history or other preferences.
+        appIconStyle = (try? values.decodeIfPresent(DictationAppIconStyle.self, forKey: .appIconStyle)) ?? .softMist
+        if !DictationAppIconStyle.manualChoices.contains(appIconStyle) { appIconStyle = .softMist }
+        appIconFollowsSystemAppearance = (try? values.decodeIfPresent(Bool.self, forKey: .appIconFollowsSystemAppearance)) ?? true
+        appearanceMode = (try? values.decodeIfPresent(DictationAppearanceMode.self, forKey: .appearanceMode)) ?? .system
         recognitionLanguage = try values.decodeIfPresent(String.self, forKey: .recognitionLanguage) ?? "zh"
         historyRetentionDays = (try? values.decodeIfPresent(Int.self, forKey: .historyRetentionDays)) ?? -1
         vocabulary = try values.decodeIfPresent([String].self, forKey: .vocabulary) ?? []
@@ -485,6 +516,37 @@ final class DictationStore {
         savePreferences()
         if hasUnsavedHistory { _ = persistHistory() }
         changed()
+    }
+
+    /// An OS icon change is rolled back by the caller if its choice cannot be
+    /// saved. Do not adopt a memory-only choice or rewrite dictation history.
+    /// Appearance uses targeted UI callbacks; a general store notification
+    /// would rebuild an open prompt editor and discard its unsaved draft.
+    @discardableResult
+    func setAppIconStyle(_ style: DictationAppIconStyle, followsSystemAppearance: Bool? = nil) -> Bool {
+        var next = preferences; next.appIconStyle = style
+        if let followsSystemAppearance { next.appIconFollowsSystemAppearance = followsSystemAppearance }
+        do {
+            if !memoryOnly { try write(next, named: "preferences.json") }
+            preferences = next; preferencesError = nil
+            return true
+        } catch {
+            preferencesError = "图标选择未能保存，请检查数据文件夹后重试。"
+            return false
+        }
+    }
+
+    @discardableResult
+    func setAppearanceMode(_ mode: DictationAppearanceMode) -> Bool {
+        var next = preferences; next.appearanceMode = mode
+        do {
+            if !memoryOnly { try write(next, named: "preferences.json") }
+            preferences = next; preferencesError = nil
+            return true
+        } catch {
+            preferencesError = "外观设置未能保存，请检查数据文件夹后重试。"
+            return false
+        }
     }
 
     /// Explicitly adding an already learned word keeps it as a manual entry.
