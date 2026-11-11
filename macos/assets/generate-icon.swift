@@ -1,76 +1,75 @@
 import AppKit
 
-// Original “Echo” mark. One continuous contour joins listening and writing.
-// Geometry stays editable; all macOS sizes are derived from the same master.
+// Original “Voice to Text” mark. Audio, a conversion arrow, and a text field
+// remain distinct at Dock size; all glyphs use geometry rather than fonts.
 guard CommandLine.arguments.count == 2 else {
   fputs("Usage: swift generate-icon.swift output.png|output.icns\n", stderr)
   exit(1)
 }
 let destination = URL(fileURLWithPath: CommandLine.arguments[1])
-func color(_ hex: UInt32, _ alpha: CGFloat = 1) -> NSColor {
-  NSColor(
-    srgbRed: CGFloat((hex >> 16) & 255) / 255, green: CGFloat((hex >> 8) & 255) / 255,
-    blue: CGFloat(hex & 255) / 255, alpha: alpha)
-}
-func stroke(_ path: NSBezierPath, color c: NSColor, width: CGFloat) {
-  path.lineWidth = width
-  path.lineCapStyle = .round
-  path.lineJoinStyle = .round
-  c.setStroke()
-  path.stroke()
-}
+
 func drawMaster() -> NSBitmapImageRep {
+  let size = 1024
   let bitmap = NSBitmapImageRep(
-    bitmapDataPlanes: nil, pixelsWide: 1024, pixelsHigh: 1024, bitsPerSample: 8, samplesPerPixel: 4,
+    bitmapDataPlanes: nil, pixelsWide: size, pixelsHigh: size, bitsPerSample: 8, samplesPerPixel: 4,
     hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
   NSGraphicsContext.saveGraphicsState()
   NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
-  let flip = NSAffineTransform()
-  flip.translateX(by: 0, yBy: 1024)
-  flip.scaleX(by: 1, yBy: -1)
-  flip.concat()
+  func color(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, _ a: CGFloat = 1) -> NSColor {
+    NSColor(srgbRed: r / 255, green: g / 255, blue: b / 255, alpha: a)
+  }
+  NSColor.clear.setFill()
+  NSRect(x: 0, y: 0, width: 1024, height: 1024).fill()
   let tile = NSBezierPath(
-    roundedRect: NSRect(x: 80, y: 76, width: 864, height: 864), xRadius: 200, yRadius: 200)
+    roundedRect: NSRect(x: 80, y: 84, width: 864, height: 864), xRadius: 202, yRadius: 202)
   NSGraphicsContext.saveGraphicsState()
-  let tileShadow = NSShadow()
-  tileShadow.shadowColor = color(0x142020, 0.19)
-  tileShadow.shadowBlurRadius = 22
-  tileShadow.shadowOffset = NSSize(width: 0, height: -14)
-  tileShadow.set()
-  color(0x17282B).setFill()
+  let shadow = NSShadow()
+  shadow.shadowColor = color(8, 24, 25, 0.25)
+  shadow.shadowBlurRadius = 24
+  shadow.shadowOffset = NSSize(width: 0, height: -15)
+  shadow.set()
+  color(21, 40, 42).setFill()
   tile.fill()
   NSGraphicsContext.restoreGraphicsState()
-  NSGradient(starting: color(0x2F4548), ending: color(0x152327))!.draw(in: tile, angle: 90)
+  NSGradient(starting: color(45, 69, 71), ending: color(20, 36, 39))!.draw(in: tile, angle: -70)
   tile.lineWidth = 2
-  color(0xFFFFFF, 0.35).setStroke()
+  color(230, 245, 235, 0.35).setStroke()
   tile.stroke()
-  let mark = NSBezierPath()
-  // A continuous handwritten l/d ligature: speech flowing into a written mark.
-  mark.move(to: NSPoint(x: 326, y: 304))
-  mark.line(to: NSPoint(x: 326, y: 555))
-  mark.curve(
-    to: NSPoint(x: 565, y: 705), controlPoint1: NSPoint(x: 326, y: 691),
-    controlPoint2: NSPoint(x: 452, y: 756))
-  mark.curve(
-    to: NSPoint(x: 700, y: 488), controlPoint1: NSPoint(x: 660, y: 663),
-    controlPoint2: NSPoint(x: 700, y: 583))
-  mark.curve(
-    to: NSPoint(x: 570, y: 341), controlPoint1: NSPoint(x: 700, y: 392),
-    controlPoint2: NSPoint(x: 644, y: 341))
-  mark.curve(
-    to: NSPoint(x: 470, y: 462), controlPoint1: NSPoint(x: 498, y: 341),
-    controlPoint2: NSPoint(x: 470, y: 397))
-  mark.line(to: NSPoint(x: 470, y: 537))
-  NSGraphicsContext.saveGraphicsState()
-  let markShadow = NSShadow()
-  markShadow.shadowColor = color(0x000000, 0.28)
-  markShadow.shadowBlurRadius = 16
-  markShadow.shadowOffset = NSSize(width: 0, height: -8)
-  markShadow.set()
-  stroke(mark, color: color(0xF7F2DF), width: 91)
-  NSGraphicsContext.restoreGraphicsState()
-  color(0xF2A66A).setFill()
-  NSBezierPath(ovalIn: NSRect(x: 696, y: 263, width: 74, height: 74)).fill()
+  let ivory = color(250, 245, 224)
+  let apricot = color(248, 168, 100)
+  func capsule(_ x: CGFloat, _ y: CGFloat, _ width: CGFloat, _ height: CGFloat, _ fill: NSColor) {
+    fill.setFill()
+    NSBezierPath(
+      roundedRect: NSRect(x: x, y: y, width: width, height: height),
+      xRadius: min(width, height) / 2, yRadius: min(width, height) / 2
+    ).fill()
+  }
+  // Unequal heights communicate audio at a glance; the centered quiet ends keep
+  // enough air around the short conversion connector.
+  capsule(207, 441, 45, 154, ivory)
+  capsule(285, 352, 45, 332, ivory)
+  capsule(363, 401, 45, 234, ivory)
+  // A compact arrow uses a single filled contour rather than thin strokes.
+  let arrow = NSBezierPath()
+  arrow.move(to: NSPoint(x: 437, y: 535))
+  arrow.line(to: NSPoint(x: 477, y: 535))
+  arrow.line(to: NSPoint(x: 477, y: 562))
+  arrow.line(to: NSPoint(x: 527, y: 518))
+  arrow.line(to: NSPoint(x: 477, y: 474))
+  arrow.line(to: NSPoint(x: 477, y: 501))
+  arrow.line(to: NSPoint(x: 437, y: 501))
+  arrow.close()
+  apricot.setFill()
+  arrow.fill()
+  // Outlined text-entry frame. The T is a geometric glyph, with a substantial
+  // cap and stem so it remains visible when the complete icon is downsampled.
+  let field = NSBezierPath(
+    roundedRect: NSRect(x: 569, y: 388, width: 266, height: 260), xRadius: 45, yRadius: 45)
+  field.lineWidth = 34
+  ivory.setStroke()
+  field.stroke()
+  capsule(637, 559, 130, 32, ivory)
+  capsule(685, 445, 34, 138, ivory)
   NSGraphicsContext.restoreGraphicsState()
   return bitmap
 }

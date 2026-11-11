@@ -43,6 +43,7 @@
 /packaging/*
 !/packaging/*.py
 !/packaging/*.sh
+!/packaging/refresh_macos_dock.swift
 !/packaging/*.md
 !/packaging/licenses/
 /packaging/licenses/**
