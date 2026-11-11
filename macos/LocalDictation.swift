@@ -2041,6 +2041,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             asrReadiness = .unavailable; cleanupReadiness = .unavailable
             serviceText = "本地服务暂未响应。点击“检查服务”可重试。"
         }
+        // Model availability changes independently of the selected Prompt.
+        // Refresh both the rule page and an open history retry sheet even when
+        // the immutable version ID has stayed the same throughout startup.
+        updatePromptUI()
         updateUI()
     }
 
@@ -2626,6 +2630,115 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         print("PASS setup guards: recording, external service, owned child exit, stale launch exclusion, GUI model selection cannot be overridden by inherited environment")
     }
 
+    static func verifyPromptModelReadiness() throws {
+        // Exercise the real retained rule page and retry sheet through health
+        // callbacks, without reaching local inference or the general clipboard.
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [NativeFailureURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let board = NSPasteboard(name: NSPasteboard.Name("local.dictation.prompt-health.\(UUID())"))
+        board.setString("prompt-health clipboard", forType: .string)
+        let controller = AppDelegate(serviceSession: session,
+            inserter: TextInserter(board: board, permissionCheck: { nil },
+                pasteKeySender: { _ in preconditionFailure("Readiness and history retry must not paste") }))
+        defer {
+            controller.terminating = true; controller.invalidateHealthCallbacks()
+            controller.reprocessTask?.cancel(); session.invalidateAndCancel()
+            controller.windowController?.window?.close(); board.releaseGlobally()
+        }
+        func field<T>(_ value: Any, _ name: String, _: T.Type) -> T? {
+            Mirror(reflecting: value).children.first { $0.label == name }?.value as? T
+        }
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let version = CleanupPromptVersion(id: "same-rule", name: "原始规则", note: "原始备注", created_at: "fixture",
+            model_id: "Qwen3.5-9B-4bit", system_prompt: "保留原意。", user_prefix: "原文：",
+            examples: [], content_sha256: "same-rule-hash", origin: "user")
+        func catalog(ready: Bool) -> CleanupPromptCatalog {
+            CleanupPromptCatalog(active_version_id: version.id, versions: [version],
+                current_model: CleanupPromptModel(id: "Qwen3.5-9B-4bit", kind: "local", ready: ready),
+                asr_model: "Qwen3-ASR-1.7B-8bit")
+        }
+        let response = HTTPURLResponse(url: serviceBase, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        func health(_ status: String, ready: Bool, model: String = "Qwen3.5-9B-4bit") {
+            let data = Data("""
+            {"service":"local-dictation","status":"\(status)","ready":true,"asr_ready":true,"cleanup_ready":\(ready),"busy":false,"message":"fixture","supports_options":true,"supports_prompt_versions":true,"supports_reprocess":true,"active_prompt_version_id":"same-rule","models":{"asr":"Qwen3-ASR-1.7B-8bit","cleanup":"\(model)"}}
+            """.utf8)
+            controller.receiveHealthReply(generation: controller.healthGeneration, data: data, response: response, error: nil)
+            controller.invalidateHealthCallbacks() // Cancel scheduled polling; every reply here is a fixture.
+        }
+        NativeFailureURLProtocol.configure(.transport)
+        controller.receivePromptCatalog(.success(catalog(ready: false)), generation: controller.promptGeneration)
+        let entry = controller.store.add(rawText: "嗯，请保留原意。", text: "嗯，请保留原意。", asrSeconds: 0.1,
+            cleanupSeconds: 0, totalSeconds: 0.1, audioSeconds: 2, cleanupApplied: false, warning: nil)
+        controller.createWindowIfNeeded()
+        let window = controller.windowController!
+        window.showPage(.prompts)
+        window.showReprocessing(entryID: entry.id, show: false)
+        let studio = descendants(window.window!.contentView!).compactMap { $0 as? PromptStudioView }.first!
+        let modelLabel = field(studio, "modelLabel", NSTextField.self)!
+        let editor = field(studio, "editor", NSTextView.self)!
+        let name = field(studio, "nameField", NSTextField.self)!
+        let sheet = field(window, "reprocessingSheet", HistoryReprocessingWindowController.self)!
+        defer { sheet.window?.close() }
+        let run = field(sheet, "runButton", NSButton.self)!
+        let retryModel = field(sheet, "modelLabel", NSTextField.self)!
+        func assertReady(_ ready: Bool, model: String = "Qwen3.5-9B-4bit") {
+            precondition(modelLabel.stringValue.contains(model) && retryModel.stringValue.contains(model))
+            precondition(modelLabel.stringValue.contains("暂未就绪") == !ready &&
+                retryModel.stringValue.contains("暂未就绪") == !ready && run.isEnabled == ready,
+                "Rule page and existing retry sheet did not reflect live model availability")
+            precondition(controller.livePromptCatalog?.current_model.ready == ready)
+        }
+        health("loading", ready: false); assertReady(false)
+        editor.string = "尚未保存的个人规则。"
+        studio.textDidChange(Notification(name: NSText.didChangeNotification, object: editor))
+        name.stringValue = "尚未保存的名称"
+        studio.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: name))
+
+        // The active rule never changes: readiness must refresh independently.
+        health("ready", ready: true); assertReady(true)
+        controller.receivePromptCatalog(.success(catalog(ready: false)), generation: controller.promptGeneration)
+        assertReady(true)
+        precondition(controller.promptCatalog?.current_model.ready == false,
+            "The regression must retain an outdated catalog to test the live projection")
+        let reply: [String: Any] = ["raw_text": entry.rawText, "text": "请保留原意。", "cleanup_seconds": 0.1,
+            "cleanup_applied": true, "cleanup_profile": ["version_id": version.id, "name": version.name,
+                "content_sha256": version.content_sha256, "model_id": "Qwen3.5-9B-4bit"],
+            "cleanup_outcome": ["status": "applied", "reason": "changed"]]
+        NativeFailureURLProtocol.configureCleanup(try JSONSerialization.data(withJSONObject: reply))
+        run.performClick(nil)
+        precondition(controller.reprocessGeneration != nil, "Fresh health must unlock the real retry dispatch guard")
+        let deadline = Date().addingTimeInterval(2)
+        while controller.reprocessGeneration != nil && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        precondition(controller.reprocessGeneration == nil && controller.store.entries[0].revisions?.count == 1)
+        precondition(NativeFailureURLProtocol.recordedPaths() == ["/cleanup/reprocess"] &&
+            NativeFailureURLProtocol.recordedPromptHeaders() == [version.id], "Readiness triggered unnecessary catalog requests")
+        precondition(board.string(forType: .string) == "prompt-health clipboard")
+
+        health("degraded", ready: false); assertReady(false)
+        controller.receivePromptCatalog(.success(catalog(ready: true)), generation: controller.promptGeneration)
+        assertReady(false)
+        health("ready", ready: true); assertReady(true)
+        controller.pendingModelSelection = ("qwen", "cleanup")
+        controller.selectedCleanupModelID = "cleanup"
+        health("ready", ready: true); assertReady(false)
+        precondition(controller.pendingModelSelection != nil, "The old ready model cannot finish a new model selection")
+        health("ready", ready: true, model: "Qwen3.5-4B-4bit")
+        assertReady(true, model: "Qwen3.5-4B-4bit")
+        controller.receivePromptCatalog(.success(catalog(ready: false)), generation: controller.promptGeneration)
+        assertReady(true, model: "Qwen3.5-4B-4bit")
+        precondition(controller.pendingModelSelection == nil && controller.promptCatalogCurrent)
+        precondition(controller.promptCatalog?.versions == [version] && controller.livePromptCatalog?.versions == [version] &&
+            controller.livePromptCatalog?.active_version_id == version.id, "Runtime metadata changed an immutable rule")
+        precondition(editor.string == "尚未保存的个人规则。" && name.stringValue == "尚未保存的名称" && studio.hasUnsavedChanges,
+            "A readiness refresh discarded the editor draft")
+        precondition(controller.store.entries[0].rawText == entry.rawText && controller.store.entries[0].text == entry.text)
+        precondition(!window.window!.isVisible && !sheet.window!.isVisible && controller.ownedBackend == nil)
+        print("PASS Prompt live readiness: same-rule startup recovery, real retained page and retry sheet, guarded retry dispatch, late catalogs, degradation, model switching, immutable versions and unsaved drafts preserved")
+    }
+
     static func verifyPromptSnapshots() throws {
         let board = NSPasteboard(name: NSPasteboard.Name("local.dictation.prompt-snapshot.\(UUID())"))
         defer { board.releaseGlobally() }
@@ -2848,8 +2961,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         if promptRefreshPending { promptRefreshPending = false; loadPrompts() }
     }
 
+    private var livePromptCatalog: CleanupPromptCatalog? {
+        guard let catalog = promptCatalog else { return nil }
+        let state = displayState
+        // The catalog owns saved rule content; health owns runtime availability.
+        // A delayed catalog response must not restore a startup ready=false (or
+        // an old ready=true after a model failure). Project only live metadata,
+        // keeping version contents, selection, and unsaved editor drafts intact.
+        let ready = state.cleanupReadiness == .checking ? catalog.current_model.ready : state.cleanupReadiness == .ready
+        return CleanupPromptCatalog(active_version_id: catalog.active_version_id, versions: catalog.versions,
+            current_model: CleanupPromptModel(id: state.cleanupModel ?? catalog.current_model.id,
+                kind: cleanupBackend?.rawValue ?? catalog.current_model.kind, ready: ready),
+            asr_model: state.asrModel ?? catalog.asr_model, prompt_store_error: catalog.prompt_store_error,
+            recovery_message: catalog.recovery_message, prompt_import_error: catalog.prompt_import_error)
+    }
+
     private func updatePromptUI() {
-        windowController?.updatePrompts(catalog: promptCatalog, busy: promptBusy, error: promptError)
+        windowController?.updatePrompts(catalog: livePromptCatalog, busy: promptBusy, error: promptError)
     }
 
     private func retryCleanup(entryID: UUID, panel: DictationHUD) {
@@ -2878,7 +3006,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             updateReprocessUI(); return
         }
         guard let entry = store.entries.first(where: { $0.id == entryID }),
-              let catalog = promptCatalog, promptCatalogCurrent, catalog.current_model.ready,
+              let catalog = livePromptCatalog, promptCatalogCurrent, catalog.current_model.ready,
               let version = catalog.versions.first(where: { $0.id == versionID }) else {
             reprocessError = "原记录或润色规则暂不可用，请刷新后重试。"
             updateReprocessUI(); return
@@ -3407,6 +3535,7 @@ private func selfTest() throws {
     precondition(recovery.nextDelay(now: 560) == 1)
     AppDelegate.verifyLateRecoveryCallbacks()
     AppDelegate.verifyModelHealthTransitions()
+    try AppDelegate.verifyPromptModelReadiness()
     try AppDelegate.verifyConfigurationGuards()
     try AppDelegate.verifyPromptSnapshots()
     try AppDelegate.verifyUploadFailureRecovery()

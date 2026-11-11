@@ -245,7 +245,7 @@ enum DictationHUDStackTests {
 
         // Attention and retry reuse the same nonactivating production panel.
         // Keep the warning readable after copying, lock duplicate taps, and
-        // never time out an actionable failure while the user reads its text.
+        // cancel the previous result's expiry while a retry is processing.
         let retryCard = DictationHUD()
         defer { retryCard.hide() }
         var retries = 0, views = 0
@@ -257,14 +257,19 @@ enum DictationHUDStackTests {
         let view = field(retryCard, "viewButton", NSButton.self)!
         let retryCopy = field(retryCard, "copyButton", NSButton.self)!
         try require(!retry.isHidden && retry.isEnabled && !view.isHidden, "Attention lost its explicit retry/view actions")
-        try require(field(retryCard, "deliveryHide", DispatchWorkItem.self) == nil, "Attention expired before an explicit decision")
+        let attentionExpiry = field(retryCard, "deliveryHide", DispatchWorkItem.self)!
         retryCopy.performClick(nil)
         try require(field(retryCard, "deliveryMessage", NSTextField.self)?.stringValue == "改动较少，请检查 · 已复制", "Copy erased the attention state")
+        try require(attentionExpiry.isCancelled, "Copy feedback left the preceding attention timer active")
+        let copiedAttentionExpiry = field(retryCard, "deliveryHide", DispatchWorkItem.self)!
         retry.performClick(nil); retry.performClick(nil)
         try require(retries == 1 && !retry.isEnabled, "Repeated tap queued duplicate edits")
         retryCard.showDelivery(message: "正在重新整理", needsPermission: false, show: false, retrying: true)
+        copiedAttentionExpiry.perform()
         try require(!retry.isEnabled && !view.isEnabled && !retryCopy.isEnabled && field(retryCard, "deliveryHide", DispatchWorkItem.self) == nil,
                     "In-flight retry retained enabled actions or an expiry")
+        try require(copiedAttentionExpiry.isCancelled && field(retryCard, "deliveryMessage", NSTextField.self)?.stringValue == "正在重新整理",
+                    "The preceding result's expiry interrupted a running retry")
         retryCard.showDelivery(message: "重新整理未完成", needsPermission: false, show: false)
         retry.performClick(nil)
         try require(retries == 2, "Failed retry could not be attempted again")
@@ -283,18 +288,38 @@ enum DictationHUDStackTests {
         // Finished reminders must expire without touching another recording,
         // while a user can still open permission settings before their expiry.
         let expiringCopy = DictationHUD(), expiringPermission = DictationHUD(), reused = DictationHUD()
+        let expiringAttention = DictationHUD(), dismissedAttention = DictationHUD()
+        var expiredResultActions = 0
+        expiringAttention.onCopy = { expiredResultActions += 1 }
+        expiringAttention.onRetryCleanup = { expiredResultActions += 1 }
+        expiringAttention.onViewResult = { expiredResultActions += 1 }
+        let attentionStarted = ProcessInfo.processInfo.systemUptime
+        expiringAttention.showDelivery(message: "原文未改 · 已复制 · 按 ⌘V 粘贴", needsPermission: false, show: false)
+        let automaticAttentionExpiry = field(expiringAttention, "deliveryHide", DispatchWorkItem.self)!
+        let attentionDismissal = expiringAttention.dismissalGeneration
         expiringCopy.onCopy = {}; expiringPermission.onCopy = {}
         expiringCopy.showDelivery(message: "已复制 · 按 ⌘V 粘贴", needsPermission: false, show: false)
         expiringPermission.showDelivery(message: "已复制 · 需要允许自动填入", needsPermission: true, show: false)
         try require(field(expiringCopy, "deliveryHide", DispatchWorkItem.self) != nil && field(expiringPermission, "deliveryHide", DispatchWorkItem.self) != nil,
                     "A copy or permission reminder has no bounded expiry")
         let recording = states[3]
-        reused.showDelivery(message: "旧提示", needsPermission: false, show: false)
+        reused.onRetryCleanup = {}
+        reused.showDelivery(message: "原文未改", needsPermission: false, show: false)
         let oldExpiry = field(reused, "deliveryHide", DispatchWorkItem.self)!
         reused.update(recording, show: false)
         oldExpiry.perform()
         try require(oldExpiry.isCancelled && field(reused, "deliveryHide", DispatchWorkItem.self) == nil && field(reused, "recordingRow", NSView.self)?.isHidden == false,
                     "An old reminder expired a subsequent recording")
+        dismissedAttention.onRetryCleanup = {}
+        dismissedAttention.showDelivery(message: "原文未改", needsPermission: false, show: false)
+        let manuallyCancelledExpiry = field(dismissedAttention, "deliveryHide", DispatchWorkItem.self)!
+        let dismissButton = field(dismissedAttention, "deliveryRow", NSStackView.self)!.arrangedSubviews.last as! NSButton
+        dismissButton.performClick(nil)
+        let manualDismissal = dismissedAttention.dismissalGeneration
+        manuallyCancelledExpiry.perform()
+        try require(manuallyCancelledExpiry.isCancelled && field(dismissedAttention, "deliveryHide", DispatchWorkItem.self) == nil
+                    && dismissedAttention.dismissalGeneration == manualDismissal,
+                    "Closing an attention card left a timer that dismissed it again")
         let permissionAction = DictationHUD()
         var permissionClicks = 0, dismissedBeforePermission = false
         permissionAction.onAccessibility = {
@@ -313,8 +338,18 @@ enum DictationHUDStackTests {
                 && ProcessInfo.processInfo.systemUptime < expiryDeadline { wait(0.01) }
         try require(field(expiringCopy, "deliveryHide", DispatchWorkItem.self) == nil && field(expiringPermission, "deliveryHide", DispatchWorkItem.self) == nil,
                     "Copy or permission reminder did not expire within its five-second lifetime")
+        try require(!automaticAttentionExpiry.isCancelled && expiringAttention.dismissalGeneration == attentionDismissal,
+                    "Attention did not allow its longer review interval")
+        let attentionDeadline = attentionStarted + 15.5
+        while field(expiringAttention, "deliveryHide", DispatchWorkItem.self) != nil
+                && ProcessInfo.processInfo.systemUptime < attentionDeadline { wait(0.01) }
+        let attentionElapsed = ProcessInfo.processInfo.systemUptime - attentionStarted
+        try require(field(expiringAttention, "deliveryHide", DispatchWorkItem.self) == nil && automaticAttentionExpiry.isCancelled
+                    && expiringAttention.dismissalGeneration == attentionDismissal + 1 && attentionElapsed >= 14.8 && attentionElapsed <= 15.5,
+                    "Attention did not expire automatically after fifteen seconds")
+        try require(expiredResultActions == 0, "Expiry invoked a result action instead of only dismissing the card")
         try require(field(reused, "recordingRow", NSView.self)?.isHidden == false, "Expiring completed reminders interrupted another recording")
-        for item in [expiringCopy, expiringPermission, reused, permissionAction] { item.hide() }
+        for item in [expiringCopy, expiringPermission, expiringAttention, dismissedAttention, reused, permissionAction] { item.hide() }
 
         // Progress paints only the background. Compare actual rendered pixels
         // inside the cancel circle at three fills; antialiased edge pixels are

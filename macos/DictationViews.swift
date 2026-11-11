@@ -1732,12 +1732,13 @@ final class DictationHUD {
         setPreferredPanelWidth(min(360, max(180, ceil(textWidth + actionsWidth + 24))))
         if show { showPanel() }
         if show && alreadyVisible { DictationMotion.reveal(deliveryRow, duration: 0.1) }
-        // Results requiring a decision stay until dismissed or successfully
-        // retried. Their actions must not disappear while the user reads the
-        // inserted text. Ordinary copy/permission reminders still expire.
-        // An in-flight retry keeps the same card and cannot enqueue a duplicate.
-        guard !retrying, onRetryCleanup == nil else { return }
-        let lifetime: TimeInterval = needsPermission || onCopy != nil || onViewResult != nil ? 5 : 3.5
+        // Reviewable results leave time to retry, but must not occupy the input
+        // area indefinitely. Dismissal only hides this card; saved history and
+        // copied text remain available. An active retry has no expiry until it
+        // completes, and invalidates the preceding result's timer above.
+        guard !retrying else { return }
+        let lifetime: TimeInterval = onRetryCleanup != nil ? 15
+            : needsPermission || onCopy != nil || onViewResult != nil ? 5 : 3.5
         let generation = deliveryGeneration
         let pending = DispatchWorkItem { [weak self] in
             guard let self, self.deliveryGeneration == generation, self.recordingRow.isHidden else { return }
