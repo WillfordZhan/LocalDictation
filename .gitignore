@@ -25,6 +25,8 @@
 !/macos/tests/*.swift
 /macos/assets/*
 !/macos/assets/AppIcon.icns
+!/macos/assets/AppIcon.png
+!/macos/assets/README.md
 !/macos/assets/generate-icon.swift
 /macos/signing/*
 !/macos/signing/*.py
