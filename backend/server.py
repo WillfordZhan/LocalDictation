@@ -32,6 +32,7 @@ import wave
 
 from streaming import MAX_CHUNK_BYTES, StreamError, StreamingSessions, validate_session_id
 
+from repetition_cleanup import collapse_adjacent_repetitions
 from prompt_store import (MAX_PROFILE_BYTES, PromptStore, PromptStoreError,
                           PromptValidationError, PromptVersion)
 
@@ -715,7 +716,10 @@ class LocalModels:
                  "prefill=%.3fs generation=%.3fs output_tokens=%d total=%.3fs",
                  hit, cached_tokens, len(prompt), first_token_at - started,
                  finished - first_token_at, getattr(last, "generation_tokens", 0), finished - started)
-        return parse_cleanup_output("".join(parts))
+        # Valid model output can still retain literal speech restarts. Collapse
+        # only conservative verbatim runs; the saved ASR and failure fallback
+        # are untouched, and this performs no extra inference.
+        return collapse_adjacent_repetitions(parse_cleanup_output("".join(parts)))
 
 
 class DictationService:

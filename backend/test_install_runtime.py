@@ -99,7 +99,7 @@ class RuntimeInstallTests(unittest.TestCase):
                      "LOCAL_DICTATION_CLEANUP_MODEL": cleanup_model},
                 text=True, capture_output=True, timeout=45)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            for name in ("server.py", "streaming.py", "prompt_store.py", "prompt-imports.json", "test_prompt_store.py", "model_artifacts.py", "model-manifest.json"):
+            for name in ("server.py", "streaming.py", "repetition_cleanup.py", "prompt_store.py", "prompt-imports.json", "test_prompt_store.py", "model_artifacts.py", "model-manifest.json"):
                 self.assertEqual((runtime / "backend" / name).read_bytes(), (backend / name).read_bytes())
             self.assertFalse((runtime / "backend/validation.json").exists())
             self.assertIn("后端资源导入检查通过", result.stdout)

@@ -271,7 +271,7 @@ fi
 BACKEND_STAGE="$(mktemp -d "$RUNTIME_DIR/.install-backend.XXXXXX")"
 LAST_STAGE="$BACKEND_STAGE"
 mkdir "$BACKEND_STAGE/backend"
-for name in server.py streaming.py prompt_store.py prompt-imports.json model_artifacts.py model-manifest.json start.sh setup.sh download_models.py requirements.txt diagnose.py install_runtime.sh test_server.py test_prompt_store.py; do
+for name in server.py streaming.py repetition_cleanup.py prompt_store.py prompt-imports.json model_artifacts.py model-manifest.json start.sh setup.sh download_models.py requirements.txt diagnose.py install_runtime.sh test_server.py test_prompt_store.py; do
   [[ -f "$BACKEND_DIR/$name" ]] || fail "交付文件缺失：$BACKEND_DIR/$name"
   /bin/cp -p "$BACKEND_DIR/$name" "$BACKEND_STAGE/backend/$name"
 done

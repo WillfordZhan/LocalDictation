@@ -106,6 +106,29 @@ class CleanupContractTests(unittest.TestCase):
         self.assertEqual((text, applied, warning), (body, True, None))
         generator.assert_called_once()
 
+    def test_successful_model_output_collapses_literal_restarts_without_changing_asr(self):
+        raw = "如果已经存入仓库，如果已经存入仓库，如果已经存入仓库，如果已经存入仓库。接下来要怎么领料？"
+        edited = "如果已经存入仓库。接下来要怎么领料？"
+        generator = Mock(side_effect=lambda *args, **kwargs: response_chunks(json.dumps({"text": raw})))
+        models = model_fixture()
+        with inference_modules(generator):
+            text, applied, warning, _ = edit_with_outcome(raw, models.cleanup)
+        self.assertEqual(text, edited)
+        self.assertTrue(applied)
+        self.assertIsNone(warning)
+        generator.assert_called_once()
+        self.assertEqual(raw.count("如果已经存入仓库"), 4)
+
+    def test_invalid_model_output_keeps_repeated_asr_verbatim(self):
+        raw = "如果已经存入仓库，" * 4 + "接下来要怎么领料？"
+        generator = Mock(side_effect=lambda *args, **kwargs: response_chunks("不是有效 JSON"))
+        with inference_modules(generator):
+            text, applied, _, outcome = edit_with_outcome(raw, model_fixture().cleanup)
+        self.assertEqual(text, raw)
+        self.assertFalse(applied)
+        self.assertEqual(outcome["reason"], "invalid_output")
+        generator.assert_called_once()
+
     def test_invalid_generation_falls_back_once_and_does_not_log_private_output(self):
         raw = "先做列表，时间轴以后再决定。"
         private_marker = "PRIVATE_MODEL_RESPONSE_SENTINEL"
