@@ -4,7 +4,7 @@
 
 在 Mac 上按快捷键说话，结束后把整理好的文字填入当前输入框。音频识别与默认文字整理都在本机运行。
 
-Mac 源码版本：**0.5.21 测试版**；当前 Mac 公开下载为 **0.5.8**。首发支持 **Apple Silicon Mac / macOS 14 或更新版本**。Windows x64 首个预览版使用 WPF、CPU Whisper 和 Qwen；[Windows 下载](https://github.com/WillfordZhan/LocalDictation/releases/tag/v0.6.0-windows-preview.1)与[安装说明](windows/README.md)独立提供。Windows 自动纠错学习、热力图和 GPU 加速尚未移植。
+Mac 源码版本：**0.5.22 测试版**；当前 Mac 公开下载为 **0.5.8**。首发支持 **Apple Silicon Mac / macOS 14 或更新版本**。Windows x64 首个预览版使用 WPF、CPU Whisper 和 Qwen；[Windows 下载](https://github.com/WillfordZhan/LocalDictation/releases/tag/v0.6.0-windows-preview.1)与[安装说明](windows/README.md)独立提供。Windows 自动纠错学习、热力图和 GPU 加速尚未移植。
 
 ## 使用
 

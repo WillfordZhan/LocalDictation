@@ -22,6 +22,9 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
     private let sourceMetadata = NSTextField(wrappingLabelWithString: "")
     private let resultMetadata = NSTextField(wrappingLabelWithString: "")
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
+    private let generationRow = NSStackView()
+    private let generationIndicator = NSProgressIndicator()
+    private var generationAnimating = false
     private let sourceText = NSTextView()
     private let resultText = NSTextView()
     private let runButton = NSButton(title: "开始测试", target: nil, action: nil)
@@ -92,7 +95,21 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
         resultPicker.target = self; resultPicker.action = #selector(resultChanged)
         resultPicker.setAccessibilityLabel("已保存的整理版本")
         let left = textPane(header: sourcePicker, text: sourceText)
-        let right = textPane(header: resultPicker, text: resultText)
+        generationIndicator.style = .spinning; generationIndicator.controlSize = .small
+        generationIndicator.isIndeterminate = true; generationIndicator.isDisplayedWhenStopped = true
+        generationIndicator.setAccessibilityLabel("正在生成测试结果")
+        generationIndicator.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        generationIndicator.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        let generationLabel = NSTextField(labelWithString: "正在生成测试结果…")
+        generationLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        generationLabel.textColor = Palette.ink
+        generationRow.orientation = .horizontal; generationRow.alignment = .centerY; generationRow.spacing = 8
+        generationRow.addArrangedSubview(generationIndicator); generationRow.addArrangedSubview(generationLabel)
+        generationRow.addArrangedSubview(NSView())
+        generationRow.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        generationRow.setAccessibilityElement(true)
+        generationRow.setAccessibilityLabel("正在生成测试结果，请稍候")
+        let right = textPane(header: resultPicker, text: resultText, activity: generationRow)
         let comparison = NSStackView(views: [left, right]); comparison.spacing = 16; comparison.distribution = .fillEqually
         comparison.setContentHuggingPriority(.defaultLow, for: .vertical)
         comparison.heightAnchor.constraint(greaterThanOrEqualToConstant: 230).isActive = true
@@ -116,9 +133,13 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
         add(footer)
     }
 
-    private func textPane(header: NSView, text: NSTextView) -> NSView {
+    private func textPane(header: NSView, text: NSTextView, activity: NSView? = nil) -> NSView {
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
         stack.addArrangedSubview(header); header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        if let activity {
+            stack.addArrangedSubview(activity)
+            activity.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.borderType = .noBorder
         scroll.drawsBackground = true; scroll.backgroundColor = Palette.editorBackground
         scroll.wantsLayer = true; scroll.layer?.cornerRadius = 10
@@ -234,6 +255,8 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
         if promptPicker.isEnabled != canPickPrompt { promptPicker.isEnabled = canPickPrompt }
         if modelPicker.isEnabled != canPickModel { modelPicker.isEnabled = canPickModel }
         runButton.title = busy ? "正在测试…" : "开始测试"
+        generationRow.isHidden = !busy
+        refreshGenerationAnimation()
         if let requestError, !requestError.isEmpty {
             statusLabel.stringValue = requestError + (selectedRevision == nil ? "" : " 右侧为已有版本。")
             statusLabel.textColor = .systemRed
@@ -242,7 +265,7 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
             statusLabel.textColor = Palette.muted
             let outcome = selectedRevision?.cleanupOutcome?.attentionMessage
             statusLabel.stringValue = entry == nil ? "这条历史记录已被删除。"
-                : busy ? "正在测试，关闭后仍会完成并保存。"
+                : busy ? (selectedRevision == nil ? "关闭后仍会完成并保存。" : "右侧为已有版本，新结果生成后自动显示。")
                 : blockedByOtherEntry ? "另一条历史正在测试。"
                 : selectedRevision == nil ? "原输出保留，新结果另存为版本。" : (outcome.map { $0 + "。" } ?? "") + "新版本已保存，原输出保留。"
         }
@@ -251,6 +274,16 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
         guard let window else { return }
         refreshControls()
         if window.sheetParent == nil { parent.beginSheet(window) { [weak window] _ in window?.orderOut(nil) } }
+        refreshGenerationAnimation()
+    }
+    /// Native indeterminate feedback stays active for the whole request,
+    /// including model loading; health refreshes must not restart its animation.
+    private func refreshGenerationAnimation() {
+        let shouldAnimate = busy && window?.isVisible == true && !DictationMotion.reduceMotion
+        guard shouldAnimate != generationAnimating else { return }
+        generationAnimating = shouldAnimate
+        if shouldAnimate { generationIndicator.startAnimation(nil) }
+        else { generationIndicator.stopAnimation(nil) }
     }
     @objc private func promptChanged() { selectedPromptID = promptPicker.selectedItem?.representedObject as? String; refreshControls() }
     @objc private func modelChanged() { selectedModelID = modelPicker.selectedItem?.representedObject as? String; refreshControls() }
@@ -267,6 +300,7 @@ final class HistoryReprocessingWindowController: NSWindowController, NSWindowDel
         guard let window else { return }
         if let parent = window.sheetParent { parent.endSheet(window) }
         window.orderOut(nil)
+        refreshGenerationAnimation()
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool { closePressed(); return false }
     func renderPNG(to url: URL) throws {

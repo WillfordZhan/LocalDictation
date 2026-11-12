@@ -46,6 +46,9 @@ enum HistoryReprocessingTests {
         let result = field(sheet, "resultPicker", NSPopUpButton.self)!, copy = field(sheet, "copyButton", NSButton.self)!
         let left = field(sheet, "sourceText", NSTextView.self)!, right = field(sheet, "resultText", NSTextView.self)!
         let status = field(sheet, "statusLabel", NSTextField.self)!, metadata = field(sheet, "resultMetadata", NSTextField.self)!
+        let activity = field(sheet, "generationRow", NSStackView.self)!
+        let indicator = field(sheet, "generationIndicator", NSProgressIndicator.self)!
+        try require(activity.isHidden, "Idle test shows a running indicator")
         try require(prompt.selectedItem?.representedObject as? String == "active", "New sheet did not select the currently active prompt")
         try require(run.isEnabled && !copy.isEnabled && !result.isEnabled, "Empty revision state has wrong available actions")
         try require(left.string == originalRaw && right.string.isEmpty, "ASR original is not the default test input comparison")
@@ -59,6 +62,7 @@ enum HistoryReprocessingTests {
         run.performClick(nil); run.performClick(nil)
         try require(requests.count == 1 && requests[0].0 == entry.id && requests[0].1 == "saved" && requests[0].2 == "provider/model-a", "Run duplicated or used the active global rule instead of the local selection")
         try require(!run.isEnabled && !prompt.isEnabled && !model.isEnabled, "Running request permits a duplicate generation or model change")
+        try require(!activity.isHidden && indicator.isIndeterminate, "Click did not immediately show ongoing generation feedback")
         try require(catalog.active_version_id == "active", "Local prompt selection changed global activation")
         let source = field(sheet, "sourcePicker", NSSegmentedControl.self)!
         source.selectedSegment = 1; NSApp.sendAction(source.action!, to: source.target, from: source)
@@ -68,6 +72,7 @@ enum HistoryReprocessingTests {
         entry.revisions = [first]
         sheet.update(entry: entry, catalog: catalog, busy: false, blockedByOtherEntry: false, error: nil)
         try require(right.string == first.text && copy.isEnabled && result.isEnabled, "New saved version was not selected automatically")
+        try require(activity.isHidden && field(sheet, "generationAnimating", Bool.self) == false, "Completed test left its waiting indicator active")
         try require(metadata.stringValue.contains("自然书面语") && metadata.stringValue.contains("model-a") && metadata.stringValue.contains("2.40") && metadata.stringValue.contains("0.65"), "Saved prompt/model provenance is missing")
         // Runtime health refreshes arrive while the user is choosing a model
         // or selecting text. Rebuilding the same menu invalidates native menu
@@ -124,8 +129,10 @@ enum HistoryReprocessingTests {
         try require(field(sheet, "busy", Bool.self) == true && requests.count == 1, "Closing the sheet cancelled or repeated generation")
         sheet.update(entry: entry, catalog: catalog, busy: false, blockedByOtherEntry: false, error: "服务暂时不可用，请稍后重试。")
         try require(status.stringValue.contains("服务暂时不可用") && status.stringValue.contains("已有版本") && run.isEnabled && right.string == first.text, "Failure erased stored results or disabled retry")
+        try require(activity.isHidden && field(sheet, "generationAnimating", Bool.self) == false, "Failed test left its waiting indicator active")
         sheet.update(entry: entry, catalog: catalog, busy: false, blockedByOtherEntry: true, error: nil)
         try require(!run.isEnabled && !prompt.isEnabled && !model.isEnabled, "Another pending history request permits duplicate dispatch")
+        try require(activity.isHidden, "Another entry's request falsely shows this result as generating")
         let unavailable = CleanupPromptCatalog(active_version_id: "active", versions: catalog.versions, current_model: CleanupPromptModel(id: "provider/model-b", kind: "local", ready: false, unavailable_reason: "请先下载此模型。"), asr_model: "Qwen3-ASR")
         sheet.update(entry: entry, catalog: unavailable, busy: false, blockedByOtherEntry: false, error: nil)
         try require(!run.isEnabled && selectedModelLabel.stringValue.contains("下载"), "An unready model can be dispatched or lacks an explanation")
@@ -162,6 +169,13 @@ enum HistoryReprocessingTests {
             sheet.window?.setContentSize(NSSize(width: 900, height: 610))
             sheet.update(entry: entry, catalog: catalog, busy: true, blockedByOtherEntry: false, error: nil)
             try sheet.renderPNG(to: folder.appendingPathComponent("history-reprocessing-busy.png"))
+            sheet.window?.appearance = NSAppearance(named: .darkAqua)
+            sheet.window?.setContentSize(NSSize(width: 760, height: 510))
+            try sheet.renderPNG(to: folder.appendingPathComponent("history-reprocessing-busy-dark-narrow.png"))
+            let content = sheet.window!.contentView!
+            let activityBounds = activity.convert(activity.bounds, to: content)
+            try require(content.bounds.contains(activityBounds) && activityBounds.height >= 16, "Running feedback is clipped at minimum window size")
+            sheet.window?.appearance = NSAppearance(named: .aqua)
             sheet.update(entry: entry, catalog: catalog, busy: false, blockedByOtherEntry: false, error: "模型加载失败，请重试。")
             try sheet.renderPNG(to: folder.appendingPathComponent("history-reprocessing-failed.png"))
         }
