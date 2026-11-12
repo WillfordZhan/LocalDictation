@@ -404,7 +404,7 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
     var onReloadPrompts: (() -> Void)?
     var onSavePrompt: ((CleanupPromptDraft) -> Void)?
     var onActivatePrompt: ((String) -> Void)?
-    var onReprocessEntry: ((UUID, String) -> Void)?
+    var onReprocessEntry: ((UUID, String, String) -> Void)?
     private var reprocessingCatalog: CleanupPromptCatalog?
     private var reprocessingSheet: HistoryReprocessingWindowController?
     private var reprocessingEntryID: UUID?
@@ -1011,7 +1011,7 @@ final class DictationWindowController: NSWindowController, NSTextFieldDelegate, 
         fill(stack, label(timing, size: 11, color: Palette.muted))
         if history {
             fill(stack, label(provenance.joined(separator: "\n"), size: 11, color: Palette.muted))
-            let reprocess = ActionButton("重新整理…", icon: "arrow.triangle.2.circlepath") { [weak self] in
+            let reprocess = ActionButton("润色测试…", icon: "arrow.triangle.2.circlepath") { [weak self] in
                 self?.showReprocessing(entryID: entry.id)
             }
             reprocess.identifier = NSUserInterfaceItemIdentifier("history-reprocess")

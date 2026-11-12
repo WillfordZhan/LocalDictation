@@ -64,6 +64,30 @@ class CleanupLoadingTests(unittest.TestCase):
         self.load.assert_called_once_with(str(self.editor))
         self.assertTrue(self.models.cleanup_ready)
 
+    def test_cleanup_only_load_does_not_initialize_asr(self):
+        self.indexed_weights()
+        self.models.load_cleanup()
+        self.assertTrue(self.models.cleanup_ready)
+        self.assertFalse(self.models.asr_ready)
+        self.assertIsNone(self.models.asr_model)
+        self.load.assert_called_once_with(str(self.editor))
+        self.mx.eval.assert_called_once_with(self.model.parameters())
+
+    def test_temporary_cleanup_release_drops_model_and_private_cache(self):
+        self.indexed_weights()
+        self.models.load_cleanup()
+        self.models._cleanup_prefix_cache = object()
+        self.models._cleanup_prefix_key = ("fixture",)
+        self.models.last_cleanup_metrics = {"generation_tokens": 1}
+        self.models.release_cleanup()
+        self.assertFalse(self.models.cleanup_ready)
+        self.assertIsNone(self.models.model)
+        self.assertIsNone(self.models.tokenizer)
+        self.assertIsNone(self.models._cleanup_prefix_cache)
+        self.assertIsNone(self.models._cleanup_prefix_key)
+        self.assertIsNone(self.models.last_cleanup_metrics)
+        self.mx.clear_cache.assert_called_once()
+
     def test_missing_shard_clears_previously_ready_editor(self):
         names = self.indexed_weights()
         self.models.load()

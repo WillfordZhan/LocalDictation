@@ -450,21 +450,81 @@ class LocalModels:
             mx.eval(whisper.parameters())
         self.asr_ready = True
         self.message = "正在加载文字整理模型。"
+        try:
+            self.load_cleanup()
+            self.message = "本地识别和文字整理已就绪。"
+        except Exception:
+            LOG.exception("Cleanup model unavailable; raw transcription remains available")
+            self.message = "语音识别已就绪；文字整理不可用，将保留原始转写。"
+
+    def load_cleanup(self):
+        """Load only this editor on the shared worker, without loading ASR.
+
+        History comparisons may own a temporary editor. Its state must never
+        replace the editor serving microphone sessions, including on failure.
+        """
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
         self.cleanup_ready = False
         self.model = self.tokenizer = None
         self._clear_cleanup_prefix()
         try:
+            import mlx.core as mx
             from mlx_lm import load
-
             self._validate_cleanup_weights()
             self.model, self.tokenizer = load(str(self.cleanup_path))
             mx.eval(self.model.parameters())
             self.cleanup_ready = True
-            self.message = "本地识别和文字整理已就绪。"
         except Exception:
             self.model = self.tokenizer = None
-            LOG.exception("Cleanup model unavailable; raw transcription remains available")
-            self.message = "语音识别已就绪；文字整理不可用，将保留原始转写。"
+            raise
+
+    def release_cleanup(self):
+        """Release a temporary history editor before the next worker job."""
+        self.cleanup_ready = False
+        self._clear_cleanup_prefix()
+        self.model = self.tokenizer = None
+        self.last_cleanup_metrics = None
+        import mlx.core as mx
+        mx.clear_cache()
+
+    def reprocess_models(self):
+        # Only shipped, verified choices are exposed. Arbitrary directories in
+        # Runtime/models may be incomplete downloads or unrelated experiments.
+        from model_artifacts import CLEANUP_MODEL_IDS, inspect_model, load_manifest
+        manifest = load_manifest()
+        choices = []
+        for identifier in CLEANUP_MODEL_IDS:
+            model = manifest.get(identifier)
+            if not model or model.get("kind") != "cleanup":
+                continue
+            report = inspect_model(self.cleanup_path.parent / model["directory"], model)
+            current = model["directory"] == self.cleanup_path.name
+            ready = self.cleanup_ready if current else report["ready"]
+            choice = {"id": model["directory"], "kind": "local", "ready": ready}
+            if not ready:
+                choice["unavailable_reason"] = ("当前润色模型尚未就绪。" if current
+                                                else report["message"])
+            choices.append(choice)
+        return choices
+
+    def reprocess_model_path(self, model_id):
+        from model_artifacts import CLEANUP_MODEL_IDS, inspect_model, load_manifest
+        try:
+            manifest = load_manifest()
+        except (OSError, ValueError, KeyError, TypeError):
+            raise RequestError(503, "本地模型清单不可用，请先检查配置。") from None
+        model = next((manifest[identifier] for identifier in CLEANUP_MODEL_IDS
+                      if identifier in manifest and manifest[identifier].get("kind") == "cleanup"
+                      and manifest[identifier]["directory"] == model_id), None)
+        if model is None:
+            raise RequestError(400, "本次润色模型不在支持的本地模型清单中。")
+        path = self.cleanup_path.parent / model["directory"]
+        report = inspect_model(path, model)
+        if not report["ready"]:
+            raise RequestError(503, report["message"] + "请先在配置中检查或下载该模型。")
+        return path
 
     def _validate_cleanup_weights(self):
         # Setup verifies pinned hashes. Startup only checks that MLX will see a
@@ -800,9 +860,19 @@ class DictationService:
         }
 
     def prompt_catalog(self):
+        current = {"id": self.models.cleanup_path.name, "kind": "local",
+                   "ready": self.models.cleanup_ready}
+        choices = [current]
+        if callable(getattr(self.models, "reprocess_models", None)):
+            try:
+                choices = self.models.reprocess_models()
+            except (OSError, ValueError, KeyError, TypeError):
+                # A broken optional catalog must not hide saved Prompt content
+                # or claim that the already-loaded microphone model changed.
+                LOG.warning("History model catalog unavailable; retaining current editor only")
         return {**self.prompts.catalog(),
-                "current_model": {"id": self.models.cleanup_path.name, "kind": "local",
-                                  "ready": self.models.cleanup_ready},
+                "current_model": current,
+                "reprocess_models": choices,
                 "asr_model": self.models.asr_path.name,
                 **({"prompt_import_error": self.prompt_import_error} if self.prompt_import_error else {})}
 
@@ -844,7 +914,7 @@ class DictationService:
         after_asr = time.monotonic()
         return self._complete(raw_text, recording.duration_seconds, after_asr - started, options)
 
-    def reprocess(self, raw_text, options: DictationOptions, version_id):
+    def reprocess(self, raw_text, options: DictationOptions, version_id, model_id=None):
         """Edit a historical ASR transcript with one explicitly selected profile.
 
         Admission favors live speech: a history edit never queues behind an
@@ -862,6 +932,14 @@ class DictationService:
             raise RequestError(413, "原始转写超过 128 KiB，未进行截断或整理。")
         if not isinstance(version_id, str) or not version_id:
             raise RequestError(400, "重新整理须明确指定 X-Cleanup-Prompt-Version。")
+        if model_id is not None and (not isinstance(model_id, str) or not model_id or len(model_id) > 128):
+            raise RequestError(400, "本次润色模型标识无效。")
+        selected_path = None
+        if model_id is not None and model_id != self.models.cleanup_path.name:
+            resolve = getattr(self.models, "reprocess_model_path", None)
+            if not callable(resolve):
+                raise RequestError(400, "当前服务不支持选择其他润色模型。")
+            selected_path = resolve(model_id)
         # Cleanup opt-out applies to recording, not this explicit edit action.
         # Recapture even for an internal caller with an older captured profile.
         options = self.capture_prompt(replace(options, cleanup=True, cleanup_profile=None,
@@ -874,7 +952,7 @@ class DictationService:
                     or not self.reprocess_lock.acquire(blocking=False)):
                 raise RequestError(409, "正在处理口述，请稍后重新整理。")
             try:
-                pending = self.worker.submit(self._reprocess, raw_text, options)
+                pending = self.worker.submit(self._reprocess, raw_text, options, selected_path)
             except RuntimeError:
                 self.reprocess_lock.release()
                 raise RequestError(503, "整理服务正在退出，请稍后重试。") from None
@@ -883,11 +961,42 @@ class DictationService:
         finally:
             self.reprocess_lock.release()
 
-    def _reprocess(self, raw_text, options):
+    def _reprocess(self, raw_text, options, selected_path=None):
         with self.admission_lock:
             if self.streams.health()["busy"] or self.inference_lock.locked():
                 raise RequestError(409, "新口述正在处理，请稍后重新整理。")
-        result = self._complete(raw_text, 0.0, 0.0, options)
+        if selected_path is None:
+            result = self._complete(raw_text, 0.0, 0.0, options)
+            result["model_load_seconds"] = 0.0
+        else:
+            # All MLX work stays serialized, but a test owns a separate editor:
+            # neither the live model, its cache nor Runtime/cleanup-model is
+            # replaced. New microphone audio can still arrive during this job.
+            # Recheck inexpensive receipts on the worker: a model download or
+            # removal after HTTP admission must not load an incomplete choice.
+            selected_path = self.models.reprocess_model_path(selected_path.name)
+            temporary = LocalModels(self.models.asr_path, selected_path,
+                                    asr_backend=self.models.asr_backend)
+            load_started = time.monotonic()
+            load_error_type = None
+            try:
+                if not options.prompt_snapshot_error:
+                    try:
+                        temporary.load_cleanup()
+                    except Exception as exc:
+                        load_error_type = type(exc).__name__
+                        LOG.error("History editor load failed: model_id=%s error_type=%s",
+                                  selected_path.name, load_error_type)
+                load_seconds = time.monotonic() - load_started
+                result = self._complete(raw_text, 0.0, 0.0, options, cleanup_models=temporary,
+                                        cleanup_load_error_type=load_error_type)
+                result["model_load_seconds"] = round(load_seconds, 3)
+                result["total_seconds"] = round(result["cleanup_seconds"] + load_seconds, 3)
+            finally:
+                try:
+                    temporary.release_cleanup()
+                except Exception as exc:
+                    LOG.warning("History editor cache release failed (%s)", type(exc).__name__)
         # No ASR ran for this result. The client keeps the historical entry's
         # original ASR provenance rather than attributing it to today's model.
         result["asr_model"] = None
@@ -899,7 +1008,9 @@ class DictationService:
             return self.models.transcribe_segment(recording, options, remaining_tokens)
         return self.models.transcribe(recording, options), 0
 
-    def _complete(self, raw_text, duration_seconds, asr_seconds, options):
+    def _complete(self, raw_text, duration_seconds, asr_seconds, options, cleanup_models=None,
+                  cleanup_load_error_type=None):
+        editor = self.models if cleanup_models is None else cleanup_models
         after_asr = time.monotonic()
         if not raw_text.strip():
             text, applied, warning = "" if options.cleanup else raw_text, False, None
@@ -912,9 +1023,14 @@ class DictationService:
             outcome = {"status": "failed", "reason": "prompt_unavailable"}
             if options.prompt_snapshot_error_type:
                 outcome["error_type"] = options.prompt_snapshot_error_type
-        elif self.models.cleanup_ready:
+        elif cleanup_load_error_type:
+            text, applied = raw_text, False
+            warning = "所选润色模型加载失败，原记录保留；未改用其他模型。"
+            outcome = {"status": "failed", "reason": "model_load_failed",
+                       "error_type": cleanup_load_error_type}
+        elif editor.cleanup_ready:
             text, applied, warning, outcome = edit_with_outcome(
-                raw_text, lambda raw: self.models.cleanup(raw, options))
+                raw_text, lambda raw: editor.cleanup(raw, options))
         else:
             text, applied, warning = raw_text, False, "文字整理模型不可用，已保留原始转写。"
             outcome = {"status": "failed", "reason": "model_unavailable"}
@@ -934,7 +1050,7 @@ class DictationService:
             "cleanup_profile": ({"version_id": options.cleanup_profile.id,
                                  "name": options.cleanup_profile.name,
                                  "content_sha256": options.cleanup_profile.content_sha256,
-                                 "model_id": self.models.cleanup_path.name}
+                                 "model_id": editor.cleanup_path.name}
                                 if options.cleanup and options.cleanup_profile else None),
         }
         if warning:
@@ -1101,9 +1217,12 @@ def make_handler(service):
                 value = json.loads(payload.decode("utf-8"), object_pairs_hook=object_without_duplicates)
             except (UnicodeError, ValueError, RecursionError):
                 raise RequestError(400, "请求须为有效 UTF-8 JSON，不能重复字段。") from None
-            if not isinstance(value, dict) or set(value) != {"raw_text"}:
-                raise RequestError(400, "重新整理请求仅支持 raw_text 字段。")
-            self.reply(200, service.reprocess(value["raw_text"], options, version))
+            if (not isinstance(value, dict) or "raw_text" not in value
+                    or set(value) - {"raw_text", "model_id"}):
+                raise RequestError(400, "重新整理请求仅支持 raw_text 和可选 model_id 字段。")
+            if "model_id" in value and (not isinstance(value["model_id"], str) or not value["model_id"]):
+                raise RequestError(400, "本次润色模型标识须为非空字符串。")
+            self.reply(200, service.reprocess(value["raw_text"], options, version, value.get("model_id")))
 
         def do_POST(self):
             try:

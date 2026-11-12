@@ -26,6 +26,8 @@ struct CleanupPromptModel: Codable, Equatable {
     let id: String
     let kind: String
     let ready: Bool
+    var name: String? = nil
+    var unavailable_reason: String? = nil
 }
 
 struct CleanupPromptCatalog: Codable, Equatable {
@@ -36,14 +38,20 @@ struct CleanupPromptCatalog: Codable, Equatable {
     let prompt_store_error: String?
     let recovery_message: String?
     let prompt_import_error: String?
+    var reprocess_models: [CleanupPromptModel]? = nil
+
+    // Older local services expose only their running model. The test picker
+    // must not invent extra choices or infer model availability from a name.
+    var reprocessModels: [CleanupPromptModel] { reprocess_models ?? [current_model] }
 
     init(active_version_id: String?, versions: [CleanupPromptVersion], current_model: CleanupPromptModel,
          asr_model: String, prompt_store_error: String? = nil, recovery_message: String? = nil,
-         prompt_import_error: String? = nil) {
+         prompt_import_error: String? = nil, reprocess_models: [CleanupPromptModel]? = nil) {
         self.active_version_id = active_version_id; self.versions = versions
         self.current_model = current_model; self.asr_model = asr_model
         self.prompt_store_error = prompt_store_error; self.recovery_message = recovery_message
         self.prompt_import_error = prompt_import_error
+        self.reprocess_models = reprocess_models
     }
 }
 

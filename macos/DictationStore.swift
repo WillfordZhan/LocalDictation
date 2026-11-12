@@ -198,6 +198,7 @@ struct DictationRevision: Codable, Identifiable {
     let cleanupSeconds: Double
     let cleanupProfile: DictationCleanupProfile
     var cleanupOutcome: DictationCleanupOutcome? = nil
+    var modelLoadSeconds: Double? = nil
 }
 
 struct DictationEntry: Codable, Identifiable {
@@ -685,14 +686,17 @@ final class DictationStore {
 
     @discardableResult
     func addRevision(entryID: UUID, text: String, cleanupSeconds: Double,
-                     cleanupProfile: DictationCleanupProfile, cleanupOutcome: DictationCleanupOutcome? = nil) -> DictationRevision? {
+                     cleanupProfile: DictationCleanupProfile, cleanupOutcome: DictationCleanupOutcome? = nil,
+                     modelLoadSeconds: Double? = nil) -> DictationRevision? {
         // Deleting the parent while a request is running is authoritative.
         // A late reply must never resurrect it or create a replacement entry.
         guard let index = entries.firstIndex(where: { $0.id == entryID }),
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              cleanupSeconds.isFinite, cleanupSeconds >= 0 else { return nil }
+              cleanupSeconds.isFinite, cleanupSeconds >= 0,
+              modelLoadSeconds.map({ $0.isFinite && $0 >= 0 }) ?? true else { return nil }
         let revision = DictationRevision(id: UUID(), createdAt: Date(), text: text,
-            cleanupSeconds: cleanupSeconds, cleanupProfile: cleanupProfile, cleanupOutcome: cleanupOutcome)
+            cleanupSeconds: cleanupSeconds, cleanupProfile: cleanupProfile, cleanupOutcome: cleanupOutcome,
+            modelLoadSeconds: modelLoadSeconds)
         entries[index].revisions = (entries[index].revisions ?? []) + [revision]
         hasUnsavedHistory = true
         _ = persistHistory()

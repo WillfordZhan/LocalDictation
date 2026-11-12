@@ -74,11 +74,11 @@ enum HistoryReprocessClientTests {
         let valid: [String: Any] = ["raw_text": raw, "text": "保留 BOM。", "cleanup_seconds": 0.3,
             "cleanup_applied": true, "cleanup_profile": ["version_id": "selected", "name": "简洁",
                 "content_sha256": "hash", "model_id": "fixture-model"]]
-        func call(_ reply: HistoryStubProtocol.Reply, input: String? = nil,
+        func call(_ reply: HistoryStubProtocol.Reply, input: String? = nil, modelID: String? = nil,
                   afterDispatch: (() -> Void)? = nil) -> Result<HistoryReprocessResult, Error> {
             HistoryStubProtocol.prepare(reply)
             var result: Result<HistoryReprocessResult, Error>?
-            _ = client.reprocess(rawText: input ?? raw, versionID: "selected", preferences: preferences) {
+            _ = client.reprocess(rawText: input ?? raw, versionID: "selected", modelID: modelID, preferences: preferences) {
                 precondition(Thread.isMainThread); result = $0
             }
             afterDispatch?()
@@ -97,6 +97,22 @@ enum HistoryReprocessClientTests {
         precondition(options["cleanup"] as? Bool == true && options["vocabulary"] as? [String] == ["BOM"])
         let body = try JSONSerialization.jsonObject(with: request.body!) as! [String: String]
         precondition(body == ["raw_text": raw])
+
+        let selectedModelReply = valid.merging(["model_load_seconds": 1.25]) { _, new in new }
+        let modelResult = try call(.http(200, try JSONSerialization.data(withJSONObject: selectedModelReply)), modelID: "fixture-model").get()
+        let modelRequest = HistoryStubProtocol.requests()[0]
+        let modelBody = try JSONSerialization.jsonObject(with: modelRequest.body!) as! [String: String]
+        precondition(modelBody == ["raw_text": raw, "model_id": "fixture-model"])
+        precondition(modelResult.model_load_seconds == 1.25)
+        if case .success = call(.http(200, try JSONSerialization.data(withJSONObject: valid)), modelID: "another-model") {
+            preconditionFailure("A response from a different model cannot be saved as the selected test")
+        }
+        let invalidTiming = valid.merging(["model_load_seconds": -0.1]) { _, new in new }
+        if case .success = call(.http(200, try JSONSerialization.data(withJSONObject: invalidTiming)), modelID: "fixture-model") {
+            preconditionFailure("Accepted invalid loading timing")
+        }
+        if case .success = call(.nonHTTP, modelID: "") { preconditionFailure("Empty model selection must fail locally") }
+        precondition(HistoryStubProtocol.requests().isEmpty)
 
         // A history retry freezes learned mappings with its other preferences.
         // Editing the dictionary while HTTP is in flight must not alter that

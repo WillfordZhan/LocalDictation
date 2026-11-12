@@ -6,6 +6,33 @@ import OSLog
 
 private let serviceBase = URL(string: "http://127.0.0.1:8765")!
 
+/// Standard editing commands must live in the application menu, not only the
+/// status-item menu. A nil target routes each shortcut to the focused editor,
+/// including NSTextField's shared field editor on the personal dictionary page.
+private func makeApplicationMainMenu() -> NSMenu {
+    let main = NSMenu()
+    let application = NSMenu(title: "本地口述")
+    application.addItem(withTitle: "隐藏本地口述", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+    let hideOthers = application.addItem(withTitle: "隐藏其他", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+    hideOthers.keyEquivalentModifierMask = [.command, .option]
+    application.addItem(withTitle: "显示全部", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+    application.addItem(.separator())
+    application.addItem(withTitle: "退出本地口述", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    let applicationItem = NSMenuItem(); applicationItem.submenu = application; main.addItem(applicationItem)
+
+    let edit = NSMenu(title: "编辑")
+    edit.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+    let redo = edit.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+    redo.keyEquivalentModifierMask = [.command, .shift]
+    edit.addItem(.separator())
+    edit.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    edit.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    let editItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: ""); editItem.submenu = edit; main.addItem(editItem)
+    return main
+}
+
 struct DictationResult: Decodable {
     let raw_text: String
     let text: String
@@ -684,6 +711,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
     }
 
     private func createMenu() {
+        NSApp.mainMenu = makeApplicationMainMenu()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "本地口述")
         let menu = NSMenu()
@@ -2096,6 +2124,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         controller.receiveReprocessedHistory(.success(value), entryID: entry.id, generation: wrong,
             expectedVersionID: "chosen", expectedHash: "different-hash")
         precondition(controller.reprocessError != nil && controller.store.entries[0].revisions?.count == 1)
+        let wrongModel = prepare()
+        controller.receiveReprocessedHistory(.success(value), entryID: entry.id, generation: wrongModel,
+            expectedVersionID: "chosen", expectedHash: "chosen-hash", expectedModelID: "another-model")
+        precondition(controller.reprocessError != nil && controller.store.entries[0].revisions?.count == 1,
+            "Mismatched model provenance must not be saved as a successful test")
         let failed = prepare()
         controller.receiveReprocessedHistory(.failure(URLError(.timedOut)), entryID: entry.id, generation: failed,
             expectedVersionID: "chosen", expectedHash: "chosen-hash")
@@ -2697,11 +2730,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         let sheet = field(window, "reprocessingSheet", HistoryReprocessingWindowController.self)!
         defer { sheet.window?.close() }
         let run = field(sheet, "runButton", NSButton.self)!
-        let retryModel = field(sheet, "modelLabel", NSTextField.self)!
+        let retryModel = field(sheet, "modelPicker", NSPopUpButton.self)!
         func assertReady(_ ready: Bool, model: String = "Qwen3.5-9B-4bit") {
-            precondition(modelLabel.stringValue.contains(model) && retryModel.stringValue.contains(model))
+            precondition(modelLabel.stringValue.contains(model) && retryModel.selectedItem?.representedObject as? String == model)
             precondition(modelLabel.stringValue.contains("暂未就绪") == !ready &&
-                retryModel.stringValue.contains("暂未就绪") == !ready && run.isEnabled == ready,
+                retryModel.titleOfSelectedItem?.contains("未就绪") == !ready && run.isEnabled == ready,
                 "Rule page and existing retry sheet did not reflect live model availability")
             precondition(controller.livePromptCatalog?.current_model.ready == ready)
         }
@@ -2750,6 +2783,36 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             controller.livePromptCatalog?.active_version_id == version.id, "Runtime metadata changed an immutable rule")
         precondition(editor.string == "尚未保存的个人规则。" && name.stringValue == "尚未保存的名称" && studio.hasUnsavedChanges,
             "A readiness refresh discarded the editor draft")
+
+        // A failed daily editor must not disable another installed model in
+        // the comparison sheet. Health only projects the live model's state.
+        let liveModel = CleanupPromptModel(id: "Qwen3.5-9B-4bit", kind: "local", ready: false)
+        let alternative = CleanupPromptModel(id: "Qwen3.5-4B-4bit", kind: "local", ready: true)
+        controller.receivePromptCatalog(.success(CleanupPromptCatalog(active_version_id: version.id, versions: [version],
+            current_model: liveModel, asr_model: "fixture-asr", reprocess_models: [liveModel, alternative])),
+            generation: controller.promptGeneration)
+        health("degraded", ready: false)
+        retryModel.selectItem(at: 1)
+        _ = retryModel.target?.perform(retryModel.action!, with: retryModel)
+        precondition(run.isEnabled && controller.livePromptCatalog?.current_model.ready == false)
+        let selectedBefore = controller.selectedCleanupModelID
+        let alternativeReply = reply.merging([
+            "model_load_seconds": 1.25,
+            "cleanup_profile": ["version_id": version.id, "name": version.name,
+                "content_sha256": version.content_sha256, "model_id": alternative.id]
+        ]) { _, new in new }
+        NativeFailureURLProtocol.configureCleanup(try JSONSerialization.data(withJSONObject: alternativeReply))
+        run.performClick(nil)
+        precondition(controller.reprocessGeneration != nil, "A ready alternative model was blocked by the daily editor")
+        let alternativeDeadline = Date().addingTimeInterval(2)
+        while controller.reprocessGeneration != nil && Date() < alternativeDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        let savedTest = controller.store.entries[0].revisions?.last
+        precondition(controller.reprocessGeneration == nil && savedTest?.cleanupProfile.modelID == alternative.id && savedTest?.modelLoadSeconds == 1.25)
+        precondition(controller.selectedCleanupModelID == selectedBefore && controller.livePromptCatalog?.current_model.id == liveModel.id)
+        precondition(controller.store.entries[0].text == entry.text && controller.store.entries[0].rawText == entry.rawText &&
+            controller.livePromptCatalog?.active_version_id == version.id && board.string(forType: .string) == "prompt-health clipboard")
         precondition(controller.store.entries[0].rawText == entry.rawText && controller.store.entries[0].text == entry.text)
         precondition(!window.window!.isVisible && !sheet.window!.isVisible && controller.ownedBackend == nil)
         print("PASS Prompt live readiness: same-rule startup recovery, real retained page and retry sheet, guarded retry dispatch, late catalogs, degradation, model switching, immutable versions and unsaved drafts preserved")
@@ -2989,7 +3052,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             current_model: CleanupPromptModel(id: state.cleanupModel ?? catalog.current_model.id,
                 kind: cleanupBackend?.rawValue ?? catalog.current_model.kind, ready: ready),
             asr_model: state.asrModel ?? catalog.asr_model, prompt_store_error: catalog.prompt_store_error,
-            recovery_message: catalog.recovery_message, prompt_import_error: catalog.prompt_import_error)
+            recovery_message: catalog.recovery_message, prompt_import_error: catalog.prompt_import_error,
+            reprocess_models: catalog.reprocess_models?.map { model in
+                guard model.id == (state.cleanupModel ?? catalog.current_model.id) else { return model }
+                return CleanupPromptModel(id: model.id, kind: model.kind, ready: ready,
+                    name: model.name, unavailable_reason: ready ? nil : model.unavailable_reason)
+            })
     }
 
     private func updatePromptUI() {
@@ -3008,7 +3076,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         reprocessHistory(entryID: entryID, versionID: versionID, feedbackHUD: panel)
     }
 
-    private func reprocessHistory(entryID: UUID, versionID: String, feedbackHUD: DictationHUD? = nil) {
+    private func reprocessHistory(entryID: UUID, versionID: String, modelID: String? = nil, feedbackHUD: DictationHUD? = nil) {
         guard reprocessGeneration == nil else { return }
         reprocessHUD = feedbackHUD
         reprocessHUDGeneration = feedbackHUD?.dismissalGeneration ?? 0
@@ -3022,36 +3090,40 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
             updateReprocessUI(); return
         }
         guard let entry = store.entries.first(where: { $0.id == entryID }),
-              let catalog = livePromptCatalog, promptCatalogCurrent, catalog.current_model.ready,
-              let version = catalog.versions.first(where: { $0.id == versionID }) else {
+              let catalog = livePromptCatalog, promptCatalogCurrent,
+              let version = catalog.versions.first(where: { $0.id == versionID }),
+              let model = catalog.reprocessModels.first(where: { $0.id == (modelID ?? catalog.current_model.id) }),
+              model.ready else {
             reprocessError = "原记录或润色规则暂不可用，请刷新后重试。"
             updateReprocessUI(); return
         }
-        // Freeze both the selected immutable rule and current dictionary. The
-        // active rule used by subsequent microphone sessions is never changed.
+        // Freeze rule, model and dictionary for this one text-only test. Neither
+        // picker changes the configuration used by subsequent microphone sessions.
         let generation = UUID(); reprocessGeneration = generation
         updateReprocessUI(); updateUI()
-        reprocessTask = reprocessClient.reprocess(rawText: entry.rawText, versionID: versionID,
+        reprocessTask = reprocessClient.reprocess(rawText: entry.rawText, versionID: versionID, modelID: model.id,
             preferences: store.preferences) { [weak self] result in
                 self?.receiveReprocessedHistory(result, entryID: entryID, generation: generation,
-                    expectedVersionID: versionID, expectedHash: version.content_sha256)
+                    expectedVersionID: versionID, expectedHash: version.content_sha256, expectedModelID: model.id)
             }
     }
 
     private func receiveReprocessedHistory(_ result: Result<HistoryReprocessResult, Error>, entryID: UUID,
-                                           generation: UUID, expectedVersionID: String, expectedHash: String) {
+                                           generation: UUID, expectedVersionID: String, expectedHash: String,
+                                           expectedModelID: String? = nil) {
         guard !terminating, reprocessGeneration == generation, reprocessEntryID == entryID else { return }
         reprocessTask = nil; reprocessGeneration = nil
         switch result {
         case .success(let value):
             guard value.cleanup_applied, !["failed", "skipped"].contains(value.cleanup_outcome?.status ?? ""), let profile = value.cleanup_profile,
-                  profile.versionID == expectedVersionID, profile.contentSHA256 == expectedHash else {
-                reprocessError = "返回的润色规则不匹配，未保存本次结果。"
+                  profile.versionID == expectedVersionID, profile.contentSHA256 == expectedHash,
+                  expectedModelID == nil || profile.modelID == expectedModelID else {
+                reprocessError = "返回的润色规则或模型不匹配，未保存本次结果。"
                 updateReprocessUI(); updateUI(); return
             }
             let outcome = value.cleanup_outcome ?? .legacy(raw: value.raw_text, text: value.text, applied: value.cleanup_applied)
             if store.addRevision(entryID: entryID, text: value.text, cleanupSeconds: value.cleanup_seconds,
-                                 cleanupProfile: profile, cleanupOutcome: outcome) == nil {
+                                 cleanupProfile: profile, cleanupOutcome: outcome, modelLoadSeconds: value.model_load_seconds) == nil {
                 reprocessError = "原记录已删除或结果无效，未保存本次结果。"
             } else { reprocessError = nil }
         case .failure(let error): reprocessError = error.localizedDescription
@@ -3185,8 +3257,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorde
         controller.onReloadPrompts = { [weak self] in self?.loadPrompts() }
         controller.onSavePrompt = { [weak self] draft in self?.savePrompt(draft) }
         controller.onActivatePrompt = { [weak self] id in self?.activatePrompt(id: id) }
-        controller.onReprocessEntry = { [weak self] entryID, versionID in
-            self?.reprocessHistory(entryID: entryID, versionID: versionID)
+        controller.onReprocessEntry = { [weak self] entryID, versionID, modelID in
+            self?.reprocessHistory(entryID: entryID, versionID: versionID, modelID: modelID)
         }
         windowController = controller
         updateAppIconUI()
@@ -3367,6 +3439,84 @@ private final class NativeFailureURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+/// Only the clipboard adapter differs from the real field editor in this
+/// fixture. Native key-equivalent dispatch, selection, text insertion and undo
+/// still run through AppKit; the user's general pasteboard is never accessed.
+private final class DictionaryEditMenuFieldEditor: NSTextView {
+    let board = NSPasteboard(name: NSPasteboard.Name("local.dictation.edit-menu.\(UUID())"))
+    override func paste(_ sender: Any?) {
+        if let value = board.string(forType: .string) { insertText(value, replacementRange: selectedRange()) }
+    }
+    override func copy(_ sender: Any?) {
+        board.clearContents()
+        board.setString((string as NSString).substring(with: selectedRange()), forType: .string)
+    }
+    override func cut(_ sender: Any?) { copy(sender); insertText("", replacementRange: selectedRange()) }
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(NSText.paste(_:)) { return board.string(forType: .string) != nil }
+        if item.action == #selector(NSText.copy(_:)) || item.action == #selector(NSText.cut(_:)) { return selectedRange().length > 0 }
+        return super.validateUserInterfaceItem(item)
+    }
+}
+
+private final class DictionaryEditMenuWindowDelegate: NSObject, NSWindowDelegate {
+    let editor = DictionaryEditMenuFieldEditor()
+    override init() { super.init(); editor.isFieldEditor = true }
+    func windowWillReturnFieldEditor(_ sender: NSWindow, to client: Any?) -> Any? { editor }
+}
+
+private func verifyDictionaryEditMenu() {
+    let store = DictationStore(memoryOnly: true)
+    let originalVocabulary = store.preferences.vocabulary
+    let controller = DictationWindowController(store: store, sessionStartedAt: Date())
+    controller.showPage(.dictionary)
+    let window = controller.window!
+    let fixture = DictionaryEditMenuWindowDelegate()
+    let previousMenu = NSApp.mainMenu, previousResponder = NSApp.nextResponder
+    defer {
+        window.makeFirstResponder(nil); window.close()
+        NSApp.mainMenu = previousMenu; NSApp.nextResponder = previousResponder
+        fixture.editor.board.releaseGlobally()
+    }
+    func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+    let field = descendants(window.contentView!).compactMap { $0 as? NSTextField }
+        .first { $0.placeholderString == "例如：CodeGraph、工作流、项目名" }!
+    window.delegate = fixture
+    precondition(window.makeFirstResponder(field))
+    fixture.editor.allowsUndo = true
+    // A prohibited self-test cannot become the system's key window. Give the
+    // menu the actual focused field editor through a temporary responder link.
+    // This is local to the fixture process; no keyboard event is posted.
+    NSApp.nextResponder = fixture.editor
+    let main = makeApplicationMainMenu(); NSApp.mainMenu = main
+    func event(_ character: String, _ keyCode: UInt16, modifiers: NSEvent.ModifierFlags = .command) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
+            timestamp: 0, windowNumber: window.windowNumber, context: nil,
+            characters: modifiers.contains(.shift) ? character.uppercased() : character,
+            charactersIgnoringModifiers: character, isARepeat: false, keyCode: keyCode)!
+    }
+    func press(_ character: String, _ keyCode: UInt16, modifiers: NSEvent.ModifierFlags = .command) {
+        precondition(main.performKeyEquivalent(with: event(character, keyCode, modifiers: modifiers)))
+        // NSTextView closes its native undo groups at the end of an event turn.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+    }
+    let words = "会话、BOM、SalesPart、工段节点"
+    fixture.editor.board.setString(words, forType: .string)
+    precondition(!NSMenu().performKeyEquivalent(with: event("v", 9)), "An absent application menu must reproduce the missing shortcut")
+    press("v", 9)
+    precondition(field.stringValue == words, "Command-V did not reach the dictionary field editor")
+    press("a", 0); press("c", 8)
+    precondition(fixture.editor.board.string(forType: .string) == words)
+    press("x", 7); precondition(field.stringValue.isEmpty)
+    press("z", 6); precondition(field.stringValue == words)
+    press("z", 6, modifiers: [.command, .shift]); precondition(field.stringValue.isEmpty)
+    press("v", 9); precondition(field.stringValue == words)
+    precondition(store.preferences.vocabulary == originalVocabulary, "Typing or pasting must not submit the dictionary automatically")
+    precondition(!main.performKeyEquivalent(with: event("v", 9, modifiers: [.command, .option])),
+        "The editing menu must not swallow the configured recording combination")
+    print("PASS dictionary editing: real Command-V/A/C/X/Z/Shift-Z menu dispatch, Chinese/multiple terms, native undo, named pasteboard only, no vocabulary submission or global shortcut interception")
+}
+
 private func verifyClipboardFallback() {
     let board = NSPasteboard(name: NSPasteboard.Name("local.dictation.regression.\(UUID().uuidString)"))
     defer { board.releaseGlobally() }
@@ -3473,6 +3623,7 @@ private func verifyInputReadiness() {
 private func selfTest() throws {
     _ = NSApplication.shared
     NSApp.setActivationPolicy(.prohibited)
+    verifyDictionaryEditMenu()
     verifyClipboardFallback()
     verifyInputReadiness()
     let caret = Selection(location: 3, length: 0)

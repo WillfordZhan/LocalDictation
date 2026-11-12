@@ -8,6 +8,7 @@ struct HistoryReprocessResult: Decodable {
     let warning: String?
     let cleanup_profile: DictationCleanupProfile?
     var cleanup_outcome: DictationCleanupOutcome? = nil
+    var model_load_seconds: Double? = nil
 }
 
 /// Explicit text-only request to the existing loopback worker. There is no
@@ -18,10 +19,17 @@ final class HistoryReprocessClient {
     init(base: URL, session: URLSession = .shared) { self.base = base; self.session = session }
 
     @discardableResult
-    func reprocess(rawText: String, versionID: String, preferences: DictationPreferences,
+    func reprocess(rawText: String, versionID: String, modelID: String? = nil, preferences: DictationPreferences,
                    completion: @escaping (Result<HistoryReprocessResult, Error>) -> Void) -> URLSessionDataTask? {
         do {
-            let body = try JSONSerialization.data(withJSONObject: ["raw_text": rawText])
+            var payload = ["raw_text": rawText]
+            if let modelID {
+                guard !modelID.isEmpty, modelID.utf8.count <= 128 else {
+                    throw Self.failure("请选择有效的测试模型。")
+                }
+                payload["model_id"] = modelID
+            }
+            let body = try JSONSerialization.data(withJSONObject: payload)
             guard !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !versionID.isEmpty, body.count <= 128 * 1024 else {
                 throw Self.failure("原文为空或过长，无法重新整理。原记录仍保留。")
@@ -34,7 +42,9 @@ final class HistoryReprocessClient {
                 throw Self.failure("个人词典超出请求容量，请调整后重试。")
             }
             var request = URLRequest(url: base.appendingPathComponent("cleanup/reprocess"))
-            request.httpMethod = "POST"; request.httpBody = body; request.timeoutInterval = 60
+            // A different local model may need a cold load. The service keeps
+            // its generation deadline; this budget also allows model loading.
+            request.httpMethod = "POST"; request.httpBody = body; request.timeoutInterval = 120
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.setValue(encodedOptions, forHTTPHeaderField: "X-Dictation-Options")
             request.setValue(versionID, forHTTPHeaderField: "X-Cleanup-Prompt-Version")
@@ -54,9 +64,11 @@ final class HistoryReprocessClient {
                         throw Self.failure(value.warning ?? "本次整理未完成，原记录仍保留。", outcome: value.cleanup_outcome)
                     }
                     guard value.raw_text == rawText, value.cleanup_profile?.versionID == versionID,
+                          modelID == nil || value.cleanup_profile?.modelID == modelID,
                           !value.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                          value.cleanup_seconds.isFinite, value.cleanup_seconds >= 0 else {
-                        throw Self.failure("整理结果或规则版本不匹配，未保存本次结果。")
+                          value.cleanup_seconds.isFinite, value.cleanup_seconds >= 0,
+                          value.model_load_seconds.map({ $0.isFinite && $0 >= 0 }) ?? true else {
+                        throw Self.failure("整理结果、规则或模型不匹配，未保存本次结果。")
                     }
                     result = .success(value)
                 } catch { result = .failure(error) }
